@@ -256,10 +256,10 @@
 - Create: `启动控制台.bat`
 - Create: `.gitignore`
 
-- [ ] Document first-use Chrome login, account profile paths, lyric format, daily folder layout, run controls, screenshots, logs, state reset, and safe stop.
-- [ ] Add one-click Windows launcher that uses `.venv` and opens the console URL.
-- [ ] Add ignore rules for `.venv/`, caches, logs, screenshots, data, and downloaded files.
-- [ ] Run final `pytest -q`.
+- [x] Document first-use Chrome login, account profile paths, lyric format, daily folder layout, run controls, screenshots, logs, state reset, and safe stop.
+- [x] Add one-click Windows launcher that uses `.venv` and opens the console URL.
+- [x] Add ignore rules for `.venv/`, caches, logs, screenshots, data, and downloaded files.
+- [x] Run final `pytest -q`.
 - [ ] Commit `docs: add console usage guide`.
 
 ---

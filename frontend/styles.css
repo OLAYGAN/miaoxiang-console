@@ -121,6 +121,7 @@ h2 { font-size: 16px; }
 
 .form-grid { display: grid; gap: 10px; padding: 14px; }
 .form-grid.compact { grid-template-columns: 1fr; }
+.login-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 0 14px 12px; }
 .field { display: grid; gap: 5px; min-width: 0; }
 .field > span { color: var(--muted); font-size: 12px; }
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -272,5 +273,6 @@ input:focus, select:focus, button:focus-visible {
   .song-row { grid-template-columns: 38px minmax(120px, 1fr) 86px 48px; }
   .song-row > span:nth-child(3), .song-row > span:nth-child(5) { display: none; }
   .field-row, .settings-grid { grid-template-columns: 1fr; }
+  .login-actions { grid-template-columns: 1fr; }
   .log-stream { height: 320px; }
 }

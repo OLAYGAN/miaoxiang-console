@@ -176,3 +176,43 @@ class ChromeSession:
     async def __aexit__(self, exc_type, exc, tb) -> bool:
         await self.cleanup()
         return False
+
+
+class BrowserManager:
+    """Keeps at most one manually opened login browser."""
+
+    def __init__(self, session_factory: Callable[[AccountConfig, ConsoleSettings], Any] | None = None) -> None:
+        self._session_factory = session_factory
+        self._session: Any = None
+        self._account_id: str | None = None
+
+    @property
+    def current(self) -> Any:
+        return self._session
+
+    @property
+    def current_account_id(self) -> str | None:
+        return self._account_id
+
+    async def open(self, account: AccountConfig, settings: ConsoleSettings) -> Any:
+        if self._session is not None and self._account_id == account.id:
+            return self._session
+        await self.close()
+        factory = self._session_factory or ChromeSession
+        session = factory(account, settings)
+        try:
+            await session.start()
+        except Exception:
+            if hasattr(session, "cleanup"):
+                await session.cleanup()
+            raise
+        self._session = session
+        self._account_id = account.id
+        return session
+
+    async def close(self) -> None:
+        session = self._session
+        self._session = None
+        self._account_id = None
+        if session is not None and hasattr(session, "cleanup"):
+            await session.cleanup()

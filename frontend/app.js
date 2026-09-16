@@ -21,6 +21,7 @@ for (const id of [
   "fresh-run", "metric-pending", "metric-success", "metric-skip", "metric-fail",
   "metric-step", "song-table", "queue-empty", "settings-form", "save-settings",
   "log-stream", "copy-logs", "open-logs", "open-screenshots", "toast",
+  "open-login", "close-login",
 ]) {
   elements[id] = document.getElementById(id);
 }
@@ -226,6 +227,8 @@ function renderControls() {
   elements["account-form"].querySelectorAll("input").forEach((input) => input.disabled = running);
   elements["settings-form"].querySelectorAll("input").forEach((input) => input.disabled = running);
   elements["save-settings"].disabled = running;
+  elements["open-login"].disabled = running || !state.accountId;
+  elements["close-login"].disabled = running;
 }
 
 function appendLog(entry) {
@@ -298,6 +301,13 @@ async function loadCurrent() {
   renderCurrent();
 }
 
+async function loadLoginBrowser() {
+  const current = await api("/api/browser/current").catch(() => null);
+  elements["close-login"].textContent = current
+    ? `关闭 ${current.account_name} 浏览器`
+    : "关闭登录浏览器";
+}
+
 function connectSocket() {
   if (state.socket) state.socket.close();
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -340,16 +350,19 @@ document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
   await Promise.allSettled([loadHealth(), loadSettings(), loadCurrent()]);
   await loadAccounts();
+  await loadLoginBrowser();
   const recent = await api("/api/logs/recent").catch(() => []);
   for (const event of recent) if (event.type === "log") appendLog(event.data);
   connectSocket();
   setInterval(loadHealth, 5000);
+  setInterval(loadLoginBrowser, 5000);
 });
 
 function bindEvents() {
   elements["account-select"].addEventListener("change", async () => {
     state.accountId = elements["account-select"].value;
     fillAccountForm(state.accounts.find((account) => account.id === state.accountId));
+    renderControls();
     await loadSongs();
   });
 
@@ -459,6 +472,25 @@ function bindEvents() {
   });
   elements["open-logs"].addEventListener("click", () => openFolder("logs"));
   elements["open-screenshots"].addEventListener("click", () => openFolder("screenshots"));
+  elements["open-login"].addEventListener("click", async () => {
+    if (!state.accountId) return toast("请先选择账号", true);
+    try {
+      const result = await api(`/api/accounts/${state.accountId}/browser/open`, { method: "POST" });
+      await loadLoginBrowser();
+      toast(`已打开 ${result.account_name} 的 Chrome，请登录后关闭浏览器`);
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+  elements["close-login"].addEventListener("click", async () => {
+    try {
+      await api("/api/browser/close", { method: "POST" });
+      await loadLoginBrowser();
+      toast("登录浏览器已关闭");
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
 }
 
 async function openFolder(kind) {

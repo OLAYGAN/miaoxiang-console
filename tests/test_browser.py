@@ -5,6 +5,7 @@ import pytest
 import httpx
 
 from backend.browser import (
+    BrowserManager,
     ChromeSession,
     build_chrome_command,
     resolve_chrome_executable,
@@ -156,6 +157,48 @@ async def test_start_failure_still_terminates_chrome(tmp_path: Path, monkeypatch
         await session.start()
 
     assert process.terminated
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_reuses_and_replaces_login_session(tmp_path: Path) -> None:
+    sessions: list[FakeSession] = []
+
+    def factory(account, settings):
+        session = FakeSession(account.id)
+        sessions.append(session)
+        return session
+
+    manager = BrowserManager(session_factory=factory)
+    account = make_account(tmp_path)
+    other = account.model_copy(update={"id": "other", "account_name": "账号02"})
+
+    first = await manager.open(account, ConsoleSettings())
+    same = await manager.open(account, ConsoleSettings())
+    second = await manager.open(other, ConsoleSettings())
+    await manager.close()
+    await manager.close()
+
+    assert first is same is sessions[0]
+    assert second is sessions[1]
+    assert sessions[0].started == 1
+    assert sessions[0].cleaned == 1
+    assert sessions[1].started == 1
+    assert sessions[1].cleaned == 1
+    assert manager.current is None
+
+
+class FakeSession:
+    def __init__(self, account_id: str) -> None:
+        self.account_id = account_id
+        self.started = 0
+        self.cleaned = 0
+
+    async def start(self):
+        self.started += 1
+        return self
+
+    async def cleanup(self):
+        self.cleaned += 1
 
 
 class FakeProcess:

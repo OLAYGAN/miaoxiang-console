@@ -225,6 +225,39 @@ def test_open_folder_accepts_only_safe_builtin_folders(tmp_path: Path, monkeypat
         assert rejected.status_code == 422
 
 
+def test_login_browser_open_status_and_close(tmp_path: Path, monkeypatch) -> None:
+    class FakeSession:
+        def __init__(self) -> None:
+            self.started = 0
+            self.cleaned = 0
+
+        async def start(self):
+            self.started += 1
+            return self
+
+        async def cleanup(self):
+            self.cleaned += 1
+
+    session = FakeSession()
+    app, _ = make_client(tmp_path)
+    monkeypatch.setattr(app.state.login_browser, "_session_factory", lambda account, settings: session)
+
+    with TestClient(app) as client:
+        account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
+        opened = client.post(f"/api/accounts/{account['id']}/browser/open")
+        reused = client.post(f"/api/accounts/{account['id']}/browser/open")
+        current = client.get("/api/browser/current")
+
+        assert opened.status_code == reused.status_code == 202
+        assert current.json()["account_id"] == account["id"]
+        assert session.started == 1
+
+        closed = client.post("/api/browser/close")
+        assert closed.status_code == 204
+        assert session.cleaned == 1
+        assert client.get("/api/browser/current").json() is None
+
+
 def test_websocket_receives_recent_events(tmp_path: Path) -> None:
     app, _ = make_client(tmp_path, stop_after=1)
     write_song(tmp_path, "01_first")

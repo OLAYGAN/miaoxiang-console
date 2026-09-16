@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from backend.browser import ChromeSession
+from backend.browser import BrowserManager, ChromeSession
 from backend.config import RuntimePaths, build_runtime_paths, ensure_runtime_directories, get_runtime_paths
 from backend.errors import AppError, NotFoundError
 from backend.events import EventBus
@@ -107,8 +107,11 @@ def create_app(
     app.state.settings = settings
     app.state.events = events
     app.state.engine = engine
+    login_browser = BrowserManager()
+    app.state.login_browser = login_browser
 
     async def shutdown_engine() -> None:
+        await login_browser.close()
         await engine.shutdown()
 
     app.router.add_event_handler("shutdown", shutdown_engine)
@@ -187,6 +190,7 @@ def create_app(
             if not path.is_file():
                 raise NotFoundError(f"歌词文件不存在: {file_name}")
             selected.append(path)
+        await login_browser.close()
         snapshot = engine.start(
             account,
             selected,
@@ -224,6 +228,26 @@ def create_app(
         folder = folders[request.kind]
         folder.mkdir(parents=True, exist_ok=True)
         open_folder_on_windows(folder)
+
+    @app.post("/api/accounts/{account_id}/browser/open", status_code=202)
+    async def open_login_browser(account_id: str) -> dict:
+        if engine.is_running:
+            raise AppError("任务运行中不能打开登录浏览器")
+        account = account_repository.get(account_id)
+        await login_browser.open(account, settings)
+        return {"account_id": account.id, "account_name": account.account_name}
+
+    @app.post("/api/browser/close", status_code=204)
+    async def close_login_browser() -> None:
+        await login_browser.close()
+
+    @app.get("/api/browser/current")
+    async def current_login_browser() -> dict | None:
+        account_id = login_browser.current_account_id
+        if not account_id:
+            return None
+        account = account_repository.get(account_id)
+        return {"account_id": account.id, "account_name": account.account_name}
 
     @app.get("/api/settings")
     async def get_settings() -> dict:
