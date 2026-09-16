@@ -54,16 +54,16 @@
 - Create: `backend/lyrics.py`
 - Test: `tests/test_lyrics.py`
 
-- [ ] Write tests for:
+- [x] Write tests for:
   - Full-width colon song name.
   - Half-width colon song name.
   - Lyric extraction removing the repeated first title line.
   - Style extraction and whitespace trimming.
   - Missing section, short lyric, and short style failures.
-- [ ] Run `pytest tests/test_lyrics.py -q` and verify parser import failure.
-- [ ] Implement `parse_lyrics(text: str) -> LyricData` using regular expressions and explicit validation errors.
-- [ ] Implement `list_lyric_files(root: Path, account: str, day: str | None = None) -> list[Path]`.
-- [ ] Run `pytest tests/test_lyrics.py -q` and confirm pass.
+- [x] Run `pytest tests/test_lyrics.py -q` and verify parser import failure.
+- [x] Implement `parse_lyrics(text: str) -> LyricData` using regular expressions and explicit validation errors.
+- [x] Implement `list_lyric_files(root: Path, account: str, day: str | None = None) -> list[Path]`.
+- [x] Run `pytest tests/test_lyrics.py -q` and confirm pass.
 - [ ] Commit `feat: add lyric parsing`.
 
 ### Task 3: Persistence and Event Bus
