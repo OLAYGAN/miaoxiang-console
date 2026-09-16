@@ -73,3 +73,29 @@ class LogEntry(BaseModel):
     song: str | None = None
     message: str
     screenshot_path: str | None = None
+
+
+class SongProgress(BaseModel):
+    file_name: str
+    song_name: str | None = None
+    status: str = "pending"
+    current_step: str = "pending"
+    attempts: int = 0
+    error: str | None = None
+    screenshot_path: str | None = None
+
+
+class TaskSnapshot(BaseModel):
+    run_id: str
+    account_id: str
+    account_name: str
+    status: str = "running"
+    current_file: str | None = None
+    current_step: str = "starting"
+    songs: list[SongProgress] = Field(default_factory=list)
+    success_count: int = 0
+    skipped_count: int = 0
+    failure_count: int = 0
+    started_at: datetime = Field(default_factory=datetime.now)
+    finished_at: datetime | None = None
+    error: str | None = None

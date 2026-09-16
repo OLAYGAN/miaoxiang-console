@@ -93,7 +93,7 @@
 - Create: `backend/task_engine.py`
 - Test: `tests/test_task_engine.py`
 
-- [ ] Write async tests with a fake page flow:
+- [x] Write async tests with a fake page flow:
   - Successful song updates run state once.
   - Parse failure advances to next song without browser calls.
   - Retryable failure respects max retries.
@@ -102,12 +102,12 @@
   - Pause blocks between state-machine steps and resume continues.
   - Completed songs are skipped unless `fresh_run` is true.
   - Unexpected exceptions emit error events and do not deadlock the engine.
-- [ ] Run tests and confirm task engine import failure.
-- [ ] Implement `ControlState`, `SongTask`, and `TaskEngine`.
-- [ ] Keep one active task at a time; use `asyncio.Lock`.
-- [ ] Implement bounded sleeps with an abort-aware event.
-- [ ] Implement event/status emission around every state transition.
-- [ ] Run `pytest tests/test_task_engine.py -q` and confirm pass.
+- [x] Run tests and confirm task engine import failure.
+- [x] Implement `ControlState`, `SongTask`, and `TaskEngine`.
+- [x] Keep one active task at a time; use `asyncio.Lock`.
+- [x] Implement bounded sleeps with an abort-aware event.
+- [x] Implement event/status emission around every state transition.
+- [x] Run `pytest tests/test_task_engine.py -q` and confirm pass.
 - [ ] Commit `feat: add deterministic task engine`.
 
 ### Task 5: Chrome Session Manager
