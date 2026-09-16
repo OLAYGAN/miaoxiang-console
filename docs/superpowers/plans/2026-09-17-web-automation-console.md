@@ -116,23 +116,23 @@
 - Create: `backend/browser.py`
 - Test: `tests/test_browser.py`
 
-- [ ] Write tests for:
+- [x] Write tests for:
   - Chrome path discovery from configured override and common Windows locations.
   - User-data directory isolation by account slug.
   - Profile path refusal for unsafe root-like paths.
   - Command line contains remote debugging port, profile, no-first-run, and no-default-browser-check.
   - CDP readiness uses bounded polling.
-- [ ] Run tests and confirm browser module import failure.
-- [ ] Implement `ChromeSession.start()`:
+- [x] Run tests and confirm browser module import failure.
+- [x] Implement `ChromeSession.start()`:
   1. Resolve executable.
   2. Ensure profile directory.
   3. Launch process with `CREATE_NO_WINDOW` on Windows.
   4. Poll `http://127.0.0.1:<port>/json/version`.
   5. Connect Playwright over CDP.
   6. Create or find a studio page.
-- [ ] Implement `ChromeSession.cleanup()` with browser disconnect, process termination, and bounded waits.
-- [ ] Implement async context manager semantics.
-- [ ] Run `pytest tests/test_browser.py -q` and confirm pass.
+- [x] Implement `ChromeSession.cleanup()` with browser disconnect, process termination, and bounded waits.
+- [x] Implement async context manager semantics.
+- [x] Run `pytest tests/test_browser.py -q` and confirm pass.
 - [ ] Commit `feat: add chrome session manager`.
 
 ### Task 6: Deterministic Page Flow
