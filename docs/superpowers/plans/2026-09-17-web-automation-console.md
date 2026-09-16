@@ -73,18 +73,18 @@
 - Create: `backend/events.py`
 - Test: `tests/test_storage.py`
 
-- [ ] Write tests proving:
+- [x] Write tests proving:
   - JSON writes are atomic.
   - Corrupt files are backed up before recreation.
   - Accounts can be created, updated, copied, and deleted.
   - Port and account-name conflicts are rejected.
   - Run state is isolated by date/account/song.
   - Event subscribers receive logs and state snapshots.
-- [ ] Run tests and confirm missing storage/event modules fail.
-- [ ] Implement `JsonStore` with `atomic_write`, timestamped backup, and UTF-8 JSON.
-- [ ] Implement `AccountRepository` and `RunStateRepository`.
-- [ ] Implement `EventBus` with bounded recent history and disconnect-safe publish.
-- [ ] Run `pytest tests/test_storage.py -q` and confirm pass.
+- [x] Run tests and confirm missing storage/event modules fail.
+- [x] Implement `JsonStore` with `atomic_write`, timestamped backup, and UTF-8 JSON.
+- [x] Implement `AccountRepository` and `RunStateRepository`.
+- [x] Implement `EventBus` with bounded recent history and disconnect-safe publish.
+- [x] Run `pytest tests/test_storage.py -q` and confirm pass.
 - [ ] Commit `feat: add persistence and event bus`.
 
 ### Task 4: Task Engine Semantics
