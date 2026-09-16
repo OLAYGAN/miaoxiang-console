@@ -206,6 +206,23 @@ def test_settings_update(tmp_path: Path) -> None:
         assert updated.json()["download_timeout_seconds"] == 31
 
 
+def test_open_folder_accepts_only_safe_builtin_folders(tmp_path: Path, monkeypatch) -> None:
+    opened: list[Path] = []
+
+    def fake_startfile(path) -> None:
+        opened.append(Path(path))
+
+    monkeypatch.setattr("backend.api.open_folder_on_windows", fake_startfile)
+    app, _ = make_client(tmp_path)
+    with TestClient(app) as client:
+        allowed = client.post("/api/folders/open", json={"kind": "logs"})
+        assert allowed.status_code == 204
+        assert opened == [tmp_path / "logs"]
+
+        rejected = client.post("/api/folders/open", json={"kind": "F:/音乐"})
+        assert rejected.status_code == 422
+
+
 def test_websocket_receives_recent_events(tmp_path: Path) -> None:
     app, _ = make_client(tmp_path, stop_after=1)
     write_song(tmp_path, "01_first")

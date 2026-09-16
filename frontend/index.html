@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>妙响自动化控制台</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Local Console</p>
+      <h1>妙响自动化控制台</h1>
+    </div>
+    <div class="top-status">
+      <span id="service-status" class="status-chip is-offline">服务未连接</span>
+      <span id="socket-status" class="status-chip is-offline">日志流未连接</span>
+      <span id="task-status" class="status-chip is-idle">无任务</span>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="panel account-panel">
+      <div class="panel-header">
+        <h2>账号</h2>
+        <div class="segmented">
+          <button type="button" id="account-new" class="segment">新建</button>
+          <button type="button" id="account-copy" class="segment">复制</button>
+          <button type="button" id="account-delete" class="segment danger">删除</button>
+        </div>
+      </div>
+
+      <label class="field">
+        <span>当前账号</span>
+        <select id="account-select"></select>
+      </label>
+
+      <form id="account-form" class="form-grid compact">
+        <label class="field">
+          <span>账号名称</span>
+          <input name="account_name" required maxlength="64">
+        </label>
+        <label class="field">
+          <span>Chrome 用户目录</span>
+          <input name="chrome_profile_dir" required>
+        </label>
+        <div class="field-row">
+          <label class="field">
+            <span>调试端口</span>
+            <input name="chrome_debug_port" type="number" min="1024" max="65535" required>
+          </label>
+          <label class="field">
+            <span>重试次数</span>
+            <input name="max_retries" type="number" min="1" max="10" required>
+          </label>
+        </div>
+        <label class="field">
+          <span>歌词根目录</span>
+          <input name="lyric_dir" required>
+        </label>
+        <label class="field">
+          <span>成品根目录</span>
+          <input name="output_dir" required>
+        </label>
+        <label class="field">
+          <span>下载目录</span>
+          <input name="download_dir" required>
+        </label>
+        <div class="field-row">
+          <label class="field">
+            <span>模型</span>
+            <input name="model_name" required>
+          </label>
+          <label class="field">
+            <span>虚拟歌手</span>
+            <input name="singer_name" required>
+          </label>
+        </div>
+        <div class="field-row">
+          <label class="field">
+            <span>歌曲间隔（秒）</span>
+            <input name="song_interval_seconds" type="number" min="0" max="600" step="1" required>
+          </label>
+        </div>
+        <label class="field">
+          <span>创作页地址</span>
+          <input name="create_url" required>
+        </label>
+        <button type="submit" class="button primary">保存账号</button>
+      </form>
+    </aside>
+
+    <section class="panel queue-panel">
+      <div class="panel-header">
+        <div>
+          <h2>今日任务</h2>
+          <p id="queue-caption" class="caption">选择账号后读取歌词</p>
+        </div>
+        <div class="queue-actions">
+          <button type="button" id="select-all" class="button">全选</button>
+          <button type="button" id="select-failed" class="button">仅失败</button>
+          <button type="button" id="refresh-songs" class="button">刷新</button>
+        </div>
+      </div>
+
+      <div class="run-strip">
+        <button type="button" id="start-run" class="button primary run-button">开始处理</button>
+        <button type="button" id="pause-run" class="button">暂停</button>
+        <button type="button" id="resume-run" class="button">继续</button>
+        <button type="button" id="stop-run" class="button danger">停止</button>
+        <label class="check">
+          <input type="checkbox" id="fresh-run">
+          <span>忽略断点全部重跑</span>
+        </label>
+      </div>
+
+      <div class="metrics">
+        <div><span>待处理</span><strong id="metric-pending">0</strong></div>
+        <div><span>成功</span><strong id="metric-success">0</strong></div>
+        <div><span>跳过</span><strong id="metric-skip">0</strong></div>
+        <div><span>失败</span><strong id="metric-fail">0</strong></div>
+        <div><span>当前步骤</span><strong id="metric-step">-</strong></div>
+      </div>
+
+      <div class="song-table" id="song-table">
+        <div class="song-row song-head">
+          <span>选择</span><span>文件</span><span>歌名</span><span>状态</span><span>步骤</span><span>重试</span>
+        </div>
+      </div>
+      <div id="queue-empty" class="empty-state">
+        <strong>暂无歌词</strong>
+        <p>按“日期/账号”放入 Markdown 歌词后点击刷新。</p>
+      </div>
+    </section>
+
+    <aside class="side-stack">
+      <section class="panel settings-panel">
+        <div class="panel-header">
+          <h2>运行参数</h2>
+          <button type="button" id="save-settings" class="button">保存参数</button>
+        </div>
+        <form id="settings-form" class="settings-grid">
+          <label><span>页面加载</span><input name="page_load_timeout_seconds" type="number" min="1" max="300"></label>
+          <label><span>生成等待</span><input name="generation_timeout_seconds" type="number" min="1" max="3600"></label>
+          <label><span>编辑器导入</span><input name="editor_import_wait_seconds" type="number" min="1" max="120"></label>
+          <label><span>导出等待</span><input name="export_timeout_seconds" type="number" min="1" max="600"></label>
+          <label><span>下载等待</span><input name="download_timeout_seconds" type="number" min="1" max="600"></label>
+          <label><span>日志容量</span><input name="log_history_limit" type="number" min="100" max="10000"></label>
+        </form>
+      </section>
+
+      <section class="panel log-panel">
+        <div class="panel-header">
+          <h2>实时日志</h2>
+          <div class="queue-actions">
+            <button type="button" id="copy-logs" class="button">复制</button>
+            <button type="button" id="open-logs" class="button">日志目录</button>
+            <button type="button" id="open-screenshots" class="button">截图</button>
+          </div>
+        </div>
+        <div id="log-stream" class="log-stream"></div>
+      </section>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

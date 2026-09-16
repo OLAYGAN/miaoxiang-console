@@ -1,6 +1,7 @@
 """FastAPI control surface for the local automation console."""
 
 from collections.abc import Callable
+import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -35,6 +36,10 @@ class RunControlRequest(BaseModel):
     action: str = Field(pattern="^(pause|resume|stop)$")
 
 
+class FolderOpenRequest(BaseModel):
+    kind: str = Field(pattern="^(logs|screenshots|data)$")
+
+
 class ConsoleSettingsUpdate(BaseModel):
     page_load_timeout_seconds: int | None = Field(default=None, ge=1, le=300)
     generation_timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
@@ -63,6 +68,10 @@ class DefaultBrowserFlow:
     async def __aexit__(self, exc_type, exc, tb) -> bool:
         await self.session.cleanup()
         return False
+
+
+def open_folder_on_windows(path: Path) -> None:
+    os.startfile(str(path))
 
 
 def create_app(
@@ -203,6 +212,17 @@ def create_app(
     @app.get("/api/logs/recent")
     async def recent_logs() -> list[dict]:
         return events.recent()
+
+    @app.post("/api/folders/open", status_code=204)
+    async def open_folder(request: FolderOpenRequest) -> None:
+        folders = {
+            "logs": paths.log_dir,
+            "screenshots": paths.screenshot_dir,
+            "data": paths.data_dir,
+        }
+        folder = folders[request.kind]
+        folder.mkdir(parents=True, exist_ok=True)
+        open_folder_on_windows(folder)
 
     @app.get("/api/settings")
     async def get_settings() -> dict:

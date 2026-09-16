@@ -214,17 +214,17 @@
 - Create: `frontend/styles.css`
 - Create: `frontend/app.js`
 
-- [ ] Build a dense operational layout:
+- [x] Build a dense operational layout:
   - Left rail: account selector and account form.
   - Center: song queue and run controls.
   - Right: configuration and recent log stream.
-- [ ] Use stable controls: segmented tabs, checkboxes, numeric steppers, path inputs, and clear action buttons.
-- [ ] Implement WebSocket reconnect and polling fallback.
-- [ ] Disable destructive and config actions while a run is active.
-- [ ] Show per-song state, retry count, current step, screenshot path, and task summary.
-- [ ] Provide links/buttons to open log and screenshot folders through API-backed safe endpoints.
-- [ ] Keep all labels in Chinese and avoid decorative marketing content.
-- [ ] Verify manually in Chromium at 1440x900 and 390x844:
+- [x] Use stable controls: segmented tabs, checkboxes, numeric steppers, path inputs, and clear action buttons.
+- [x] Implement WebSocket reconnect and polling fallback.
+- [x] Disable destructive and config actions while a run is active.
+- [x] Show per-song state, retry count, current step, screenshot path, and task summary.
+- [x] Provide links/buttons to open log and screenshot folders through API-backed safe endpoints.
+- [x] Keep all labels in Chinese and avoid decorative marketing content.
+- [x] Verify manually in Chromium at 1440x900 and 390x844:
   - No blank screen.
   - No overlapping text.
   - Controls remain reachable.
