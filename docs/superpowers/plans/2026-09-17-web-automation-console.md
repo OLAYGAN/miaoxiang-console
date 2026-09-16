@@ -40,12 +40,12 @@
 - Create: `backend/errors.py`
 - Create: `tests/__init__.py`
 
-- [ ] Write `tests/test_models.py` asserting that `AccountConfig` applies defaults, rejects duplicate ports through the repository later, and converts paths to absolute normalized paths.
-- [ ] Run `pytest tests/test_models.py -q` and confirm the failure is caused by missing backend modules.
-- [ ] Add project metadata and dependencies: `fastapi`, `uvicorn[standard]`, `playwright`, `pydantic`, `pytest`, `pytest-asyncio`, `httpx`.
-- [ ] Implement runtime settings rooted in the project directory and create data/log/screenshot directories lazily.
-- [ ] Implement typed exceptions: `AppError`, `ValidationError`, `ConflictError`, `NotFoundError`, `TaskControlError`, `BrowserFlowError`, `GenerationLimitError`.
-- [ ] Run `pytest tests/test_models.py -q` and confirm pass.
+- [x] Write `tests/test_models.py` asserting that `AccountConfig` applies defaults, rejects duplicate ports through the repository later, and converts paths to absolute normalized paths.
+- [x] Run `pytest tests/test_models.py -q` and confirm the failure is caused by missing backend modules.
+- [x] Add project metadata and dependencies: `fastapi`, `uvicorn[standard]`, `playwright`, `pydantic`, `pytest`, `pytest-asyncio`, `httpx`.
+- [x] Implement runtime settings rooted in the project directory and create data/log/screenshot directories lazily.
+- [x] Implement typed exceptions: `AppError`, `ValidationError`, `ConflictError`, `NotFoundError`, `TaskControlError`, `BrowserFlowError`, `GenerationLimitError`.
+- [x] Run `pytest tests/test_models.py -q` and confirm pass.
 - [ ] Commit `feat: add backend foundation`.
 
 ### Task 2: Lyric Parser

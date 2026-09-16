@@ -1,0 +1,1 @@
+"""Local automation console backend."""
