@@ -179,7 +179,7 @@
 - Create: `backend/main.py`
 - Test: `tests/test_api.py`
 
-- [ ] Write API tests for:
+- [x] Write API tests for:
   - Health endpoint.
   - Account CRUD and conflict responses.
   - Lyric listing and parsing.
@@ -188,8 +188,8 @@
   - Pause/resume/stop controls.
   - WebSocket receives log and status events.
   - Server shutdown calls engine cleanup.
-- [ ] Run tests and confirm API import failure.
-- [ ] Implement endpoints:
+- [x] Run tests and confirm API import failure.
+- [x] Implement endpoints:
   - `GET /api/health`
   - `GET/POST /api/accounts`
   - `GET/PUT/DELETE /api/accounts/{id}`
@@ -202,9 +202,9 @@
   - `GET /api/settings`
   - `PUT /api/settings`
   - `WS /ws`
-- [ ] Validate request bodies with Pydantic and map typed errors to JSON responses.
-- [ ] Mount static frontend from `frontend/`.
-- [ ] Run `pytest tests/test_api.py -q` and confirm pass.
+- [x] Validate request bodies with Pydantic and map typed errors to JSON responses.
+- [x] Mount static frontend from `frontend/`.
+- [x] Run `pytest tests/test_api.py -q` and confirm pass.
 - [ ] Commit `feat: add control api`.
 
 ### Task 8: Local Control Console UI
