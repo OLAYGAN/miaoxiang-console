@@ -141,22 +141,22 @@
 - Create: `backend/page_flow.py`
 - Test: `tests/test_page_flow.py`
 
-- [ ] Write fake-locator tests for:
+- [x] Write fake-locator tests for:
   - Trusted mouse click sequence.
   - DOM click logging.
   - Segmented lyric input.
   - Generation-before/after title change.
   - Generation-limit text detection.
   - File archive and collision handling.
-- [ ] Run tests and confirm page flow import failure.
-- [ ] Implement helpers:
+- [x] Run tests and confirm page flow import failure.
+- [x] Implement helpers:
   - `trusted_click`
   - `dom_click`
   - `type_segmented`
   - `clear_and_type`
   - `screenshot_on_error`
   - `archive_download`
-- [ ] Implement `PageFlow` methods:
+- [x] Implement `PageFlow` methods:
   - `ensure_create_page_ready`
   - `select_model`
   - `select_singer`
@@ -168,8 +168,8 @@
   - `enter_editor`
   - `export_song`
   - `download_song`
-- [ ] Every locator has a bounded timeout and logs selector text.
-- [ ] Run `pytest tests/test_page_flow.py -q` and confirm pass.
+- [x] Every locator has a bounded timeout and logs selector text.
+- [x] Run `pytest tests/test_page_flow.py -q` and confirm pass.
 - [ ] Commit `feat: add deterministic page flow`.
 
 ### Task 7: FastAPI Control Surface
