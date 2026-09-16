@@ -51,6 +51,15 @@ class TaskEngine:
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    @property
+    def settings(self) -> ConsoleSettings:
+        return self._settings
+
+    def update_settings(self, settings: ConsoleSettings) -> None:
+        if self.is_running:
+            raise ConflictError("任务运行中不能修改全局等待配置")
+        self._settings = settings
+
     def start(
         self,
         account: AccountConfig,

@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+import httpx
 
 from backend.browser import (
     ChromeSession,
@@ -105,6 +106,58 @@ async def test_chrome_session_cleanup_is_idempotent(tmp_path: Path) -> None:
     assert process.terminated
 
 
+@pytest.mark.asyncio
+async def test_cdp_health_check_bypasses_environment_proxy(tmp_path: Path, monkeypatch) -> None:
+    captured: dict = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"Browser": "Chrome/1"}
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url: str):
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    session = ChromeSession(make_account(tmp_path), ConsoleSettings())
+    result = await session._fetch_json("http://127.0.0.1:9222/json/version")
+
+    assert result == {"Browser": "Chrome/1"}
+    assert captured["trust_env"] is False
+
+
+@pytest.mark.asyncio
+async def test_start_failure_still_terminates_chrome(tmp_path: Path, monkeypatch) -> None:
+    executable = tmp_path / "chrome.exe"
+    executable.write_text("", encoding="utf-8")
+    process = FakeProcess()
+    session = ChromeSession(make_account(tmp_path), ConsoleSettings())
+
+    async def failed_wait(**kwargs):
+        raise BrowserFlowError("Chrome 调试端口未就绪")
+
+    monkeypatch.setattr("backend.browser.resolve_chrome_executable", lambda: executable)
+    monkeypatch.setattr("backend.browser.subprocess.Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr("backend.browser.wait_for_cdp", failed_wait)
+
+    with pytest.raises(BrowserFlowError, match="调试端口"):
+        await session.start()
+
+    assert process.terminated
+
+
 class FakeProcess:
     def __init__(self) -> None:
         self.terminated = False
@@ -131,5 +184,5 @@ class FakePlaywright:
     def __init__(self) -> None:
         self.stopped_count = 0
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         self.stopped_count += 1

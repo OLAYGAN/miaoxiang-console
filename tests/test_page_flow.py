@@ -125,6 +125,10 @@ async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
     downloaded_file = tmp_path / "夜色引擎.mp3"
     downloaded_file.write_bytes(b"audio")
 
+    async def ensure_create_page_ready():
+        calls.append("ensure_create_page_ready")
+        return None
+
     async def step(name):
         calls.append(name)
         if name == "first_asset_title":
@@ -134,6 +138,7 @@ async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
         if name == "download_song":
             return downloaded_file
 
+    flow.ensure_create_page_ready = ensure_create_page_ready
     flow.fill_inputs = lambda lyric_data: step("fill_inputs")
     flow.first_asset_title = lambda: step("first_asset_title")
     flow.generate = lambda: step("generate")
@@ -149,6 +154,7 @@ async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
     )
 
     assert calls == [
+        "ensure_create_page_ready",
         "fill_inputs",
         "first_asset_title",
         "generate",
@@ -159,6 +165,7 @@ async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
         "download_song",
     ]
     assert steps == [
+        "page_ready",
         "fill_inputs",
         "record_before",
         "generate",
@@ -175,6 +182,11 @@ async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
 async def test_process_song_propagates_generation_limit(tmp_path: Path) -> None:
     account = make_account(tmp_path)
     flow = PageFlow(page=FakePage(), account=account, settings=ConsoleSettings(), screenshot_dir=tmp_path)
+
+    async def ensure_create_page_ready():
+        return None
+
+    flow.ensure_create_page_ready = ensure_create_page_ready
 
     async def fill_inputs(lyric_data):
         return None

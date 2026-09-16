@@ -204,6 +204,8 @@ def test_settings_update(tmp_path: Path) -> None:
         assert updated.status_code == 200
         assert updated.json()["generation_timeout_seconds"] == 301
         assert updated.json()["download_timeout_seconds"] == 31
+        assert app.state.engine.settings.generation_timeout_seconds == 301
+        assert app.state.engine.settings.download_timeout_seconds == 31
 
 
 def test_open_folder_accepts_only_safe_builtin_folders(tmp_path: Path, monkeypatch) -> None:

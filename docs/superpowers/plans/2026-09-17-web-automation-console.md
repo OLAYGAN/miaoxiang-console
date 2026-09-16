@@ -236,8 +236,9 @@
 **Files:**
 - Modify as needed based on failures.
 
-- [ ] Run `pytest -q`.
-- [ ] Run `python -m backend.main` and verify:
+- [ ] Live one-song test is deferred until the user logs into the generated Chrome profile manually.
+- [x] Run `pytest -q`.
+- [x] Run `python -m backend.main` and verify:
   - Console opens at `http://127.0.0.1:8787`.
   - Account can be created.
   - Lyric directory can be listed.
@@ -245,8 +246,8 @@
   - Stop endpoint releases the browser.
 - [ ] Run a one-song live test only after the user logs into the generated Chrome profile manually.
 - [ ] Verify generated MP3 reaches `output/YYYY-MM-DD/account/song.mp3`.
-- [ ] Verify interruption and restart skip completed songs.
-- [ ] Fix all failures, rerun tests, and commit `test: verify complete workflow`.
+- [x] Verify interruption and restart skip completed songs.
+- [x] Fix all failures, rerun tests, and commit `test: verify complete workflow`.
 
 ### Task 10: Documentation and Startup
 

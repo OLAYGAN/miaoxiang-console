@@ -1,6 +1,7 @@
 """Chrome process and Playwright CDP session management."""
 
 import asyncio
+import inspect
 import os
 import subprocess
 from collections.abc import Callable
@@ -112,29 +113,34 @@ class ChromeSession:
             creationflags=creationflags,
             close_fds=True,
         )
-        await wait_for_cdp(
-            port=self.account.chrome_debug_port,
-            fetch_json=self._fetch_json,
-            attempts=30,
-            interval=0.5,
-        )
-        self._playwright = await async_playwright().start()
-        cdp_url = f"http://127.0.0.1:{self.account.chrome_debug_port}"
-        self.browser = await self._playwright.chromium.connect_over_cdp(
-            cdp_url,
-            timeout=self.settings.page_load_timeout_seconds * 1000,
-        )
-        context = self.browser.contexts[0] if self.browser.contexts else await self.browser.new_context()
-        self.page = context.pages[0] if context.pages else await context.new_page()
-        await self.page.goto(
-            self.account.create_url,
-            wait_until="domcontentloaded",
-            timeout=self.settings.page_load_timeout_seconds * 1000,
-        )
-        return self
+        try:
+            await wait_for_cdp(
+                port=self.account.chrome_debug_port,
+                fetch_json=self._fetch_json,
+                attempts=30,
+                interval=0.5,
+            )
+            self._playwright = await async_playwright().start()
+            cdp_url = f"http://127.0.0.1:{self.account.chrome_debug_port}"
+            self.browser = await self._playwright.chromium.connect_over_cdp(
+                cdp_url,
+                timeout=self.settings.page_load_timeout_seconds * 1000,
+            )
+            context = self.browser.contexts[0] if self.browser.contexts else await self.browser.new_context()
+            self.page = context.pages[0] if context.pages else await context.new_page()
+            await self.page.goto(
+                self.account.create_url,
+                wait_until="domcontentloaded",
+                timeout=self.settings.page_load_timeout_seconds * 1000,
+            )
+            return self
+        except Exception:
+            await self.cleanup()
+            raise
 
     async def _fetch_json(self, url: str) -> dict:
-        async with httpx.AsyncClient(timeout=1) as client:
+        # CDP is local; system proxy settings must not intercept 127.0.0.1.
+        async with httpx.AsyncClient(timeout=1, trust_env=False) as client:
             response = await client.get(url)
             response.raise_for_status()
             return response.json()
@@ -148,7 +154,9 @@ class ChromeSession:
             self.browser = None
         if self._playwright is not None:
             try:
-                self._playwright.stop()
+                result = self._playwright.stop()
+                if inspect.isawaitable(result):
+                    await result
             except Exception:
                 pass
             self._playwright = None

@@ -127,6 +127,9 @@ class PageFlow:
         lyric_data: LyricData,
         on_step: Callable[[str], None],
     ) -> Path:
+        on_step("page_ready")
+        await self.ensure_create_page_ready()
+
         on_step("fill_inputs")
         await self.fill_inputs(lyric_data)
 

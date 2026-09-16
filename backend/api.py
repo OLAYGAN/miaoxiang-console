@@ -108,9 +108,10 @@ def create_app(
     app.state.events = events
     app.state.engine = engine
 
-    @app.on_event("shutdown")
     async def shutdown_engine() -> None:
         await engine.shutdown()
+
+    app.router.add_event_handler("shutdown", shutdown_engine)
 
     @app.exception_handler(AppError)
     async def handle_app_error(request: Request, error: AppError):
@@ -230,11 +231,14 @@ def create_app(
 
     @app.put("/api/settings")
     async def update_settings(request: ConsoleSettingsUpdate) -> dict:
+        nonlocal settings
         if engine.is_running:
             raise AppError("任务运行中不能修改全局等待配置")
         updated = ConsoleSettings.model_validate(
             {**settings.model_dump(mode="json"), **request.model_dump(exclude_unset=True)}
         )
+        engine.update_settings(updated)
+        settings = updated
         settings_store.write(updated.model_dump(mode="json"))
         app.state.settings = updated
         return updated.model_dump(mode="json")
