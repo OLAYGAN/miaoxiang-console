@@ -415,6 +415,7 @@ class FakeDetailPage:
         self.content = FakeDetailLocator("content", self)
         self.detail_content = detail_content
         self.calls: list[str] = []
+        self.filter_calls: list[dict] = []
 
     def locator(self, selector: str):
         if selector == '[class*="libraryItemWrapper"]':
@@ -434,6 +435,10 @@ class FakeDetailLocator:
 
     @property
     def first(self):
+        return self
+
+    def filter(self, **kwargs):
+        self.page.filter_calls.append(kwargs)
         return self
 
     async def click(self, **kwargs) -> None:
@@ -457,6 +462,20 @@ async def test_verify_generated_song_clicks_card_and_checks_lyric_content() -> N
     )
 
     assert page.calls == ["click-card", "wait"]
+    assert page.filter_calls == [{"visible": True}]
+
+
+@pytest.mark.asyncio
+async def test_verify_generated_song_ignores_structural_lyric_directives() -> None:
+    page = FakeDetailPage(
+        "油 墨 还 没 散 尽\n书 页 白 得 发 亮\n第一行 名字\n写 得 歪 歪 扭 扭"
+    )
+
+    await verify_generated_song(
+        page,
+        "[主歌1][成人独唱，温暖中低音男声rap]\n油墨还没散尽，书页白得发亮。\n"
+        "第一行名字\n写得歪歪扭扭",
+    )
 
 
 @pytest.mark.asyncio

@@ -6,8 +6,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
-from backend.errors import BrowserFlowError, GenerationLimitError
-from backend.errors import LoginRequiredError
+from backend.errors import (
+    BrowserFlowError,
+    GenerationLimitError,
+    LoginRequiredError,
+    SongVerificationError,
+)
 from backend.models import AccountConfig, ConsoleSettings, LyricData
 
 
@@ -184,12 +188,18 @@ def _normalize_lyric_content(text: str) -> str:
     return "".join(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]+", text.lower()))
 
 
+def _lyric_probe(lyrics: str) -> str:
+    # Structural labels are authoring directives; the platform detail may omit them.
+    content = re.sub(r"\[[^\]]+\]", "", lyrics)
+    return _normalize_lyric_content(content)[:48]
+
+
 async def verify_generated_song(page: Any, lyrics: str) -> None:
-    normalized_lyrics = _normalize_lyric_content(lyrics)
-    if len(normalized_lyrics) < 20:
+    lyric_probe = _lyric_probe(lyrics)
+    if len(lyric_probe) < 20:
         raise BrowserFlowError("输入歌词太短，无法做详情校验")
 
-    card = page.locator('[class*="libraryItemWrapper"]').first
+    card = page.locator('[class*="libraryItemWrapper"]').filter(visible=True).first
     await card.click(timeout=5000)
     await page.wait_for_timeout(1000)
 
@@ -198,10 +208,8 @@ async def verify_generated_song(page: Any, lyrics: str) -> None:
     ).first
     detail_text = await detail_content.inner_text()
     normalized_detail = _normalize_lyric_content(detail_text)
-    # Use a stable prefix from the submitted lyric rather than the AI-generated title.
-    lyric_probe = normalized_lyrics[:48]
     if lyric_probe not in normalized_detail:
-        raise BrowserFlowError("歌词详情不匹配：生成卡片详情中没有找到本次输入的歌词片段")
+        raise SongVerificationError("歌词详情不匹配：生成卡片详情中没有找到本次输入的歌词片段")
 
 
 class PageFlow:
@@ -294,6 +302,8 @@ class PageFlow:
             await select_model(self.page, self.account.model_name)
         except GenerationLimitError:
             raise
+        except SongVerificationError:
+            raise
         except Exception as error:
             await self._raise_with_screenshot("模型选择", error)
 
@@ -309,6 +319,8 @@ class PageFlow:
         try:
             await verify_generated_song(self.page, lyrics)
         except GenerationLimitError:
+            raise
+        except SongVerificationError:
             raise
         except Exception as error:
             await self._raise_with_screenshot("生成歌曲详情校验", error)
@@ -542,6 +554,9 @@ class PageFlow:
     async def _raise_with_screenshot(self, step: str, error: Exception) -> None:
         path = await self._screenshot(re.sub(r"[^a-z0-9-]+", "-", step).strip("-"))
         suffix = f"；截图: {path}" if path else ""
-        if isinstance(error, (GenerationLimitError, LoginRequiredError)):
+        if isinstance(
+            error,
+            (GenerationLimitError, LoginRequiredError, SongVerificationError),
+        ):
             raise error
         raise BrowserFlowError(f"{step}失败: {error}{suffix}") from error

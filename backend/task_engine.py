@@ -12,6 +12,7 @@ from backend.errors import (
     ConflictError,
     GenerationLimitError,
     LoginRequiredError,
+    SongVerificationError,
     ValidationFailed,
 )
 from backend.events import EventBus
@@ -92,7 +93,10 @@ class TaskEngine:
 
     async def wait(self) -> None:
         if self._task is not None:
-            await self._task
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
 
     async def pause(self) -> None:
         if not self.is_running:
@@ -114,12 +118,16 @@ class TaskEngine:
         self._stop_requested.set()
         self._resumed.set()
         self._update_status("stopping", step="stopping")
+        if self._task is not None:
+            self._task.cancel()
 
     async def shutdown(self) -> None:
         if self.is_running:
             await self.stop()
             try:
                 await asyncio.wait_for(self.wait(), timeout=5)
+            except asyncio.CancelledError:
+                pass
             except asyncio.TimeoutError:
                 self._task.cancel()
                 try:
@@ -184,6 +192,8 @@ class TaskEngine:
                         return
                     if self.current.status == "login_required":
                         return
+                    if self.current.status == "verification_failed":
+                        return
 
                     if file_index < len(song_files) - 1 and account.song_interval_seconds > 0:
                         self._update_status(self.current.status, step="waiting_before_next_song")
@@ -197,7 +207,7 @@ class TaskEngine:
                 self._complete("completed")
         except asyncio.CancelledError:
             self._complete("stopped")
-            raise
+            return
         except Exception as error:
             self._log("error", "task", f"任务异常: {error}", traceback.format_exc(limit=2))
             self._complete("failed", error=str(error))
@@ -261,6 +271,17 @@ class TaskEngine:
                     error=error.message,
                 )
                 self._complete("login_required", error.message)
+                return
+            except SongVerificationError as error:
+                self._finish_song(
+                    day,
+                    account,
+                    progress,
+                    status="详情校验失败",
+                    current_step=current_step,
+                    error=error.message,
+                )
+                self._complete("verification_failed", error.message)
                 return
             except ValidationFailed as error:
                 self._finish_song(

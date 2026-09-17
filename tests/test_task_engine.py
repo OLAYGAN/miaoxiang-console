@@ -8,6 +8,7 @@ from backend.errors import (
     ConflictError,
     GenerationLimitError,
     LoginRequiredError,
+    SongVerificationError,
     ValidationFailed,
 )
 from backend.events import EventBus
@@ -181,6 +182,26 @@ async def test_login_required_stops_without_retries(tmp_path: Path) -> None:
     assert state.get("2026-09-17", "账号01", "02_second.md") is None
 
 
+async def test_song_verification_failure_stops_whole_run(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    songs = [make_song(account.lyric_dir, "01_first"), make_song(account.lyric_dir, "02_second")]
+    flow = FakeFlow()
+
+    async def reject_details(lyric_data, on_step):
+        raise SongVerificationError("歌词详情不匹配")
+
+    flow.process_song = reject_details
+    engine, state, _ = make_engine(tmp_path, flow)
+    engine.start(account, songs, day="2026-09-17")
+    await engine.wait()
+
+    assert len(flow.processed) == 0
+    assert engine.current.status == "verification_failed"
+    assert state.get("2026-09-17", "账号01", "01_first.md").status == "详情校验失败"
+    assert state.get("2026-09-17", "账号01", "01_first.md").attempts == 1
+    assert state.get("2026-09-17", "账号01", "02_second.md") is None
+
+
 async def test_stop_prevents_next_song_and_releases_browser(tmp_path: Path) -> None:
     account = make_account(tmp_path)
     songs = [make_song(account.lyric_dir, "01_first"), make_song(account.lyric_dir, "02_second")]
@@ -198,6 +219,29 @@ async def test_stop_prevents_next_song_and_releases_browser(tmp_path: Path) -> N
     await engine.wait()
 
     assert flow.processed == ["01_first"]
+    assert engine.current.status == "stopped"
+    assert browser.exited == 1
+
+
+async def test_stop_cancels_long_running_browser_step(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_first")
+    flow = FakeFlow()
+
+    async def long_step(lyric_data, on_step):
+        on_step("wait_generation")
+        await asyncio.sleep(30)
+        return Path("output/should-not-exist.mp3")
+
+    flow.process_song = long_step
+    engine, _, browser = make_engine(tmp_path, flow)
+    engine.start(account, [song], day="2026-09-17")
+    while browser.entered == 0:
+        await asyncio.sleep(0.01)
+
+    await engine.stop()
+    await asyncio.wait_for(engine.wait(), timeout=1.5)
+
     assert engine.current.status == "stopped"
     assert browser.exited == 1
 
