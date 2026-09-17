@@ -85,7 +85,6 @@ async def clear_and_type(
 def archive_download(
     downloaded_file: Path,
     output_root: Path,
-    account_name: str,
     song_name: str,
     day: str,
 ) -> Path:
@@ -94,7 +93,7 @@ def archive_download(
         raise BrowserFlowError(f"下载文件为空或不存在: {source}")
 
     safe_song = re.sub(r'[\\/:*?"<>|]+', "_", song_name).strip() or "未命名歌曲"
-    directory = Path(output_root) / day / account_name
+    directory = Path(output_root) / day
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / f"{safe_song}.mp3"
     counter = 2
@@ -156,7 +155,6 @@ class PageFlow:
         return archive_download(
             downloaded,
             Path(self.account.output_dir),
-            self.account.account_name,
             lyric_data.song_name,
             datetime.now().strftime("%Y-%m-%d"),
         )

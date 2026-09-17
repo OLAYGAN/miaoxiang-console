@@ -100,20 +100,20 @@ def test_archive_download_moves_file_and_handles_collision(tmp_path: Path) -> No
     output_root = tmp_path / "成品"
     account = make_account(tmp_path)
 
-    first = archive_download(downloaded, output_root, account.account_name, "夜色引擎", "2026-09-17")
-    assert first == output_root / "2026-09-17" / "账号01" / "夜色引擎.mp3"
+    first = archive_download(downloaded, output_root, "夜色引擎", "2026-09-17")
+    assert first == output_root / "2026-09-17" / "夜色引擎.mp3"
     assert first.read_bytes() == b"audio"
     assert not downloaded.exists()
 
     downloaded.write_bytes(b"audio2")
-    second = archive_download(downloaded, output_root, account.account_name, "夜色引擎", "2026-09-17")
+    second = archive_download(downloaded, output_root, "夜色引擎", "2026-09-17")
     assert second.name == "夜色引擎-2.mp3"
     assert second.read_bytes() == b"audio2"
 
     empty = tmp_path / "empty.mp3"
     empty.write_bytes(b"")
     with pytest.raises(BrowserFlowError, match="下载文件为空"):
-        archive_download(empty, output_root, account.account_name, "坏文件", "2026-09-17")
+        archive_download(empty, output_root, "坏文件", "2026-09-17")
 
 
 @pytest.mark.asyncio
@@ -175,7 +175,7 @@ async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
         "export_song",
         "download_song",
     ]
-    assert result == tmp_path / "output" / "2026-09-17" / "账号01" / "夜色引擎.mp3"
+    assert result == tmp_path / "output" / "2026-09-17" / "夜色引擎.mp3"
 
 
 @pytest.mark.asyncio
