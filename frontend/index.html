@@ -31,63 +31,63 @@
         </div>
       </div>
 
-      <label class="field">
+      <label class="field" data-tip="选择当前要登录和处理的账号；任务运行时不能切换。">
         <span>当前账号</span>
         <select id="account-select"></select>
       </label>
       <div class="login-actions">
-        <button type="button" id="open-login" class="button">打开 Chrome 登录</button>
-        <button type="button" id="close-login" class="button">关闭登录浏览器</button>
+        <button type="button" id="open-login" class="button" data-tip="打开该账号专用 Chrome，用于首次登录妙响。">打开 Chrome 登录</button>
+        <button type="button" id="close-login" class="button" data-tip="关闭登录窗口并释放账号目录；开始任务前必须关闭。">关闭登录浏览器</button>
       </div>
 
       <form id="account-form" class="form-grid compact">
-        <label class="field">
+        <label class="field" data-tip="控制台里显示的账号名称，也会用于歌词和成品的日期子目录。">
           <span>账号名称</span>
           <input name="account_name" required maxlength="64">
         </label>
-        <label class="field">
+        <label class="field" data-tip="该账号专用 Chrome 资料目录，保存登录状态；每个账号必须不同。">
           <span>Chrome 用户目录</span>
           <input name="chrome_profile_dir" required>
         </label>
         <div class="field-row">
-          <label class="field">
+          <label class="field" data-tip="本机调试端口。不同账号不要重复，常用 9222、9223、9224。">
             <span>调试端口</span>
             <input name="chrome_debug_port" type="number" min="1024" max="65535" required>
           </label>
-          <label class="field">
+          <label class="field" data-tip="单首歌失败后的最大处理次数；生成上限不会重试。">
             <span>重试次数</span>
             <input name="max_retries" type="number" min="1" max="10" required>
           </label>
         </div>
-        <label class="field">
+        <label class="field" data-tip="歌词根目录。程序读取：根目录/当天日期/账号名称/*.md。">
           <span>歌词根目录</span>
           <input name="lyric_dir" required>
         </label>
-        <label class="field">
+        <label class="field" data-tip="成品根目录。下载后归档到：根目录/当天日期/账号名称/。">
           <span>成品根目录</span>
           <input name="output_dir" required>
         </label>
-        <label class="field">
+        <label class="field" data-tip="浏览器下载临时目录；最终音乐会自动移动到成品目录。">
           <span>下载目录</span>
           <input name="download_dir" required>
         </label>
         <div class="field-row">
-          <label class="field">
+          <label class="field" data-tip="目标生成模型，默认 Sway v5.5。">
             <span>模型</span>
             <input name="model_name" required>
           </label>
-          <label class="field">
+          <label class="field" data-tip="虚拟歌手音色，默认老岩。">
             <span>虚拟歌手</span>
             <input name="singer_name" required>
           </label>
         </div>
         <div class="field-row">
-          <label class="field">
+          <label class="field" data-tip="一首歌处理完成后，等待多少秒再处理下一首。">
             <span>歌曲间隔（秒）</span>
             <input name="song_interval_seconds" type="number" min="0" max="600" step="1" required>
           </label>
         </div>
-        <label class="field">
+        <label class="field" data-tip="创作页入口地址；平台地址变化时才需要修改。">
           <span>创作页地址</span>
           <input name="create_url" required>
         </label>
@@ -102,18 +102,18 @@
           <p id="queue-caption" class="caption">选择账号后读取歌词</p>
         </div>
         <div class="queue-actions">
-          <button type="button" id="select-all" class="button">全选</button>
-          <button type="button" id="select-failed" class="button">仅失败</button>
-          <button type="button" id="refresh-songs" class="button">刷新</button>
+          <button type="button" id="select-all" class="button" data-tip="选中当前账号今天所有可解析的歌词。">全选</button>
+          <button type="button" id="select-failed" class="button" data-tip="只选择解析失败或处理失败的歌词。">仅失败</button>
+          <button type="button" id="refresh-songs" class="button" data-tip="重新读取歌词目录和解析结果。">刷新</button>
         </div>
       </div>
 
       <div class="run-strip">
-        <button type="button" id="start-run" class="button primary run-button">开始处理</button>
-        <button type="button" id="pause-run" class="button">暂停</button>
-        <button type="button" id="resume-run" class="button">继续</button>
-        <button type="button" id="stop-run" class="button danger">停止</button>
-        <label class="check">
+        <button type="button" id="start-run" class="button primary run-button" data-tip="按勾选顺序串行处理：生成、导出、下载、归档。">开始处理</button>
+        <button type="button" id="pause-run" class="button" data-tip="当前步骤完成后暂停，不中途打断页面操作。">暂停</button>
+        <button type="button" id="resume-run" class="button" data-tip="从暂停位置继续处理。">继续</button>
+        <button type="button" id="stop-run" class="button danger" data-tip="不再开始新步骤，保存状态并释放 Chrome。">停止</button>
+        <label class="check" data-tip="默认跳过当天已成功歌曲；勾选后全部重新处理。">
           <input type="checkbox" id="fresh-run">
           <span>忽略断点全部重跑</span>
         </label>
@@ -145,12 +145,12 @@
           <button type="button" id="save-settings" class="button">保存参数</button>
         </div>
         <form id="settings-form" class="settings-grid">
-          <label><span>页面加载</span><input name="page_load_timeout_seconds" type="number" min="1" max="300"></label>
-          <label><span>生成等待</span><input name="generation_timeout_seconds" type="number" min="1" max="3600"></label>
-          <label><span>编辑器导入</span><input name="editor_import_wait_seconds" type="number" min="1" max="120"></label>
-          <label><span>导出等待</span><input name="export_timeout_seconds" type="number" min="1" max="600"></label>
-          <label><span>下载等待</span><input name="download_timeout_seconds" type="number" min="1" max="600"></label>
-          <label><span>日志容量</span><input name="log_history_limit" type="number" min="100" max="10000"></label>
+          <label data-tip="打开或刷新创作页的最大等待时间。"><span>页面加载</span><input name="page_load_timeout_seconds" type="number" min="1" max="300"></label>
+          <label data-tip="点击生成后等待新歌出现在资产列表的最大时间，默认 300 秒。"><span>生成等待</span><input name="generation_timeout_seconds" type="number" min="1" max="3600"></label>
+          <label data-tip="进入编辑器后等待音轨导入；太短可能导致导出无效。"><span>编辑器导入</span><input name="editor_import_wait_seconds" type="number" min="1" max="120"></label>
+          <label data-tip="点击导出后等待跳回资产页的最大时间。"><span>导出等待</span><input name="export_timeout_seconds" type="number" min="1" max="600"></label>
+          <label data-tip="点击下载后等待浏览器下载事件的最大时间。"><span>下载等待</span><input name="download_timeout_seconds" type="number" min="1" max="600"></label>
+          <label data-tip="控制台保留的最近日志条数，只影响界面显示。"><span>日志容量</span><input name="log_history_limit" type="number" min="100" max="10000"></label>
         </form>
       </section>
 
@@ -158,9 +158,9 @@
         <div class="panel-header">
           <h2>实时日志</h2>
           <div class="queue-actions">
-            <button type="button" id="copy-logs" class="button">复制</button>
-            <button type="button" id="open-logs" class="button">日志目录</button>
-            <button type="button" id="open-screenshots" class="button">截图</button>
+            <button type="button" id="copy-logs" class="button" data-tip="复制当前界面显示的日志文本。">复制</button>
+            <button type="button" id="open-logs" class="button" data-tip="打开本地日志文件夹。">日志目录</button>
+            <button type="button" id="open-screenshots" class="button" data-tip="打开异常截图文件夹。">截图</button>
           </div>
         </div>
         <div id="log-stream" class="log-stream"></div>
@@ -169,6 +169,7 @@
   </main>
 
   <div id="toast" class="toast" role="status"></div>
+  <div id="floating-tooltip" class="floating-tooltip" role="tooltip" aria-hidden="true"></div>
   <script src="/assets/app.js"></script>
 </body>
 </html>

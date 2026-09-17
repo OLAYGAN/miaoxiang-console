@@ -258,6 +258,29 @@ input:focus, select:focus, button:focus-visible {
 
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
+.floating-tooltip {
+  position: fixed;
+  z-index: 100;
+  max-width: min(320px, calc(100vw - 24px));
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #202a28;
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.45;
+  box-shadow: var(--shadow);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(4px);
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+
+.floating-tooltip.show {
+  opacity: 1;
+  transform: translateY(0);
+}
+
 @media (max-width: 1220px) {
   .workspace { grid-template-columns: minmax(280px, 360px) minmax(400px, 1fr); }
   .side-stack { grid-column: 1 / -1; grid-template-columns: repeat(2, minmax(280px, 1fr)); }

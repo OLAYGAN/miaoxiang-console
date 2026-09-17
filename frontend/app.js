@@ -347,6 +347,7 @@ async function runControl(action) {
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
+  setupTooltips();
   bindEvents();
   await Promise.allSettled([loadHealth(), loadSettings(), loadCurrent()]);
   await loadAccounts();
@@ -357,6 +358,65 @@ document.addEventListener("DOMContentLoaded", async () => {
   setInterval(loadHealth, 5000);
   setInterval(loadLoginBrowser, 5000);
 });
+
+function setupTooltips() {
+  const tooltip = document.getElementById("floating-tooltip");
+  let currentTarget = null;
+
+  function show(target, event) {
+    const text = target.getAttribute("data-tip");
+    if (!text) return;
+    currentTarget = target;
+    tooltip.textContent = text;
+    tooltip.classList.add("show");
+    tooltip.setAttribute("aria-hidden", "false");
+    position(event instanceof PointerEvent ? event : null, target);
+  }
+
+  function position(event, target) {
+    const rect = target.getBoundingClientRect();
+    const point = event ?? { clientX: rect.left + rect.width / 2, clientY: rect.bottom };
+    tooltip.style.left = "0px";
+    tooltip.style.top = "0px";
+    const box = tooltip.getBoundingClientRect();
+    const padding = 10;
+    let x = point.clientX + 12;
+    let y = point.clientY + 14;
+    if (x + box.width + padding > window.innerWidth) x = window.innerWidth - box.width - padding;
+    if (y + box.height + padding > window.innerHeight) y = point.clientY - box.height - 12;
+    x = Math.max(padding, x);
+    y = Math.max(padding, y);
+    tooltip.style.left = `${x}px`;
+    tooltip.style.top = `${y}px`;
+  }
+
+  function hide() {
+    currentTarget = null;
+    tooltip.classList.remove("show");
+    tooltip.setAttribute("aria-hidden", "true");
+  }
+
+  document.addEventListener("pointerover", (event) => {
+    const target = event.target.closest("[data-tip]");
+    if (target) show(target, event);
+  });
+  document.addEventListener("pointermove", (event) => {
+    if (currentTarget) position(event, currentTarget);
+  }, { passive: true });
+  document.addEventListener("pointerout", (event) => {
+    const target = event.target.closest("[data-tip]");
+    if (target && target === currentTarget) hide();
+  });
+  document.addEventListener("focusin", (event) => {
+    const target = event.target.closest("[data-tip]");
+    if (target) show(target, null);
+  });
+  document.addEventListener("focusout", hide);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") hide();
+  });
+  window.addEventListener("scroll", hide, { passive: true });
+}
 
 function bindEvents() {
   elements["account-select"].addEventListener("change", async () => {
