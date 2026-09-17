@@ -961,6 +961,79 @@ async def test_process_batch_recovers_preexisting_generations_before_submitting(
 
 
 @pytest.mark.asyncio
+async def test_process_batch_reclassifies_settled_assets_before_declaring_missing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+    from backend.models import GeneratedCandidate
+
+    flow = PageFlow(
+        page=FakePage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    flow.classification_retry_delay_ms = 0
+    first = LyricData(song_name="第一首", lyrics="a" * 120, style="s" * 60)
+    second = LyricData(song_name="第二首", lyrics="b" * 120, style="s" * 60)
+    classification_calls: list[list[str]] = []
+
+    async def ensure_ready(): return None
+    async def recover_existing_candidates(lyric_data_list): return {}
+    async def fill_inputs(lyric_data): return None
+    async def generate(): return None
+    async def check_limit(): return None
+    async def wait_for_batch_generation(baseline_count, lyric_count, baseline_anchor=None):
+        return [
+            {"index": 0, "title": "第一首版本", "loading": False},
+            {"index": 1, "title": "第二首版本", "loading": False},
+        ]
+
+    async def classify_generated_cards(cards, lyric_data_list):
+        names = [item.song_name for item in lyric_data_list]
+        classification_calls.append(names)
+        if len(classification_calls) == 1:
+            return {"第一首": [
+                GeneratedCandidate(song_name="第一首", generated_title="第一首版本", card_index=0)
+            ]}
+        return {
+            "第一首": [
+                GeneratedCandidate(song_name="第一首", generated_title="第一首版本", card_index=0)
+            ],
+            "第二首": [
+                GeneratedCandidate(song_name="第二首", generated_title="第二首版本", card_index=1)
+            ],
+        }
+
+    async def export_candidate(candidate, lyric_data):
+        return tmp_path / f"{lyric_data.song_name}.mp3"
+
+    monkeypatch.setattr(flow, "ensure_create_page_ready", ensure_ready)
+    monkeypatch.setattr(flow, "recover_existing_candidates", recover_existing_candidates)
+    monkeypatch.setattr(flow, "fill_inputs", fill_inputs)
+    monkeypatch.setattr(flow, "generate", generate)
+    monkeypatch.setattr(flow, "check_generation_limit", check_limit)
+    monkeypatch.setattr(
+        flow,
+        "asset_card_states",
+        lambda: [
+            {"index": 0, "title": "第一首版本", "loading": False},
+            {"index": 1, "title": "第二首版本", "loading": False},
+            {"index": 2, "title": "旧锚点", "loading": False},
+        ],
+    )
+    monkeypatch.setattr(flow, "wait_for_batch_generation", wait_for_batch_generation)
+    monkeypatch.setattr(flow, "classify_generated_cards", classify_generated_cards)
+    monkeypatch.setattr(flow, "export_candidate", export_candidate)
+
+    results = await flow.process_batch([first, second], lambda step, song=None: None)
+
+    assert len(classification_calls) == 2
+    assert [result.status for result in results] == ["success", "success"]
+
+
+@pytest.mark.asyncio
 async def test_recover_existing_candidates_includes_completed_top_cards(
     tmp_path: Path,
     monkeypatch,

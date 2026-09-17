@@ -356,6 +356,7 @@ class PageFlow:
         self.settings = settings
         self.screenshot_dir = Path(screenshot_dir)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+        self.classification_retry_delay_ms = 5000
 
     async def process_song(
         self,
@@ -447,6 +448,31 @@ class PageFlow:
             generated_cards,
             lyrics_to_submit,
         ) if lyrics_to_submit else {}
+        missing_after_first_classification = any(
+            not candidates.get(lyric_data.song_name)
+            for lyric_data in lyrics_to_submit
+        )
+        if lyrics_to_submit and generated_cards and missing_after_first_classification:
+            on_step("verify_details_settling", None)
+            await self.page.wait_for_timeout(self.classification_retry_delay_ms)
+            current_states = await _maybe_await(self.asset_card_states())
+            settled_cards = new_cards_above_anchor(
+                current_states,
+                baseline_anchor,
+                baseline_count=baseline_count,
+            )
+            settled_candidates = await self.classify_generated_cards(
+                settled_cards,
+                lyrics_to_submit,
+            )
+            for song_name, song_candidates in settled_candidates.items():
+                merged = {
+                    (candidate.generated_title, candidate.card_index): candidate
+                    for candidate in candidates.get(song_name, [])
+                }
+                for candidate in song_candidates:
+                    merged[(candidate.generated_title, candidate.card_index)] = candidate
+                candidates[song_name] = list(merged.values())
         for song_name, song_candidates in recovered_candidates.items():
             candidates[song_name] = song_candidates
 
