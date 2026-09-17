@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import date
 
 import pytest
 from fastapi.testclient import TestClient
@@ -51,7 +52,7 @@ def account_payload(tmp_path: Path, name: str = "账号01", port: int = 9222) ->
 
 
 def write_song(tmp_path: Path, name: str = "01_song") -> Path:
-    directory = tmp_path / "lyrics" / "2026-09-17" / "账号01"
+    directory = tmp_path / "lyrics" / "2026-09-17"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{name}.md"
     lyrics = "夜色像一台缓慢转动的引擎\n穿过城市也穿过我的呼吸\n" + "旧灯光写下未完成的旋律\n" * 20
@@ -137,6 +138,33 @@ def test_start_requires_existing_account_and_songs(tmp_path: Path) -> None:
         account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
         empty = client.post("/api/runs", json={"account_id": account["id"], "song_files": []})
         assert empty.status_code == 422
+
+
+def test_start_uses_today_when_day_is_omitted(tmp_path: Path) -> None:
+    app, holder = make_client(tmp_path, stop_after=1)
+    write_song(tmp_path, "01_today")
+    fixed_day = tmp_path / "lyrics" / "2026-09-17"
+    today = tmp_path / "lyrics" / date.today().isoformat()
+    if fixed_day != today and fixed_day.is_dir():
+        fixed_day.rename(today)
+    with TestClient(app) as client:
+        account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
+        response = client.post(
+            "/api/runs",
+            json={
+                "account_id": account["id"],
+                "song_files": ["01_today.md"],
+                "fresh_run": True,
+            },
+        )
+        assert response.status_code == 202
+        for _ in range(100):
+            current = client.get("/api/runs/current").json()
+            if current["status"] in {"stopped", "completed", "failed"}:
+                break
+            client.post("/api/runs/control", json={"action": "stop"})
+        assert current["status"] == "stopped"
+        assert holder["browser"].flow.processed == 1
 
 
 def test_run_stop_releases_browser_and_reports_state(tmp_path: Path) -> None:

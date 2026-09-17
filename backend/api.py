@@ -1,6 +1,7 @@
 """FastAPI control surface for the local automation console."""
 
 from collections.abc import Callable
+from datetime import date
 import os
 from pathlib import Path
 
@@ -162,7 +163,7 @@ def create_app(
     @app.get("/api/accounts/{account_id}/songs")
     async def list_songs(account_id: str, day: str | None = None) -> list[dict]:
         account = account_repository.get(account_id)
-        files = list_lyric_files(Path(account.lyric_dir), account.account_name, day=day)
+        files = list_lyric_files(Path(account.lyric_dir), day=day)
         result: list[dict] = []
         for path in files:
             item = {
@@ -184,9 +185,10 @@ def create_app(
     async def start_run(request: RunRequest) -> dict:
         account = account_repository.get(request.account_id)
         root = Path(account.lyric_dir)
+        day = request.day or date.today().isoformat()
         selected: list[Path] = []
         for file_name in request.song_files:
-            path = (root / (request.day or "") / account.account_name / Path(file_name).name).resolve()
+            path = (root / day / Path(file_name).name).resolve()
             if not path.is_file():
                 raise NotFoundError(f"歌词文件不存在: {file_name}")
             selected.append(path)
@@ -194,7 +196,7 @@ def create_app(
         snapshot = engine.start(
             account,
             selected,
-            day=request.day,
+            day=day,
             fresh_run=request.fresh_run,
         )
         return snapshot.model_dump(mode="json")

@@ -79,10 +79,10 @@ def test_parse_lyrics_rejects_short_content() -> None:
         parse_lyrics(text)
 
 
-def test_list_lyric_files_uses_date_and_account(tmp_path: Path) -> None:
+def test_list_lyric_files_reads_todays_project_date_folder(tmp_path: Path) -> None:
     root = tmp_path / "lyrics"
-    expected_dir = root / "2026-09-17" / "账号01"
-    other_dir = root / "2026-09-16" / "账号01"
+    expected_dir = root / "2026-09-17"
+    other_dir = root / "2026-09-16"
     expected_dir.mkdir(parents=True)
     other_dir.mkdir(parents=True)
     (expected_dir / "02_second.md").write_text("b", encoding="utf-8")
@@ -90,6 +90,6 @@ def test_list_lyric_files_uses_date_and_account(tmp_path: Path) -> None:
     (expected_dir / "ignored.txt").write_text("c", encoding="utf-8")
     (other_dir / "old.md").write_text("d", encoding="utf-8")
 
-    files = list_lyric_files(root, "账号01", day="2026-09-17")
+    files = list_lyric_files(root, day="2026-09-17")
 
     assert [path.name for path in files] == ["01_first.md", "02_second.md"]

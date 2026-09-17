@@ -62,11 +62,10 @@ def _remove_repeated_title(lyrics: str, song_name: str) -> str:
 
 def list_lyric_files(
     root: Path,
-    account: str,
     day: str | None = None,
 ) -> list[Path]:
     day_value = day or date.today().isoformat()
-    directory = Path(root) / day_value / account
+    directory = Path(root) / day_value
     if not directory.is_dir():
         return []
     return sorted(path for path in directory.glob("*.md") if path.is_file())
