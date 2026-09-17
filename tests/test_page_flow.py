@@ -364,7 +364,7 @@ async def test_refresh_asset_tabs_switches_lyrics_and_back_to_songs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_wait_for_generation_refreshes_assets_every_30_seconds(
+async def test_wait_for_generation_refreshes_assets_once_and_waits_for_title(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -389,11 +389,13 @@ async def test_wait_for_generation_refreshes_assets_every_30_seconds(
     async def refresh_assets(page) -> None:
         refresh_times.append(page.clock)
 
-    async def read_title() -> str:
-        return "新课本" if fake_page.clock >= 65 else "旧歌曲"
+    async def read_generation_state() -> dict:
+        if fake_page.clock >= 65:
+            return {"title": "新课本", "has_placeholder": False}
+        return {"title": "", "has_placeholder": True}
 
     monkeypatch.setattr(page_flow_module, "refresh_asset_tabs", refresh_assets)
-    monkeypatch.setattr(flow, "first_asset_title", read_title)
+    monkeypatch.setattr(flow, "asset_generation_state", read_generation_state)
     monkeypatch.setattr(
         page_flow_module,
         "datetime",
@@ -403,7 +405,7 @@ async def test_wait_for_generation_refreshes_assets_every_30_seconds(
     result = await flow.wait_for_generation("旧歌曲")
 
     assert result == "新课本"
-    assert refresh_times == [0, 30, 60]
+    assert refresh_times == [0]
 
 
 @pytest.mark.asyncio

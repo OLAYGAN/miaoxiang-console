@@ -330,6 +330,38 @@ class PageFlow:
         except Exception as error:
             await self._raise_with_screenshot("资产列表读取", error)
 
+    async def asset_generation_state(self) -> dict:
+        try:
+            value = await self.page.evaluate(
+                """() => {
+                    const width = window.innerWidth || document.documentElement.clientWidth;
+                    const cards = Array.from(document.querySelectorAll(
+                        '[class*="libraryItemWrapper"],[class*="songItem"],[class*="assetItem"]'
+                    )).filter(element => {
+                        const rect = element.getBoundingClientRect();
+                        return rect.left > width * 0.45 &&
+                            rect.right > width * 0.55 &&
+                            rect.width > 0 &&
+                            rect.height > 0;
+                    });
+                    if (!cards.length) return {title: '', has_placeholder: false};
+                    const card = cards[0];
+                    const titleNode = card.querySelector(
+                        '[class*="title"],[class*="songName"],[class*="name"]'
+                    );
+                    const title = (titleNode ? titleNode.textContent : '').trim();
+                    const markerText = `${card.className} ${card.textContent}`;
+                    const loadingMarker = /生成中|loading|skeleton|placeholder/i.test(markerText);
+                    return {
+                        title,
+                        has_placeholder: !title || loadingMarker,
+                    };
+                }"""
+            )
+            return value if isinstance(value, dict) else {"title": "", "has_placeholder": False}
+        except Exception as error:
+            await self._raise_with_screenshot("生成状态读取", error)
+
     async def generate(self) -> None:
         try:
             button = self.page.locator("button").filter(
@@ -358,16 +390,16 @@ class PageFlow:
     async def wait_for_generation(self, before_title: str) -> str:
         deadline = datetime.now().timestamp() + self.settings.generation_timeout_seconds
         last_title = before_title
-        last_refresh_at: float | None = None
+        saw_placeholder = False
+        await refresh_asset_tabs(self.page)
         while datetime.now().timestamp() < deadline:
-            now = datetime.now().timestamp()
-            if last_refresh_at is None or now - last_refresh_at >= 30:
-                await refresh_asset_tabs(self.page)
-                last_refresh_at = now
-            current = await self.first_asset_title()
-            if current and current != before_title:
+            state = await self.asset_generation_state()
+            current = str(state.get("title") or "")
+            last_title = current or "生成中"
+            if state.get("has_placeholder"):
+                saw_placeholder = True
+            elif current and (saw_placeholder or current != before_title):
                 return current
-            last_title = current
             await self.page.wait_for_timeout(5000)
         await self._screenshot("generation-timeout")
         raise BrowserFlowError(
