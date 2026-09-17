@@ -85,6 +85,7 @@ function renderTaskStatus() {
     failed: "任务失败",
     stopped: "已停止",
     generation_limit: "生成上限",
+    login_required: "需要登录",
   };
   chip.textContent = labels[state.current.status] || state.current.status;
   chip.className = `status-chip ${runningStatuses().has(state.current.status) ? "is-active" : state.current.status === "completed" ? "is-live" : "is-warn"}`;

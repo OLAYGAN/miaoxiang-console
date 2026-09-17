@@ -11,6 +11,7 @@ from backend.errors import (
     BrowserFlowError,
     ConflictError,
     GenerationLimitError,
+    LoginRequiredError,
     ValidationFailed,
 )
 from backend.events import EventBus
@@ -181,6 +182,8 @@ class TaskEngine:
                     await self._process_with_retries(account, flow, day, path, progress, lyric_data)
                     if self.current.status == "generation_limit":
                         return
+                    if self.current.status == "login_required":
+                        return
 
                     if file_index < len(song_files) - 1 and account.song_interval_seconds > 0:
                         self._update_status(self.current.status, step="waiting_before_next_song")
@@ -247,6 +250,17 @@ class TaskEngine:
                     error=error.message,
                 )
                 self._complete("generation_limit", error.message)
+                return
+            except LoginRequiredError as error:
+                self._finish_song(
+                    day,
+                    account,
+                    progress,
+                    status="需要登录",
+                    current_step=current_step,
+                    error=error.message,
+                )
+                self._complete("login_required", error.message)
                 return
             except ValidationFailed as error:
                 self._finish_song(

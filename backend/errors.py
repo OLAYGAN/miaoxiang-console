@@ -37,3 +37,7 @@ class BrowserFlowError(AppError):
 
 class GenerationLimitError(BrowserFlowError):
     code = "GENERATION_LIMIT"
+
+
+class LoginRequiredError(BrowserFlowError):
+    code = "LOGIN_REQUIRED"

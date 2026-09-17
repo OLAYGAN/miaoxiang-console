@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import date
 
 import pytest
 
@@ -8,6 +9,7 @@ from backend.page_flow import (
         PageFlow,
         archive_download,
         clear_and_type,
+        is_login_challenge,
         trusted_click,
         type_segmented,
 )
@@ -116,6 +118,14 @@ def test_archive_download_moves_file_and_handles_collision(tmp_path: Path) -> No
         archive_download(empty, output_root, "坏文件", "2026-09-17")
 
 
+def test_detects_platform_login_challenge_text() -> None:
+    logged_in_text = "灵感创作模式 专业模式 模型选择 自动 生成歌曲"
+    challenge_text = "扫码登录 验证码登录 登录即代表同意用户协议"
+
+    assert is_login_challenge(logged_in_text) is False
+    assert is_login_challenge(challenge_text) is True
+
+
 @pytest.mark.asyncio
 async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
     account = make_account(tmp_path)
@@ -175,7 +185,7 @@ async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
         "export_song",
         "download_song",
     ]
-    assert result == tmp_path / "output" / "2026-09-17" / "夜色引擎.mp3"
+    assert result == tmp_path / "output" / date.today().isoformat() / "夜色引擎.mp3"
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from backend.errors import BrowserFlowError, ConflictError, GenerationLimitError, ValidationFailed
+from backend.errors import (
+    BrowserFlowError,
+    ConflictError,
+    GenerationLimitError,
+    LoginRequiredError,
+    ValidationFailed,
+)
 from backend.events import EventBus
 from backend.models import AccountConfig, ConsoleSettings, SongRecord
 from backend.storage import RunStateRepository
@@ -152,6 +158,26 @@ async def test_generation_limit_stops_whole_run(tmp_path: Path) -> None:
 
     assert flow.processed == ["01_first"]
     assert engine.current.status == "generation_limit"
+    assert state.get("2026-09-17", "账号01", "02_second.md") is None
+
+
+async def test_login_required_stops_without_retries(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    songs = [make_song(account.lyric_dir, "01_first"), make_song(account.lyric_dir, "02_second")]
+    flow = FakeFlow()
+
+    async def require_login(lyric_data, on_step):
+        raise LoginRequiredError("请先登录妙响账号")
+
+    flow.process_song = require_login
+    engine, state, _ = make_engine(tmp_path, flow)
+    engine.start(account, songs, day="2026-09-17")
+    await engine.wait()
+
+    assert len(flow.processed) == 0
+    assert engine.current.status == "login_required"
+    assert state.get("2026-09-17", "账号01", "01_first.md").status == "需要登录"
+    assert state.get("2026-09-17", "账号01", "01_first.md").attempts == 1
     assert state.get("2026-09-17", "账号01", "02_second.md") is None
 
 

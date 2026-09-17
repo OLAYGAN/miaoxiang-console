@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
 from backend.errors import BrowserFlowError, GenerationLimitError
+from backend.errors import LoginRequiredError
 from backend.models import AccountConfig, ConsoleSettings, LyricData
 
 
@@ -106,6 +107,11 @@ def archive_download(
     return destination
 
 
+def is_login_challenge(body_text: str) -> bool:
+    markers = ("扫码登录", "验证码登录", "登录二维码")
+    return any(marker in body_text for marker in markers)
+
+
 class PageFlow:
     def __init__(
         self,
@@ -166,6 +172,10 @@ class PageFlow:
                 wait_until="domcontentloaded",
                 timeout=self.settings.page_load_timeout_seconds * 1000,
             )
+            body_text = await self.page.inner_text("body")
+            if is_login_challenge(body_text):
+                await self._screenshot("login-required")
+                raise LoginRequiredError("检测到妙响登录弹窗，请先登录当前账号的 Chrome 配置")
             editor = self.page.locator(".ql-editor").first
             try:
                 await editor.wait_for(state="visible", timeout=8000)
@@ -445,6 +455,6 @@ class PageFlow:
     async def _raise_with_screenshot(self, step: str, error: Exception) -> None:
         path = await self._screenshot(re.sub(r"[^a-z0-9-]+", "-", step).strip("-"))
         suffix = f"；截图: {path}" if path else ""
-        if isinstance(error, GenerationLimitError):
+        if isinstance(error, (GenerationLimitError, LoginRequiredError)):
             raise error
         raise BrowserFlowError(f"{step}失败: {error}{suffix}") from error
