@@ -246,14 +246,21 @@ async def export_song(
     raise BrowserFlowError(f"导出跳转超时: {page.url}")
 
 
-async def open_download_menu(page: Any, song_name: str) -> Any:
+async def open_download_menu(
+    page: Any,
+    song_name: str,
+    lyrics: str | None = None,
+) -> Any:
     results_tab = page.locator("button").filter(has_text="生成结果").first
     await results_tab.click(timeout=5000)
     await page.wait_for_timeout(3000)
 
-    card = page.locator('[class*="generatedSongCard"]').filter(
-        has_text=song_name
-    ).first
+    if lyrics is None:
+        card = page.locator('[class*="generatedSongCard"]').filter(
+            has_text=song_name
+        ).first
+    else:
+        card = await find_exported_download_card(page, song_name, lyrics)
     trigger = card.locator("div[class*='trigger']").last
     await trigger.scroll_into_view_if_needed(timeout=5000)
     await trigger.hover(timeout=5000)
@@ -269,10 +276,70 @@ async def open_download_menu(page: Any, song_name: str) -> Any:
     return page.locator('[role="menuitem"]').filter(has_text="下载").first
 
 
+async def find_exported_download_card(
+    page: Any,
+    song_name: str,
+    lyrics: str,
+) -> Any:
+    cards = page.locator('[class*="generatedSongCard"]').filter(visible=True)
+    card_count = await cards.count()
+    lyric_probe = _lyric_probe(lyrics)
+
+    for index in range(card_count):
+        card = cards.nth(index)
+        source_tag = card.locator('[class*="sourceTag"]').first
+        source_text = await source_tag.inner_text()
+        if "编辑器导出" not in source_text:
+            continue
+
+        title_node = card.locator('[class*="title"]').first
+        card_title = (await title_node.inner_text()).strip()
+        if card_title != song_name:
+            continue
+
+        await card.click(timeout=5000)
+        detail_title_nodes = page.locator(
+            '[class*="detailPanel"] [class*="infoTitle"]'
+        ).filter(visible=True)
+        if await detail_title_nodes.count():
+            detail_title = (await detail_title_nodes.first.inner_text()).strip()
+            if detail_title != song_name:
+                continue
+            lyric_title = page.locator(
+                '[class*="detailPanel"] [class*="sectionTitle"]'
+            ).filter(has_text=re.compile(r"^\s*歌词\s*$")).first
+            detail_content = lyric_title.locator(
+                "xpath=following-sibling::*[contains(@class,'sectionContent')][1]"
+            )
+            detail_text = await detail_content.inner_text()
+            if lyric_probe not in _normalize_lyric_content(detail_text):
+                continue
+        return card
+
+    raise BrowserFlowError(
+        f"未找到可下载的导出歌曲：需要标题为“{song_name}”、标记为编辑器导出，且歌词详情匹配"
+    )
+
+
 async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def new_cards_above_anchor(
+    current_states: list[dict],
+    anchor_title: str,
+    *,
+    baseline_count: int,
+) -> list[dict]:
+    """Return inserted cards even when a virtual list keeps a fixed length."""
+    if anchor_title:
+        for index, state in enumerate(current_states):
+            if str(state.get("title") or "") == anchor_title:
+                return current_states[:index]
+    new_count = max(len(current_states) - baseline_count, 0)
+    return current_states[:new_count]
 
 
 class PageFlow:
@@ -323,7 +390,10 @@ class PageFlow:
         await self.export_song(lyric_data.song_name)
 
         on_step("download_song")
-        downloaded = await self.download_song(lyric_data.song_name)
+        downloaded = await self.download_song(
+            lyric_data.song_name,
+            lyric_data.lyrics,
+        )
         return archive_download(
             downloaded,
             Path(self.account.output_dir),
@@ -338,9 +408,26 @@ class PageFlow:
     ) -> list[BatchSongResult]:
         on_step("page_ready", None)
         await self.ensure_create_page_ready()
-        baseline_count = await _maybe_await(self.asset_card_count())
+        on_step("recover_existing_generation", None)
+        recovered_candidates = await self.recover_existing_candidates(lyric_data_list)
+        lyrics_to_submit = [
+            lyric_data
+            for lyric_data in lyric_data_list
+            if not recovered_candidates.get(lyric_data.song_name)
+        ]
+        baseline_states = await _maybe_await(self.asset_card_states())
+        baseline_count = len(baseline_states)
+        baseline_anchor = next(
+            (
+                str(state.get("title") or "")
+                for state in baseline_states
+                if not state.get("loading")
+            ),
+            "",
+        )
 
-        for lyric_data in lyric_data_list:
+        generated_cards: list[dict] = []
+        for lyric_data in lyrics_to_submit:
             on_step("fill_inputs", lyric_data.song_name)
             await self.fill_inputs(lyric_data)
             on_step("generate", lyric_data.song_name)
@@ -349,15 +436,19 @@ class PageFlow:
             await self.check_generation_limit()
 
         on_step("wait_generation", None)
-        generated_cards = await self.wait_for_batch_generation(
-            baseline_count,
-            len(lyric_data_list),
-        )
+        if lyrics_to_submit:
+            generated_cards = await self.wait_for_batch_generation(
+                baseline_count,
+                len(lyrics_to_submit),
+                baseline_anchor=baseline_anchor,
+            )
         on_step("verify_details", None)
         candidates = await self.classify_generated_cards(
             generated_cards,
-            lyric_data_list,
-        )
+            lyrics_to_submit,
+        ) if lyrics_to_submit else {}
+        for song_name, song_candidates in recovered_candidates.items():
+            candidates[song_name] = song_candidates
 
         results: list[BatchSongResult] = []
         for lyric_data in lyric_data_list:
@@ -573,10 +664,53 @@ class PageFlow:
     async def asset_card_count(self) -> int:
         return len(await self.asset_card_states())
 
+    async def recover_existing_candidates(
+        self,
+        lyric_data_list: list[LyricData],
+    ) -> dict[str, list[GeneratedCandidate]]:
+        initial_states = await self.asset_card_states()
+        if not any(state.get("loading") for state in initial_states):
+            recent_count = max(len(lyric_data_list) * 2, 1)
+            return await self.classify_generated_cards(
+                initial_states[:recent_count],
+                lyric_data_list,
+            )
+
+        anchor_state = next(
+            (state for state in initial_states if not state.get("loading")),
+            None,
+        )
+        anchor_title = str(anchor_state.get("title") or "") if anchor_state else ""
+        await refresh_asset_tabs(self.page)
+        deadline = datetime.now().timestamp() + self.settings.generation_timeout_seconds
+
+        while datetime.now().timestamp() < deadline:
+            states = await self.asset_card_states()
+            if anchor_title:
+                anchor_index = next(
+                    (index for index, state in enumerate(states)
+                     if str(state.get("title") or "") == anchor_title),
+                    0,
+                )
+                resolving_cards = states[:anchor_index]
+            else:
+                resolving_cards = states
+
+            if not any(state.get("loading") for state in resolving_cards):
+                return await self.classify_generated_cards(
+                    resolving_cards,
+                    lyric_data_list,
+                )
+            await self.page.wait_for_timeout(5000)
+
+        await self._screenshot("preexisting-generation-timeout")
+        return {}
+
     async def wait_for_batch_generation(
         self,
         baseline_count: int,
         lyric_count: int,
+        baseline_anchor: str = "",
     ) -> list[dict]:
         await refresh_asset_tabs(self.page)
         started_at = datetime.now().timestamp()
@@ -586,8 +720,11 @@ class PageFlow:
 
         while datetime.now().timestamp() < deadline:
             states = await self.asset_card_states()
-            new_count = max(len(states) - baseline_count, 0)
-            new_states = states[:new_count]
+            new_states = new_cards_above_anchor(
+                states,
+                baseline_anchor,
+                baseline_count=baseline_count,
+            )
             completed = [state for state in new_states if not state.get("loading")]
             has_loading = any(state.get("loading") for state in new_states)
             last_completed = [
@@ -753,7 +890,10 @@ class PageFlow:
 
             await self.enter_editor(candidate.generated_title)
             await self.export_song(lyric_data.song_name)
-            downloaded = await self.download_song(lyric_data.song_name)
+            downloaded = await self.download_song(
+                lyric_data.song_name,
+                lyric_data.lyrics,
+            )
             return archive_download(
                 downloaded,
                 Path(self.account.output_dir),
@@ -769,9 +909,13 @@ class PageFlow:
         except Exception as error:
             await self._raise_with_screenshot("导出选中版本", error)
 
-    async def download_song(self, song_name: str) -> Path:
+    async def download_song(
+        self,
+        song_name: str,
+        lyrics: str | None = None,
+    ) -> Path:
         try:
-            download_item = await open_download_menu(self.page, song_name)
+            download_item = await open_download_menu(self.page, song_name, lyrics)
             async with self.page.expect_download(
                 timeout=self.settings.download_timeout_seconds * 1000
             ) as download_info:
