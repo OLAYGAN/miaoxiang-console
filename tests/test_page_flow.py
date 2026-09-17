@@ -15,6 +15,7 @@ from backend.page_flow import (
         refresh_asset_tabs,
         select_model,
         select_singer,
+        verify_generated_song,
         trusted_click,
         type_segmented,
 )
@@ -408,6 +409,67 @@ async def test_wait_for_generation_refreshes_assets_once_and_waits_for_title(
     assert refresh_times == [0]
 
 
+class FakeDetailPage:
+    def __init__(self, detail_content: str) -> None:
+        self.card = FakeDetailLocator("card", self)
+        self.content = FakeDetailLocator("content", self)
+        self.detail_content = detail_content
+        self.calls: list[str] = []
+
+    def locator(self, selector: str):
+        if selector == '[class*="libraryItemWrapper"]':
+            return self.card
+        if selector == '[class*="detailPanel"] [class*="sectionContent"]':
+            return self.content
+        raise AssertionError(f"unexpected selector: {selector}")
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        self.calls.append("wait")
+
+
+class FakeDetailLocator:
+    def __init__(self, name: str, page: FakeDetailPage) -> None:
+        self.name = name
+        self.page = page
+
+    @property
+    def first(self):
+        return self
+
+    async def click(self, **kwargs) -> None:
+        self.page.calls.append(f"click-{self.name}")
+
+    async def inner_text(self) -> str:
+        return self.page.detail_content
+
+
+@pytest.mark.asyncio
+async def test_verify_generated_song_clicks_card_and_checks_lyric_content() -> None:
+    page = FakeDetailPage(
+        "歌名：《新课本》\n油 墨 还 没 散 尽！书 页 白 得 发 亮\n第一行 名字\n"
+        "油 墨 还 没 散 尽！书 页 白 得 发 亮\n写 得 歪 歪 扭 扭"
+    )
+
+    await verify_generated_song(
+        page,
+        "油墨还没散尽，书页白得发亮。\n第一行名字\n"
+        "油墨还没散尽，书页白得发亮。\n写得歪歪扭扭",
+    )
+
+    assert page.calls == ["click-card", "wait"]
+
+
+@pytest.mark.asyncio
+async def test_verify_generated_song_rejects_mismatched_lyric_content() -> None:
+    page = FakeDetailPage("完全不同的歌词内容")
+
+    with pytest.raises(BrowserFlowError, match="歌词详情不匹配"):
+        await verify_generated_song(
+            page,
+            "油墨还没散尽，书页白得发亮。\n第一行名字\n油墨还没散尽，书页白得发亮。",
+        )
+
+
 @pytest.mark.asyncio
 async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
     account = make_account(tmp_path)
@@ -436,6 +498,7 @@ async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
     flow.generate = lambda: step("generate")
     flow.check_generation_limit = lambda: step("check_generation_limit")
     flow.wait_for_generation = lambda before: step("wait_for_generation")
+    flow.verify_generated_song = lambda lyrics: step("verify_generated_song")
     flow.enter_editor = lambda song_name: step("enter_editor")
     flow.export_song = lambda song_name: step("export_song")
     flow.download_song = lambda song_name: step("download_song")
@@ -452,6 +515,7 @@ async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
         "generate",
         "check_generation_limit",
         "wait_for_generation",
+        "verify_generated_song",
         "enter_editor",
         "export_song",
         "download_song",
@@ -463,6 +527,7 @@ async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
         "generate",
         "check_limit",
         "wait_generation",
+        "verify_details",
         "enter_editor",
         "export_song",
         "download_song",

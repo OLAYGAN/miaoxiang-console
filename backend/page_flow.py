@@ -180,6 +180,30 @@ async def refresh_asset_tabs(page: Any) -> None:
     await page.wait_for_timeout(1000)
 
 
+def _normalize_lyric_content(text: str) -> str:
+    return "".join(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]+", text.lower()))
+
+
+async def verify_generated_song(page: Any, lyrics: str) -> None:
+    normalized_lyrics = _normalize_lyric_content(lyrics)
+    if len(normalized_lyrics) < 20:
+        raise BrowserFlowError("输入歌词太短，无法做详情校验")
+
+    card = page.locator('[class*="libraryItemWrapper"]').first
+    await card.click(timeout=5000)
+    await page.wait_for_timeout(1000)
+
+    detail_content = page.locator(
+        '[class*="detailPanel"] [class*="sectionContent"]'
+    ).first
+    detail_text = await detail_content.inner_text()
+    normalized_detail = _normalize_lyric_content(detail_text)
+    # Use a stable prefix from the submitted lyric rather than the AI-generated title.
+    lyric_probe = normalized_lyrics[:48]
+    if lyric_probe not in normalized_detail:
+        raise BrowserFlowError("歌词详情不匹配：生成卡片详情中没有找到本次输入的歌词片段")
+
+
 class PageFlow:
     def __init__(
         self,
@@ -217,6 +241,9 @@ class PageFlow:
 
         on_step("wait_generation")
         actual_song_name = await self.wait_for_generation(before)
+
+        on_step("verify_details")
+        await self.verify_generated_song(lyric_data.lyrics)
 
         on_step("enter_editor")
         await self.enter_editor(actual_song_name)
@@ -277,6 +304,14 @@ class PageFlow:
             raise
         except Exception as error:
             await self._raise_with_screenshot("虚拟歌手选择", error)
+
+    async def verify_generated_song(self, lyrics: str) -> None:
+        try:
+            await verify_generated_song(self.page, lyrics)
+        except GenerationLimitError:
+            raise
+        except Exception as error:
+            await self._raise_with_screenshot("生成歌曲详情校验", error)
 
     async def fill_inputs(self, lyric_data: LyricData) -> None:
         try:
