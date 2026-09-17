@@ -16,6 +16,8 @@ from backend.page_flow import (
         select_model,
         select_singer,
         verify_generated_song,
+        export_song,
+        open_download_menu,
         trusted_click,
         type_segmented,
 )
@@ -504,6 +506,160 @@ async def test_verify_generated_song_rejects_mismatched_lyric_content() -> None:
             page,
             "油墨还没散尽，书页白得发亮。\n第一行名字\n油墨还没散尽，书页白得发亮。",
         )
+
+
+class FakeExportPage:
+    def __init__(self) -> None:
+        self.url = "https://music.douyin.com/studio/playground"
+        self.top_export = FakeExportLocator("top-export", self)
+        self.modal = FakeExportLocator("modal", self)
+        self.name_input = FakeExportLocator("name-input", self)
+        self.confirm = FakeExportLocator("confirm", self)
+        self.calls: list[str] = []
+        self.locator_calls: list[str] = []
+
+    def locator(self, selector: str):
+        self.locator_calls.append(selector)
+        if selector == "button":
+            return self.top_export
+        if selector == ".semi-modal-content":
+            return self.modal
+        raise AssertionError(f"unexpected page selector: {selector}")
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        self.calls.append(f"wait-{timeout}")
+
+
+class FakeExportLocator:
+    def __init__(self, name: str, page: FakeExportPage) -> None:
+        self.name = name
+        self.page = page
+
+    @property
+    def first(self):
+        return self
+
+    @property
+    def last(self):
+        return self
+
+    def filter(self, **kwargs):
+        self.page.calls.append(f"filter-{self.name}")
+        return self
+
+    def locator(self, selector: str):
+        if self.name == "modal" and selector == "input.semi-input":
+            return self.page.name_input
+        if self.name == "modal" and selector == ".semi-modal-footer button":
+            return self.page.confirm
+        raise AssertionError(f"unexpected modal selector: {selector}")
+
+    async def click(self, **kwargs) -> None:
+        self.page.calls.append(f"click-{self.name}")
+        if self.name == "confirm":
+            self.page.url = "https://music.douyin.com/studio/assets"
+
+    async def press(self, key: str) -> None:
+        self.page.calls.append(f"press-{self.name}-{key}")
+
+    async def type(self, text: str, delay: int = 0) -> None:
+        self.page.calls.append(f"type-{self.name}-{text}")
+
+    async def input_value(self) -> str:
+        return "新课本"
+
+
+@pytest.mark.asyncio
+async def test_export_song_uses_modal_name_input_and_footer_button() -> None:
+    page = FakeExportPage()
+
+    await export_song(page, "新课本", timeout_seconds=1)
+
+    assert "click-top-export" in page.calls
+    assert "press-name-input-Control+a" in page.calls
+    assert "press-name-input-Delete" in page.calls
+    assert "type-name-input-新课本" in page.calls
+    assert "click-confirm" in page.calls
+    assert page.url.endswith("/assets")
+
+
+class FakeDownloadPage:
+    def __init__(self) -> None:
+        self.result_tab = FakeDownloadLocator("result-tab", self)
+        self.card = FakeDownloadLocator("card", self)
+        self.trigger = FakeDownloadLocator("trigger", self)
+        self.download_item = FakeDownloadLocator("download-item", self)
+        self.mouse = FakeDownloadMouse()
+        self.calls: list[str] = []
+
+    def locator(self, selector: str):
+        if selector == "button":
+            return self.result_tab
+        if selector == '[class*="generatedSongCard"]':
+            return self.card
+        if selector == '[role="menuitem"]':
+            return self.download_item
+        raise AssertionError(f"unexpected selector: {selector}")
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        self.calls.append(f"wait-{timeout}")
+
+
+class FakeDownloadLocator:
+    def __init__(self, name: str, page: FakeDownloadPage) -> None:
+        self.name = name
+        self.page = page
+
+    @property
+    def first(self):
+        return self
+
+    @property
+    def last(self):
+        return self
+
+    def filter(self, **kwargs):
+        self.page.calls.append(f"filter-{self.name}")
+        return self
+
+    def locator(self, selector: str):
+        if self.name == "card" and selector == "div[class*='trigger']":
+            return self.page.trigger
+        raise AssertionError(f"unexpected nested selector: {selector}")
+
+    async def hover(self, **kwargs) -> None:
+        self.page.calls.append(f"hover-{self.name}")
+
+    async def click(self, **kwargs) -> None:
+        self.page.calls.append(f"click-{self.name}")
+
+    async def scroll_into_view_if_needed(self, **kwargs) -> None:
+        self.page.calls.append(f"scroll-{self.name}")
+
+    async def bounding_box(self) -> dict:
+        return {"x": 100, "y": 200, "width": 28, "height": 28}
+
+
+class FakeDownloadMouse:
+    def __init__(self) -> None:
+        self.clicks: list[tuple[float, float]] = []
+
+    async def click(self, x: float, y: float, **kwargs) -> None:
+        self.clicks.append((x, y))
+
+
+@pytest.mark.asyncio
+async def test_open_download_menu_uses_generated_card_trigger_and_menu_item() -> None:
+    page = FakeDownloadPage()
+
+    item = await open_download_menu(page, "新课本")
+
+    assert item is page.download_item
+    assert "click-result-tab" in page.calls
+    assert "filter-card" in page.calls
+    assert "hover-trigger" in page.calls
+    assert page.mouse.clicks == [(114.0, 214.0)]
+    assert "filter-download-item" in page.calls
 
 
 @pytest.mark.asyncio

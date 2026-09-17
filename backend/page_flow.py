@@ -215,6 +215,58 @@ async def verify_generated_song(page: Any, lyrics: str) -> None:
         raise SongVerificationError("歌词详情不匹配：生成卡片详情中没有找到本次输入的歌词片段")
 
 
+async def export_song(
+    page: Any,
+    song_name: str,
+    *,
+    timeout_seconds: int = 60,
+) -> None:
+    top_export = page.locator("button").filter(has_text="导出").first
+    await top_export.click(timeout=5000)
+    await page.wait_for_timeout(5000)
+
+    modal = page.locator(".semi-modal-content").filter(visible=True).last
+    name_input = modal.locator("input.semi-input").first
+    await clear_and_type(name_input, song_name)
+    await page.wait_for_timeout(2000)
+
+    confirm = modal.locator(".semi-modal-footer button").filter(
+        has_text="导出"
+    ).last
+    await confirm.click(timeout=5000)
+
+    deadline = datetime.now().timestamp() + timeout_seconds
+    while datetime.now().timestamp() < deadline:
+        if "assets" in page.url:
+            await page.wait_for_timeout(3000)
+            return
+        await page.wait_for_timeout(3000)
+    raise BrowserFlowError(f"导出跳转超时: {page.url}")
+
+
+async def open_download_menu(page: Any, song_name: str) -> Any:
+    results_tab = page.locator("button").filter(has_text="生成结果").first
+    await results_tab.click(timeout=5000)
+    await page.wait_for_timeout(3000)
+
+    card = page.locator('[class*="generatedSongCard"]').filter(
+        has_text=song_name
+    ).first
+    trigger = card.locator("div[class*='trigger']").last
+    await trigger.scroll_into_view_if_needed(timeout=5000)
+    await trigger.hover(timeout=5000)
+    await page.wait_for_timeout(500)
+    box = await trigger.bounding_box()
+    if not box:
+        raise BrowserFlowError("下载更多按钮不可见")
+    await page.mouse.click(
+        box["x"] + box["width"] / 2,
+        box["y"] + box["height"] / 2,
+    )
+    await page.wait_for_timeout(3000)
+    return page.locator('[role="menuitem"]').filter(has_text="下载").first
+
+
 class PageFlow:
     def __init__(
         self,
@@ -484,25 +536,11 @@ class PageFlow:
 
     async def export_song(self, song_name: str) -> None:
         try:
-            top_export = self.page.locator("button").filter(has_text="导出").first
-            await trusted_click(self.page, top_export, "顶部导出")
-            await self.page.wait_for_timeout(5000)
-            name_input = self.page.locator("input").filter(
-                has_value=re.compile("新项目|项目")
-            ).first
-            await clear_and_type(name_input, song_name)
-            await self.page.wait_for_timeout(2000)
-            confirm = self.page.locator(".semi-modal button, [role='dialog'] button").filter(
-                has_text="导出"
-            ).last
-            await trusted_click(self.page, confirm, "确认导出")
-            deadline = datetime.now().timestamp() + self.settings.export_timeout_seconds
-            while datetime.now().timestamp() < deadline:
-                if "assets" in self.page.url:
-                    await self.page.wait_for_timeout(3000)
-                    return
-                await self.page.wait_for_timeout(3000)
-            raise BrowserFlowError(f"导出跳转超时: {self.page.url}")
+            await export_song(
+                self.page,
+                song_name,
+                timeout_seconds=self.settings.export_timeout_seconds,
+            )
         except GenerationLimitError:
             raise
         except Exception as error:
@@ -510,26 +548,7 @@ class PageFlow:
 
     async def download_song(self, song_name: str) -> Path:
         try:
-            results_tab = self.page.get_by_text("生成结果", exact=True).first
-            await trusted_click(self.page, results_tab, "生成结果标签")
-            await self.page.wait_for_timeout(3000)
-            title = self.page.get_by_text(song_name, exact=False).first
-            card = title.locator(
-                "xpath=ancestor::div[contains(@class,'song') or contains(@class,'asset') or contains(@class,'card')][1]"
-            )
-            trigger = card.locator("div[class*='trigger']").last
-            await trigger.scroll_into_view_if_needed(timeout=5000)
-            await trigger.hover(timeout=5000)
-            await self.page.wait_for_timeout(500)
-            box = await trigger.bounding_box()
-            if not box:
-                raise BrowserFlowError("下载更多按钮不可见")
-            await self.page.mouse.click(
-                box["x"] + box["width"] / 2,
-                box["y"] + box["height"] / 2,
-            )
-            await self.page.wait_for_timeout(3000)
-            download_item = self.page.get_by_text("下载", exact=True).first
+            download_item = await open_download_menu(self.page, song_name)
             async with self.page.expect_download(
                 timeout=self.settings.download_timeout_seconds * 1000
             ) as download_info:
