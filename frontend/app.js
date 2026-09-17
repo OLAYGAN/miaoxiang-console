@@ -2,6 +2,7 @@ const state = {
   accounts: [],
   accountId: "",
   songs: [],
+  uploads: [],
   selected: new Set(),
   current: null,
   settings: null,
@@ -10,6 +11,7 @@ const state = {
   socketTimer: null,
   pollTimer: null,
   formMode: "edit",
+  view: "task",
 };
 
 const elements = {};
@@ -22,8 +24,19 @@ for (const id of [
   "metric-step", "song-table", "queue-empty", "settings-form", "save-settings",
   "log-stream", "copy-logs", "open-logs", "open-screenshots", "toast",
   "open-login", "close-login",
+  "upload-caption", "upload-count", "upload-limit", "upload-real-name",
+  "upload-table", "upload-empty", "refresh-uploads", "start-upload",
 ]) {
   elements[id] = document.getElementById(id);
+}
+
+function renderView() {
+  document.querySelectorAll(".view").forEach((view) => {
+    view.classList.toggle("is-active", view.id === `view-${state.view}`);
+  });
+  document.querySelectorAll(".nav-item").forEach((item) => {
+    item.classList.toggle("is-active", item.dataset.view === state.view);
+  });
 }
 
 function formatTime(value) {
@@ -117,6 +130,9 @@ function fillAccountForm(account = null) {
     singer_name: "老岩",
     max_retries: 3,
     generation_batch_size: 2,
+    upload_batch_size: 10,
+    upload_artist_name: "白日逐梦",
+    upload_real_name: "龙英",
     song_interval_seconds: 5,
     create_url: "https://music.douyin.com/studio/create",
   };
@@ -140,6 +156,9 @@ function accountPayload() {
     singer_name: form.singer_name.value.trim(),
     max_retries: Number(form.max_retries.value),
     generation_batch_size: Number(form.generation_batch_size.value),
+    upload_batch_size: Number(form.upload_batch_size.value),
+    upload_artist_name: form.upload_artist_name.value.trim(),
+    upload_real_name: form.upload_real_name.value.trim(),
     song_interval_seconds: Number(form.song_interval_seconds.value),
     create_url: form.create_url.value.trim(),
     assets_url: "https://music.douyin.com/studio/assets",
@@ -148,6 +167,38 @@ function accountPayload() {
     throw new Error("请完整填写账号名称和四个目录路径");
   }
   return payload;
+}
+
+function formatSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "-";
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function renderUploads() {
+  const files = state.uploads?.files || [];
+  elements["upload-table"].querySelectorAll(".upload-row:not(.upload-head)").forEach((node) => node.remove());
+  elements["upload-empty"].classList.toggle("is-hidden", files.length > 0);
+  elements["upload-count"].textContent = String(files.length);
+  elements["upload-limit"].textContent = String(state.uploads?.batch_size || 10);
+  elements["upload-real-name"].textContent = state.uploads?.real_name || "-";
+  elements["upload-caption"].textContent = state.uploads?.day
+    ? `${state.uploads.day} · ${files.length} 首可发布`
+    : "等待成品下载完成";
+
+  for (const file of files) {
+    const row = document.createElement("div");
+    row.className = "upload-row";
+    const name = document.createElement("span");
+    name.textContent = file.file_name;
+    name.title = file.path;
+    const size = document.createElement("span");
+    size.textContent = formatSize(file.size);
+    const status = document.createElement("span");
+    status.innerHTML = '<span class="state state-waiting">待发布</span>';
+    row.append(name, size, status);
+    elements["upload-table"].append(row);
+  }
 }
 
 function stateLabel(value) {
@@ -279,6 +330,7 @@ async function loadAccounts(selectId = null) {
   fillAccountForm(account);
   if (account) await loadSongs();
   else state.songs = [];
+  await loadUploads();
   renderSongs();
   renderControls();
 }
@@ -290,6 +342,20 @@ async function loadSongs() {
   state.selected = new Set(state.songs.filter((song) => song.valid).map((song) => song.file_name));
   elements["queue-caption"].textContent = `${account.account_name} · ${state.songs.length} 个文件`;
   renderSongs();
+}
+
+async function loadUploads() {
+  if (!state.accountId) {
+    state.uploads = [];
+    renderUploads();
+    return;
+  }
+  try {
+    state.uploads = await api(`/api/accounts/${state.accountId}/uploads`);
+  } catch {
+    state.uploads = [];
+  }
+  renderUploads();
 }
 
 async function loadSettings() {
@@ -353,14 +419,17 @@ async function runControl(action) {
 document.addEventListener("DOMContentLoaded", async () => {
   setupTooltips();
   bindEvents();
+  renderView();
   await Promise.allSettled([loadHealth(), loadSettings(), loadCurrent()]);
   await loadAccounts();
+  await loadUploads();
   await loadLoginBrowser();
   const recent = await api("/api/logs/recent").catch(() => []);
   for (const event of recent) if (event.type === "log") appendLog(event.data);
   connectSocket();
   setInterval(loadHealth, 5000);
   setInterval(loadLoginBrowser, 5000);
+  setInterval(loadUploads, 10000);
 });
 
 function setupTooltips() {
@@ -423,11 +492,19 @@ function setupTooltips() {
 }
 
 function bindEvents() {
+  document.querySelectorAll(".nav-item:not(.is-disabled)").forEach((item) => {
+    item.addEventListener("click", () => {
+      state.view = item.dataset.view;
+      renderView();
+    });
+  });
+
   elements["account-select"].addEventListener("change", async () => {
     state.accountId = elements["account-select"].value;
     fillAccountForm(state.accounts.find((account) => account.id === state.accountId));
     renderControls();
     await loadSongs();
+    await loadUploads();
   });
 
   elements["account-new"].addEventListener("click", () => {
@@ -482,6 +559,14 @@ function bindEvents() {
 
   elements["refresh-songs"].addEventListener("click", async () => {
     try { await loadSongs(); toast("歌词列表已刷新"); } catch (error) { toast(error.message, true); }
+  });
+  elements["refresh-uploads"].addEventListener("click", async () => {
+    try {
+      await loadUploads();
+      toast("上传批次已刷新");
+    } catch (error) {
+      toast(error.message, true);
+    }
   });
   elements["select-all"].addEventListener("click", () => {
     state.selected = new Set(state.songs.filter((song) => song.valid).map((song) => song.file_name));

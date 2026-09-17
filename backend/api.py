@@ -181,6 +181,32 @@ def create_app(
             result.append(item)
         return result
 
+    @app.get("/api/accounts/{account_id}/uploads")
+    async def list_upload_batch(account_id: str, day: str | None = None) -> dict:
+        account = account_repository.get(account_id)
+        day_value = day or date.today().isoformat()
+        directory = Path(account.output_dir) / day_value
+        files: list[dict] = []
+        if directory.is_dir():
+            for path in sorted(directory.glob("*.mp3")):
+                if path.is_file() and path.stat().st_size > 0:
+                    files.append(
+                        {
+                            "file_name": path.name,
+                            "path": str(path),
+                            "size": path.stat().st_size,
+                        }
+                    )
+        return {
+            "ready": bool(files),
+            "day": day_value,
+            "batch_size": account.upload_batch_size,
+            "artist_name": account.upload_artist_name,
+            "real_name": account.upload_real_name,
+            "files": files[: account.upload_batch_size],
+            "overflow": max(len(files) - account.upload_batch_size, 0),
+        }
+
     @app.post("/api/runs", status_code=202)
     async def start_run(request: RunRequest) -> dict:
         account = account_repository.get(request.account_id)

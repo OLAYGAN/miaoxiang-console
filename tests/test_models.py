@@ -22,6 +22,9 @@ def test_account_config_applies_stable_defaults() -> None:
     assert account.chrome_debug_port == 9222
     assert account.create_url == "https://music.douyin.com/studio/create"
     assert account.generation_batch_size == 2
+    assert account.upload_batch_size == 10
+    assert account.upload_artist_name == "白日逐梦"
+    assert account.upload_real_name == "龙英"
 
 
 def test_account_config_normalizes_paths() -> None:
@@ -82,4 +85,14 @@ def test_console_settings_validate_wait_bounds() -> None:
             output_dir="output/账号01",
             download_dir="downloads/账号01",
             generation_batch_size=3,
+        )
+
+    with pytest.raises(ValidationError):
+        AccountConfig(
+            account_name="账号01",
+            chrome_profile_dir="chrome/账号01",
+            lyric_dir="lyrics/账号01",
+            output_dir="output/账号01",
+            download_dir="downloads/账号01",
+            upload_batch_size=11,
         )

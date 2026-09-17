@@ -111,6 +111,26 @@ def test_health_and_account_crud(tmp_path: Path) -> None:
         assert client.get(f"/api/accounts/{account['id']}").status_code == 404
 
 
+def test_upload_batch_listing_reads_output_directory(tmp_path: Path) -> None:
+    app, _ = make_client(tmp_path)
+    with TestClient(app) as client:
+        account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
+        output = tmp_path / "output" / "2026-09-18"
+        output.mkdir(parents=True, exist_ok=True)
+        for name in ("第一首.mp3", "第二首.mp3"):
+            (output / name).write_bytes(b"audio")
+        (output / "invalid.txt").write_text("not audio", encoding="utf-8")
+
+        response = client.get(f"/api/accounts/{account['id']}/uploads?day=2026-09-18")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ready"] is True
+        assert body["batch_size"] == 10
+        assert [item["file_name"] for item in body["files"]] == ["第一首.mp3", "第二首.mp3"]
+        assert all(item["size"] == 5 for item in body["files"])
+
+
 def test_song_listing_reports_parse_errors(tmp_path: Path) -> None:
     app, _ = make_client(tmp_path)
     with TestClient(app) as client:

@@ -20,6 +20,9 @@ class AccountConfig(BaseModel):
     max_retries: int = Field(default=3, ge=1, le=10)
     song_interval_seconds: float = Field(default=5, ge=0, le=600)
     generation_batch_size: int = Field(default=2, ge=1, le=2)
+    upload_batch_size: int = Field(default=10, ge=1, le=10)
+    upload_artist_name: str = Field(default="白日逐梦", min_length=1, max_length=64)
+    upload_real_name: str = Field(default="龙英", min_length=2, max_length=64)
     create_url: str = "https://music.douyin.com/studio/create"
     assets_url: str = "https://music.douyin.com/studio/assets"
 
