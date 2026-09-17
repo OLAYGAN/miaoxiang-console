@@ -11,6 +11,7 @@ from backend.page_flow import (
         clear_and_type,
         is_login_challenge,
         select_model,
+        select_singer,
         trusted_click,
         type_segmented,
 )
@@ -166,6 +167,11 @@ class FakeModelLocator:
     def filter(self, **kwargs):
         return self
 
+    def locator(self, selector: str):
+        if self.name == "item" and selector == "button":
+            return self.page.choose
+        raise AssertionError(f"unexpected nested selector: {selector}")
+
     async def inner_text(self) -> str:
         return self.page.dropdown_text
 
@@ -209,6 +215,90 @@ async def test_select_model_keeps_existing_choice() -> None:
     page = FakeModelPage(initial_text="Sway v5.5")
 
     await select_model(page, "Sway v5.5")
+
+    assert page.calls == []
+
+
+class FakeSingerPage:
+    def __init__(self, trigger_text: str = "选择虚拟歌手音色", switch_checked: bool = False) -> None:
+        self.switch = FakeSingerLocator("switch", self)
+        self.trigger = FakeSingerLocator("trigger", self)
+        self.item = FakeSingerLocator("item", self)
+        self.choose = FakeSingerLocator("choose", self)
+        self.trigger_text = trigger_text
+        self.switch_checked = switch_checked
+        self.calls: list[str] = []
+
+    def locator(self, selector: str):
+        if selector == '[class*="vocalTimbreWrapper"] .semi-switch':
+            return self.switch
+        if selector == '[class*="singerTrigger"]':
+            return self.trigger
+        if selector == '[class*="singerItem"]':
+            return self.item
+        if selector == 'button':
+            return self.choose
+        raise AssertionError(f"unexpected selector: {selector}")
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        self.calls.append("wait")
+
+
+class FakeSingerLocator:
+    def __init__(self, name: str, page: FakeSingerPage) -> None:
+        self.name = name
+        self.page = page
+
+    @property
+    def first(self):
+        return self
+
+    def filter(self, **kwargs):
+        return self
+
+    def locator(self, selector: str):
+        if self.name == "item" and selector == "button":
+            return self.page.choose
+        raise AssertionError(f"unexpected nested selector: {selector}")
+
+    async def inner_text(self) -> str:
+        return self.page.trigger_text
+
+    async def get_attribute(self, name: str):
+        if self.name == "switch" and name == "class":
+            return "semi-switch semi-switch-checked" if self.page.switch_checked else "semi-switch"
+        return None
+
+    async def click(self, **kwargs) -> None:
+        self.page.calls.append(f"click-{self.name}")
+        if self.name == "switch":
+            self.page.switch_checked = True
+        if self.name == "choose":
+            self.page.trigger_text = "老岩 男低音 摇滚 Hiphop 沙哑 粗犷"
+
+
+@pytest.mark.asyncio
+async def test_select_singer_opens_switch_dialog_and_confirms_choice() -> None:
+    page = FakeSingerPage()
+
+    await select_singer(page, "老岩")
+
+    assert page.calls == [
+        "click-switch",
+        "wait",
+        "click-trigger",
+        "wait",
+        "click-choose",
+        "wait",
+    ]
+    assert "老岩" in page.trigger_text
+
+
+@pytest.mark.asyncio
+async def test_select_singer_keeps_existing_choice() -> None:
+    page = FakeSingerPage(trigger_text="老岩 男低音", switch_checked=True)
+
+    await select_singer(page, "老岩")
 
     assert page.calls == []
 

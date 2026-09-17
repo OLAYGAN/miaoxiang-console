@@ -146,6 +146,30 @@ async def select_model(page: Any, model_name: str) -> None:
         raise BrowserFlowError(f"模型选择验证失败: {model_name}")
 
 
+async def select_singer(page: Any, singer_name: str) -> None:
+    switch = page.locator('[class*="vocalTimbreWrapper"] .semi-switch').first
+    switch_class = await switch.get_attribute("class") or ""
+    if "semi-switch-checked" not in switch_class:
+        await switch.click(timeout=5000)
+        await page.wait_for_timeout(1000)
+
+    trigger = page.locator('[class*="singerTrigger"]').first
+    if singer_name in await trigger.inner_text():
+        return
+
+    await trigger.click(timeout=5000)
+    await page.wait_for_timeout(1500)
+    singer_item = page.locator('[class*="singerItem"]').filter(
+        has_text=singer_name
+    ).first
+    choose_button = singer_item.locator("button").filter(has_text="选择").first
+    await choose_button.click(timeout=5000)
+    await page.wait_for_timeout(1000)
+
+    if singer_name not in await trigger.inner_text():
+        raise BrowserFlowError(f"虚拟歌手选择验证失败: {singer_name}")
+
+
 class PageFlow:
     def __init__(
         self,
@@ -238,27 +262,7 @@ class PageFlow:
 
     async def select_singer(self) -> None:
         try:
-            label = self.page.get_by_text("使用虚拟歌手音色", exact=True).first
-            switch = label.locator(
-                "xpath=following::div[contains(@class,'semi-switch')][1]"
-            )
-            state = await switch.get_attribute("aria-checked")
-            css = await switch.get_attribute("class")
-            if state != "true" and "semi-switch-checked" not in (css or ""):
-                await dom_click(switch, "虚拟歌手开关")
-                await self.page.wait_for_timeout(1000)
-            await trusted_click(
-                self.page,
-                self.page.get_by_text("选择虚拟歌手音色", exact=True).first,
-                "选择虚拟歌手音色",
-            )
-            await self.page.wait_for_timeout(2000)
-            singer_card = self.page.locator("*").filter(
-                has_text=self.account.singer_name
-            ).first
-            choose = singer_card.get_by_role("button", name="选择").first
-            await trusted_click(choose, f"选择歌手 {self.account.singer_name}")
-            await self.page.wait_for_timeout(1000)
+            await select_singer(self.page, self.account.singer_name)
         except GenerationLimitError:
             raise
         except Exception as error:
