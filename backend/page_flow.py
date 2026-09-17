@@ -170,6 +170,16 @@ async def select_singer(page: Any, singer_name: str) -> None:
         raise BrowserFlowError(f"虚拟歌手选择验证失败: {singer_name}")
 
 
+async def refresh_asset_tabs(page: Any) -> None:
+    tabs = page.locator('[class*="tabItem"]')
+    lyric_tab = tabs.filter(has_text=re.compile(r"^\s*歌词\s*$")).first
+    song_tab = tabs.filter(has_text=re.compile(r"^\s*歌曲\s*$")).first
+    await lyric_tab.click(timeout=3000)
+    await page.wait_for_timeout(500)
+    await song_tab.click(timeout=3000)
+    await page.wait_for_timeout(1000)
+
+
 class PageFlow:
     def __init__(
         self,
@@ -349,6 +359,7 @@ class PageFlow:
         deadline = datetime.now().timestamp() + self.settings.generation_timeout_seconds
         last_title = before_title
         while datetime.now().timestamp() < deadline:
+            await refresh_asset_tabs(self.page)
             current = await self.first_asset_title()
             if current and current != before_title:
                 return current

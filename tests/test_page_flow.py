@@ -10,6 +10,7 @@ from backend.page_flow import (
         archive_download,
         clear_and_type,
         is_login_challenge,
+        refresh_asset_tabs,
         select_model,
         select_singer,
         trusted_click,
@@ -301,6 +302,63 @@ async def test_select_singer_keeps_existing_choice() -> None:
     await select_singer(page, "老岩")
 
     assert page.calls == []
+
+
+class FakeAssetTabsPage:
+    def __init__(self) -> None:
+        self.tabs = FakeAssetTabsLocator(self)
+        self.calls: list[str] = []
+
+    def locator(self, selector: str):
+        assert selector == '[class*="tabItem"]'
+        return self.tabs
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        self.calls.append(f"wait-{timeout}")
+
+
+class FakeAssetTabsLocator:
+    def __init__(self, page: FakeAssetTabsPage) -> None:
+        self.page = page
+
+    @property
+    def first(self):
+        return self
+
+    def filter(self, **kwargs):
+        pattern = kwargs["has_text"]
+        if "歌词" in pattern.pattern:
+            return FakeAssetTab("lyric", self.page)
+        if "歌曲" in pattern.pattern:
+            return FakeAssetTab("song", self.page)
+        raise AssertionError(f"unexpected tab pattern: {pattern.pattern}")
+
+
+class FakeAssetTab:
+    def __init__(self, name: str, page: FakeAssetTabsPage) -> None:
+        self.name = name
+        self.page = page
+
+    @property
+    def first(self):
+        return self
+
+    async def click(self, **kwargs) -> None:
+        self.page.calls.append(f"click-{self.name}")
+
+
+@pytest.mark.asyncio
+async def test_refresh_asset_tabs_switches_lyrics_and_back_to_songs() -> None:
+    page = FakeAssetTabsPage()
+
+    await refresh_asset_tabs(page)
+
+    assert page.calls == [
+        "click-lyric",
+        "wait-500",
+        "click-song",
+        "wait-1000",
+    ]
 
 
 @pytest.mark.asyncio
