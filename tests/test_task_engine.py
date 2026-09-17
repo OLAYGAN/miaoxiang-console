@@ -13,6 +13,7 @@ from backend.errors import (
 )
 from backend.events import EventBus
 from backend.models import AccountConfig, ConsoleSettings, SongRecord
+from backend.models import BatchSongResult
 from backend.storage import RunStateRepository
 from backend.task_engine import TaskEngine
 
@@ -61,6 +62,20 @@ class FakeFlow:
         if self.engine is not None and len(self.processed) == 1:
             await self.engine.pause()
         return Path("output") / f"{lyric_data.song_name}.mp3"
+
+
+class FakeBatchFlow:
+    def __init__(self) -> None:
+        self.batches: list[list[str]] = []
+        self.results: list[list[BatchSongResult]] = []
+
+    async def process_batch(self, lyric_data_list, on_step) -> list[BatchSongResult]:
+        submitted = [item.song_name for item in lyric_data_list]
+        self.batches.append(submitted)
+        for item in lyric_data_list:
+            on_step("generate", item.song_name)
+        result = self.results.pop(0)
+        return result
 
 
 class FakeBrowser:
@@ -114,6 +129,68 @@ async def test_successful_run_updates_state_once(tmp_path: Path) -> None:
     assert state.get("2026-09-17", "账号01", "02_second.md").status == "成功"
     assert engine.current.status == "completed"
     assert engine.current.success_count == 2
+
+
+async def test_batch_mode_submits_two_songs_together(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    songs = [make_song(account.lyric_dir, "01_first"), make_song(account.lyric_dir, "02_second")]
+    flow = FakeBatchFlow()
+    flow.results = [
+        [
+            BatchSongResult(song_name="01_first", status="success", output_path="output/a.mp3"),
+            BatchSongResult(song_name="02_second", status="success", output_path="output/b.mp3"),
+        ]
+    ]
+    engine, state, _ = make_engine(tmp_path, flow)
+
+    engine.start(account, songs, day="2026-09-17")
+    await engine.wait()
+
+    assert flow.batches == [["01_first", "02_second"]]
+    assert engine.current.status == "completed"
+    assert state.get("2026-09-17", "账号01", "01_first.md").status == "成功"
+    assert state.get("2026-09-17", "账号01", "02_second.md").status == "成功"
+
+
+async def test_batch_mode_retries_only_generation_failures(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    songs = [make_song(account.lyric_dir, "01_first"), make_song(account.lyric_dir, "02_second")]
+    flow = FakeBatchFlow()
+    flow.results = [
+        [
+            BatchSongResult(song_name="01_first", status="success", output_path="output/a.mp3"),
+            BatchSongResult(song_name="02_second", status="generation_failed", error="没有匹配结果"),
+        ],
+        [
+            BatchSongResult(song_name="02_second", status="success", output_path="output/b.mp3"),
+        ],
+    ]
+    engine, state, _ = make_engine(tmp_path, flow)
+
+    engine.start(account, songs, day="2026-09-17")
+    await engine.wait()
+
+    assert flow.batches == [["01_first", "02_second"], ["02_second"]]
+    assert state.get("2026-09-17", "账号01", "01_first.md").status == "成功"
+    assert state.get("2026-09-17", "账号01", "02_second.md").status == "成功"
+    assert state.get("2026-09-17", "账号01", "02_second.md").attempts == 2
+
+
+async def test_batch_export_failure_does_not_regenerate(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_first")
+    flow = FakeBatchFlow()
+    flow.results = [
+        [BatchSongResult(song_name="01_first", status="export_failed", error="下载失败")],
+    ]
+    engine, state, _ = make_engine(tmp_path, flow)
+
+    engine.start(account, [song], day="2026-09-17")
+    await engine.wait()
+
+    assert flow.batches == [["01_first"]]
+    assert state.get("2026-09-17", "账号01", "01_first.md").status == "导出失败"
+    assert state.get("2026-09-17", "账号01", "01_first.md").attempts == 1
 
 
 async def test_parse_failure_continues_without_browser_call(tmp_path: Path) -> None:

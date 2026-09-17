@@ -24,6 +24,7 @@ from backend.models import (
     SongProgress,
     SongRecord,
     TaskSnapshot,
+    BatchSongResult,
 )
 from backend.storage import RunStateRepository
 
@@ -146,6 +147,7 @@ class TaskEngine:
         try:
             self._update_status("running", step="opening_browser")
             async with self._browser_factory(account, self._settings) as flow:
+                prepared: list[tuple[Path, SongProgress, object]] = []
                 for file_index, path in enumerate(song_files):
                     if self._stop_requested.is_set():
                         break
@@ -187,15 +189,32 @@ class TaskEngine:
                         continue
 
                     progress.song_name = lyric_data.song_name
-                    await self._process_with_retries(account, flow, day, path, progress, lyric_data)
-                    if self.current.status == "generation_limit":
-                        return
-                    if self.current.status == "login_required":
-                        return
-                    if self.current.status == "verification_failed":
-                        return
+                    prepared.append((path, progress, lyric_data))
 
-                    if file_index < len(song_files) - 1 and account.song_interval_seconds > 0:
+                use_batch_flow = hasattr(flow, "process_batch")
+                batches = range(0, len(prepared), account.generation_batch_size) if use_batch_flow else range(0, len(prepared), 1)
+                last_batch_index = len(batches) - 1 if isinstance(batches, range) else 0
+                for batch_index, start in enumerate(batches):
+                    if self._stop_requested.is_set():
+                        break
+                    await self._wait_while_paused()
+                    if self._stop_requested.is_set():
+                        break
+                    batch = prepared[start:start + account.generation_batch_size] if use_batch_flow else prepared[start:start + 1]
+                    if use_batch_flow:
+                        await self._process_batch_with_retries(
+                            account, flow, day, batch
+                        )
+                    else:
+                        path, progress, lyric_data = batch[0]
+                        await self._process_with_retries(account, flow, day, path, progress, lyric_data)
+                    if self.current.status in {
+                        "generation_limit",
+                        "login_required",
+                        "verification_failed",
+                    }:
+                        return
+                    if batch_index < last_batch_index and account.song_interval_seconds > 0:
                         self._update_status(self.current.status, step="waiting_before_next_song")
                         await self._interruptible_sleep(account.song_interval_seconds)
 
@@ -211,6 +230,126 @@ class TaskEngine:
         except Exception as error:
             self._log("error", "task", f"任务异常: {error}", traceback.format_exc(limit=2))
             self._complete("failed", error=str(error))
+
+    async def _process_batch_with_retries(
+        self,
+        account: AccountConfig,
+        flow: object,
+        day: str,
+        batch: list[tuple[Path, SongProgress, object]],
+    ) -> None:
+        remaining = list(batch)
+        last_errors = {progress.file_name: "生成失败" for _, progress, _ in batch}
+        for attempt in range(1, account.max_retries + 1):
+            if self._stop_requested.is_set() or not remaining:
+                return
+            await self._wait_while_paused()
+            for _, progress, _ in remaining:
+                progress.attempts += 1
+                progress.status = "running"
+                progress.current_step = "batch_generate"
+            self.current.current_file = remaining[0][1].file_name
+            self._update_status("running", step="batch_generate")
+
+            def on_step(step: str, song_name: str | None = None) -> None:
+                targets = [
+                    item for item in remaining
+                    if song_name is None or item[2].song_name == song_name
+                ]
+                for _, progress, _ in targets:
+                    progress.current_step = step
+                self.current.current_step = step
+                self._emit_status()
+
+            try:
+                results = await flow.process_batch(
+                    [lyric_data for _, _, lyric_data in remaining],
+                    on_step,
+                )
+                result_by_song = {result.song_name: result for result in results}
+            except GenerationLimitError as error:
+                for _, progress, _ in remaining:
+                    self._finish_song(
+                        day, account, progress,
+                        status="生成上限", current_step="batch_generate", error=error.message,
+                    )
+                self._complete("generation_limit", error.message)
+                return
+            except LoginRequiredError as error:
+                for _, progress, _ in remaining:
+                    self._finish_song(
+                        day, account, progress,
+                        status="需要登录", current_step="batch_generate", error=error.message,
+                    )
+                self._complete("login_required", error.message)
+                return
+            except SongVerificationError as error:
+                for _, progress, _ in remaining:
+                    self._finish_song(
+                        day, account, progress,
+                        status="详情校验失败", current_step="verify_details", error=error.message,
+                    )
+                self._complete("verification_failed", error.message)
+                return
+            except Exception as error:
+                message = str(error)
+                self._log("warning", "batch_generate", f"第 {attempt}/{account.max_retries} 批次失败: {message}")
+                for _, progress, _ in remaining:
+                    last_errors[progress.file_name] = message
+                if attempt < account.max_retries and not self._stop_requested.is_set():
+                    await self._interruptible_sleep(min(5, self._settings.page_load_timeout_seconds))
+                continue
+
+            next_remaining: list[tuple[Path, SongProgress, object]] = []
+            for path, progress, lyric_data in remaining:
+                result = result_by_song.get(lyric_data.song_name)
+                if result is None:
+                    result = BatchSongResult(
+                        song_name=lyric_data.song_name,
+                        status="generation_failed",
+                        error="批次结果缺少该歌词",
+                    )
+                if result.status == "success":
+                    self._finish_song(
+                        day,
+                        account,
+                        progress,
+                        status="成功",
+                        current_step="done",
+                        output_path=result.output_path,
+                    )
+                elif result.status == "export_failed":
+                    self._finish_song(
+                        day,
+                        account,
+                        progress,
+                        status="导出失败",
+                        current_step="export_song",
+                        error=result.error or "导出失败",
+                    )
+                else:
+                    last_errors[progress.file_name] = result.error or "生成失败"
+                    progress.status = "running"
+                    progress.current_step = "generation_failed"
+                    next_remaining.append((path, progress, lyric_data))
+            remaining = next_remaining
+            if remaining and attempt < account.max_retries and not self._stop_requested.is_set():
+                self._log(
+                    "warning",
+                    "batch_generate",
+                    f"批次生成缺失 {len(remaining)} 首，准备只重试缺失歌词",
+                )
+                await self._interruptible_sleep(min(5, self._settings.page_load_timeout_seconds))
+
+        for _, progress, _ in remaining:
+            self._finish_song(
+                day,
+                account,
+                progress,
+                status="生成失败",
+                current_step="batch_generate",
+                error=last_errors.get(progress.file_name, "生成失败"),
+            )
 
     async def _process_with_retries(
         self,

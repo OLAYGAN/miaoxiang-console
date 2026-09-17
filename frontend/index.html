@@ -86,6 +86,10 @@
             <span>歌曲间隔（秒）</span>
             <input name="song_interval_seconds" type="number" min="0" max="600" step="1" required>
           </label>
+          <label class="field" data-tip="一次提交生成的歌词数量。平台每次生成通常返回同歌词的两个版本，脚本导出最新的匹配版本。">
+            <span>批量生成数量</span>
+            <input name="generation_batch_size" type="number" min="1" max="2" required>
+          </label>
         </div>
         <label class="field" data-tip="创作页入口地址；平台地址变化时才需要修改。">
           <span>创作页地址</span>

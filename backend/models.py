@@ -19,6 +19,7 @@ class AccountConfig(BaseModel):
     singer_name: str = "老岩"
     max_retries: int = Field(default=3, ge=1, le=10)
     song_interval_seconds: float = Field(default=5, ge=0, le=600)
+    generation_batch_size: int = Field(default=2, ge=1, le=2)
     create_url: str = "https://music.douyin.com/studio/create"
     assets_url: str = "https://music.douyin.com/studio/assets"
 
@@ -53,6 +54,19 @@ class LyricData(BaseModel):
     song_name: str
     lyrics: str
     style: str
+
+
+class GeneratedCandidate(BaseModel):
+    song_name: str
+    generated_title: str
+    card_index: int
+
+
+class BatchSongResult(BaseModel):
+    song_name: str
+    status: str = "generation_failed"
+    output_path: str | None = None
+    error: str | None = None
 
 
 class SongRecord(BaseModel):

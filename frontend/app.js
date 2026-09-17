@@ -116,6 +116,7 @@ function fillAccountForm(account = null) {
     model_name: "Sway v5.5",
     singer_name: "老岩",
     max_retries: 3,
+    generation_batch_size: 2,
     song_interval_seconds: 5,
     create_url: "https://music.douyin.com/studio/create",
   };
@@ -138,6 +139,7 @@ function accountPayload() {
     model_name: form.model_name.value.trim(),
     singer_name: form.singer_name.value.trim(),
     max_retries: Number(form.max_retries.value),
+    generation_batch_size: Number(form.generation_batch_size.value),
     song_interval_seconds: Number(form.song_interval_seconds.value),
     create_url: form.create_url.value.trim(),
     assets_url: "https://music.douyin.com/studio/assets",

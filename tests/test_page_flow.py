@@ -663,6 +663,135 @@ async def test_open_download_menu_uses_generated_card_trigger_and_menu_item() ->
 
 
 @pytest.mark.asyncio
+async def test_process_batch_exports_newest_matching_candidate_per_lyric(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+    from backend.models import GeneratedCandidate
+
+    flow = PageFlow(
+        page=FakePage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    calls: list[str] = []
+    submitted: list[str] = []
+    first = LyricData(song_name="第一首", lyrics="a" * 120, style="s" * 60)
+    second = LyricData(song_name="第二首", lyrics="b" * 120, style="s" * 60)
+
+    async def ensure_ready():
+        calls.append("ready")
+
+    async def fill_inputs(lyric_data):
+        submitted.append(lyric_data.song_name)
+
+    async def generate():
+        calls.append("generate")
+
+    async def check_limit():
+        calls.append("check-limit")
+
+    async def wait_for_batch_generation(baseline_count, lyric_count):
+        assert baseline_count == 5
+        assert lyric_count == 2
+        return [
+            {"title": "第二首版本一", "loading": False},
+            {"title": "第二首版本二", "loading": False},
+            {"title": "第一首版本一", "loading": False},
+            {"title": "第一首版本二", "loading": False},
+        ]
+
+    async def classify_generated_cards(cards, lyric_data_list):
+        return {
+            "第一首": [
+                GeneratedCandidate(song_name="第一首", generated_title="第一首版本二", card_index=3),
+                GeneratedCandidate(song_name="第一首", generated_title="第一首版本一", card_index=2),
+            ],
+            "第二首": [
+                GeneratedCandidate(song_name="第二首", generated_title="第二首版本一", card_index=0),
+            ],
+        }
+
+    async def export_candidate(candidate, lyric_data):
+        calls.append(f"export:{candidate.generated_title}:{lyric_data.song_name}")
+        return tmp_path / f"{lyric_data.song_name}.mp3"
+
+    monkeypatch.setattr(flow, "ensure_create_page_ready", ensure_ready)
+    monkeypatch.setattr(flow, "fill_inputs", fill_inputs)
+    monkeypatch.setattr(flow, "generate", generate)
+    monkeypatch.setattr(flow, "check_generation_limit", check_limit)
+    monkeypatch.setattr(flow, "asset_card_count", lambda: 5)
+    monkeypatch.setattr(flow, "wait_for_batch_generation", wait_for_batch_generation)
+    monkeypatch.setattr(flow, "classify_generated_cards", classify_generated_cards)
+    monkeypatch.setattr(flow, "export_candidate", export_candidate)
+
+    results = await flow.process_batch([first, second], lambda step, song=None: calls.append(step))
+
+    assert submitted == ["第一首", "第二首"]
+    assert calls == [
+        "page_ready", "ready", "fill_inputs", "generate", "generate", "check_limit", "check-limit",
+        "fill_inputs", "generate", "generate", "check_limit", "check-limit",
+        "wait_generation", "verify_details",
+        "export_song", "export:第一首版本二:第一首",
+        "export_song", "export:第二首版本一:第二首",
+    ]
+    assert [result.status for result in results] == ["success", "success"]
+    assert [result.output_path for result in results] == [
+        str(tmp_path / "第一首.mp3"), str(tmp_path / "第二首.mp3")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_process_batch_reports_missing_and_export_failures_separately(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+    from backend.models import GeneratedCandidate
+
+    flow = PageFlow(
+        page=FakePage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    first = LyricData(song_name="第一首", lyrics="a" * 120, style="s" * 60)
+    second = LyricData(song_name="第二首", lyrics="b" * 120, style="s" * 60)
+
+    async def ensure_ready(): return None
+    async def fill_inputs(lyric_data): return None
+    async def generate(): return None
+    async def check_limit(): return None
+    async def wait_for_batch_generation(baseline_count, lyric_count):
+        return [{"title": "第一首版本", "loading": False}]
+    async def classify_generated_cards(cards, lyric_data_list):
+        return {"第一首": [GeneratedCandidate(song_name="第一首", generated_title="第一首版本", card_index=0)]}
+
+    async def export_candidate(candidate, lyric_data):
+        if lyric_data.song_name == "第一首":
+            raise BrowserFlowError("下载失败")
+        return tmp_path / "第二首.mp3"
+
+    monkeypatch.setattr(flow, "ensure_create_page_ready", ensure_ready)
+    monkeypatch.setattr(flow, "fill_inputs", fill_inputs)
+    monkeypatch.setattr(flow, "generate", generate)
+    monkeypatch.setattr(flow, "check_generation_limit", check_limit)
+    monkeypatch.setattr(flow, "asset_card_count", lambda: 0)
+    monkeypatch.setattr(flow, "wait_for_batch_generation", wait_for_batch_generation)
+    monkeypatch.setattr(flow, "classify_generated_cards", classify_generated_cards)
+    monkeypatch.setattr(flow, "export_candidate", export_candidate)
+
+    results = await flow.process_batch([first, second], lambda step, song=None: None)
+
+    assert results[0].status == "export_failed"
+    assert "下载失败" in results[0].error
+    assert results[1].status == "generation_failed"
+    assert results[1].error == "没有匹配的生成结果"
+
+
+@pytest.mark.asyncio
 async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
     account = make_account(tmp_path)
     flow = PageFlow(page=FakePage(), account=account, settings=ConsoleSettings(), screenshot_dir=tmp_path)

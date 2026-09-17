@@ -1,6 +1,7 @@
 """Deterministic page operations for the Miaoxiang studio workflow."""
 
 import re
+import inspect
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ from backend.errors import (
     SongVerificationError,
 )
 from backend.models import AccountConfig, ConsoleSettings, LyricData
+from backend.models import BatchSongResult, GeneratedCandidate
 
 
 T = TypeVar("T")
@@ -267,6 +269,12 @@ async def open_download_menu(page: Any, song_name: str) -> Any:
     return page.locator('[role="menuitem"]').filter(has_text="下载").first
 
 
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
 class PageFlow:
     def __init__(
         self,
@@ -322,6 +330,75 @@ class PageFlow:
             lyric_data.song_name,
             datetime.now().strftime("%Y-%m-%d"),
         )
+
+    async def process_batch(
+        self,
+        lyric_data_list: list[LyricData],
+        on_step: Callable[[str, str | None], None],
+    ) -> list[BatchSongResult]:
+        on_step("page_ready", None)
+        await self.ensure_create_page_ready()
+        baseline_count = await _maybe_await(self.asset_card_count())
+
+        for lyric_data in lyric_data_list:
+            on_step("fill_inputs", lyric_data.song_name)
+            await self.fill_inputs(lyric_data)
+            on_step("generate", lyric_data.song_name)
+            await self.generate()
+            on_step("check_limit", lyric_data.song_name)
+            await self.check_generation_limit()
+
+        on_step("wait_generation", None)
+        generated_cards = await self.wait_for_batch_generation(
+            baseline_count,
+            len(lyric_data_list),
+        )
+        on_step("verify_details", None)
+        candidates = await self.classify_generated_cards(
+            generated_cards,
+            lyric_data_list,
+        )
+
+        results: list[BatchSongResult] = []
+        for lyric_data in lyric_data_list:
+            matches = candidates.get(lyric_data.song_name, [])
+            if not matches:
+                results.append(
+                    BatchSongResult(
+                        song_name=lyric_data.song_name,
+                        status="generation_failed",
+                        error="没有匹配的生成结果",
+                    )
+                )
+                continue
+
+            # Asset cards are newest first; export the first matching version.
+            selected = matches[0]
+            on_step("export_song", lyric_data.song_name)
+            try:
+                output_path = await self.export_candidate(selected, lyric_data)
+                results.append(
+                    BatchSongResult(
+                        song_name=lyric_data.song_name,
+                        status="success",
+                        output_path=str(output_path),
+                    )
+                )
+            except GenerationLimitError:
+                raise
+            except LoginRequiredError:
+                raise
+            except SongVerificationError:
+                raise
+            except Exception as error:
+                results.append(
+                    BatchSongResult(
+                        song_name=lyric_data.song_name,
+                        status="export_failed",
+                        error=str(error),
+                    )
+                )
+        return results
 
     async def ensure_create_page_ready(self) -> None:
         try:
@@ -464,6 +541,120 @@ class PageFlow:
         except Exception as error:
             await self._raise_with_screenshot("生成状态读取", error)
 
+    async def asset_card_states(self) -> list[dict]:
+        try:
+            value = await self.page.evaluate(
+                """() => {
+                    const width = window.innerWidth || document.documentElement.clientWidth;
+                    const cards = Array.from(document.querySelectorAll(
+                        '[class*="libraryItemWrapper"],[class*="songItem"],[class*="assetItem"]'
+                    )).filter(element => {
+                        const rect = element.getBoundingClientRect();
+                        return rect.left > width * 0.45 &&
+                            rect.right > width * 0.55 &&
+                            rect.width > 0 &&
+                            rect.height > 0;
+                    });
+                    return cards.map((card, index) => {
+                        const titleNode = card.querySelector(
+                            '[class*="title"],[class*="songName"],[class*="name"]'
+                        );
+                        const title = (titleNode ? titleNode.textContent : '').trim();
+                        const markerText = `${card.className} ${card.textContent}`;
+                        const loading = !title || /生成中|loading|skeleton|placeholder/i.test(markerText);
+                        return {index, title, loading};
+                    });
+                }"""
+            )
+            return value if isinstance(value, list) else []
+        except Exception as error:
+            await self._raise_with_screenshot("资产卡片读取", error)
+
+    async def asset_card_count(self) -> int:
+        return len(await self.asset_card_states())
+
+    async def wait_for_batch_generation(
+        self,
+        baseline_count: int,
+        lyric_count: int,
+    ) -> list[dict]:
+        await refresh_asset_tabs(self.page)
+        started_at = datetime.now().timestamp()
+        deadline = started_at + self.settings.generation_timeout_seconds
+        stable_polls = 0
+        last_completed: list[dict] = []
+
+        while datetime.now().timestamp() < deadline:
+            states = await self.asset_card_states()
+            new_count = max(len(states) - baseline_count, 0)
+            new_states = states[:new_count]
+            completed = [state for state in new_states if not state.get("loading")]
+            has_loading = any(state.get("loading") for state in new_states)
+            last_completed = [
+                {"title": state.get("title", ""), "index": state.get("index", 0), "loading": False}
+                for state in completed
+            ]
+
+            expected_max = lyric_count * 2
+            if len(completed) >= expected_max:
+                return last_completed
+            if completed and not has_loading:
+                stable_polls += 1
+                if stable_polls >= 2:
+                    return last_completed
+            else:
+                stable_polls = 0
+            # A submitted batch that produces no card or placeholder at all is a platform failure.
+            if not new_states and datetime.now().timestamp() - started_at >= 30:
+                return []
+            await self.page.wait_for_timeout(5000)
+
+        await self._screenshot("batch-generation-timeout")
+        return last_completed
+
+    async def _read_lyric_detail_for_card(self, card_index: int) -> str:
+        card = self.page.locator('[class*="libraryItemWrapper"]').filter(visible=True).nth(card_index)
+        await card.click(timeout=5000)
+        await self.page.wait_for_timeout(1000)
+        lyric_title = self.page.locator(
+            '[class*="detailPanel"] [class*="sectionTitle"]'
+        ).filter(has_text=re.compile(r"^\s*歌词\s*$")).first
+        detail_content = lyric_title.locator(
+            "xpath=following-sibling::*[contains(@class,'sectionContent')][1]"
+        )
+        return await detail_content.inner_text()
+
+    async def classify_generated_cards(
+        self,
+        generated_cards: list[dict],
+        lyric_data_list: list[LyricData],
+    ) -> dict[str, list[GeneratedCandidate]]:
+        matches: dict[str, list[GeneratedCandidate]] = {
+            lyric_data.song_name: [] for lyric_data in lyric_data_list
+        }
+        probes = {
+            lyric_data.song_name: _lyric_probe(lyric_data.lyrics)
+            for lyric_data in lyric_data_list
+        }
+        for fallback_index, generated in enumerate(generated_cards):
+            title = str(generated.get("title") or "").strip()
+            card_index = int(generated.get("index", fallback_index))
+            if not title:
+                continue
+            detail_text = await self._read_lyric_detail_for_card(card_index)
+            normalized_detail = _normalize_lyric_content(detail_text)
+            for song_name, probe in probes.items():
+                if probe and probe in normalized_detail:
+                    matches[song_name].append(
+                        GeneratedCandidate(
+                            song_name=song_name,
+                            generated_title=title,
+                            card_index=card_index,
+                        )
+                    )
+                    break
+        return matches
+
     async def generate(self) -> None:
         try:
             button = self.page.locator("button").filter(
@@ -545,6 +736,38 @@ class PageFlow:
             raise
         except Exception as error:
             await self._raise_with_screenshot("导出歌曲", error)
+
+    async def export_candidate(
+        self,
+        candidate: GeneratedCandidate,
+        lyric_data: LyricData,
+    ) -> Path:
+        try:
+            if "playground" in self.page.url or "assets" in self.page.url:
+                await self.page.goto(
+                    self.account.create_url,
+                    wait_until="domcontentloaded",
+                    timeout=self.settings.page_load_timeout_seconds * 1000,
+                )
+                await self.ensure_create_page_ready()
+
+            await self.enter_editor(candidate.generated_title)
+            await self.export_song(lyric_data.song_name)
+            downloaded = await self.download_song(lyric_data.song_name)
+            return archive_download(
+                downloaded,
+                Path(self.account.output_dir),
+                lyric_data.song_name,
+                datetime.now().strftime("%Y-%m-%d"),
+            )
+        except GenerationLimitError:
+            raise
+        except LoginRequiredError:
+            raise
+        except SongVerificationError:
+            raise
+        except Exception as error:
+            await self._raise_with_screenshot("导出选中版本", error)
 
     async def download_song(self, song_name: str) -> Path:
         try:
