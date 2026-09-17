@@ -358,8 +358,12 @@ class PageFlow:
     async def wait_for_generation(self, before_title: str) -> str:
         deadline = datetime.now().timestamp() + self.settings.generation_timeout_seconds
         last_title = before_title
+        last_refresh_at: float | None = None
         while datetime.now().timestamp() < deadline:
-            await refresh_asset_tabs(self.page)
+            now = datetime.now().timestamp()
+            if last_refresh_at is None or now - last_refresh_at >= 30:
+                await refresh_asset_tabs(self.page)
+                last_refresh_at = now
             current = await self.first_asset_title()
             if current and current != before_title:
                 return current

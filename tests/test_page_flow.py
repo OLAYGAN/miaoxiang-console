@@ -2,8 +2,10 @@ from pathlib import Path
 from datetime import date
 
 import pytest
+from types import SimpleNamespace
 
 from backend.errors import BrowserFlowError, GenerationLimitError
+import backend.page_flow as page_flow_module
 from backend.models import AccountConfig, ConsoleSettings, LyricData
 from backend.page_flow import (
         PageFlow,
@@ -359,6 +361,49 @@ async def test_refresh_asset_tabs_switches_lyrics_and_back_to_songs() -> None:
         "click-song",
         "wait-1000",
     ]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_generation_refreshes_assets_every_30_seconds(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+
+    class FakeClockPage:
+        def __init__(self) -> None:
+            self.clock = 0.0
+
+        async def wait_for_timeout(self, timeout: int) -> None:
+            self.clock += timeout / 1000
+
+    fake_page = FakeClockPage()
+    flow = PageFlow(
+        page=fake_page,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    refresh_times: list[float] = []
+
+    async def refresh_assets(page) -> None:
+        refresh_times.append(page.clock)
+
+    async def read_title() -> str:
+        return "新课本" if fake_page.clock >= 65 else "旧歌曲"
+
+    monkeypatch.setattr(page_flow_module, "refresh_asset_tabs", refresh_assets)
+    monkeypatch.setattr(flow, "first_asset_title", read_title)
+    monkeypatch.setattr(
+        page_flow_module,
+        "datetime",
+        SimpleNamespace(now=lambda: SimpleNamespace(timestamp=lambda: fake_page.clock)),
+    )
+
+    result = await flow.wait_for_generation("旧歌曲")
+
+    assert result == "新课本"
+    assert refresh_times == [0, 30, 60]
 
 
 @pytest.mark.asyncio
