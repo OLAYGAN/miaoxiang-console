@@ -191,7 +191,7 @@ def _normalize_lyric_content(text: str) -> str:
 def _lyric_probe(lyrics: str) -> str:
     # Structural labels are authoring directives; the platform detail may omit them.
     content = re.sub(r"\[[^\]]+\]", "", lyrics)
-    return _normalize_lyric_content(content)[:48]
+    return _normalize_lyric_content(content)
 
 
 async def verify_generated_song(page: Any, lyrics: str) -> None:
@@ -203,9 +203,12 @@ async def verify_generated_song(page: Any, lyrics: str) -> None:
     await card.click(timeout=5000)
     await page.wait_for_timeout(1000)
 
-    detail_content = page.locator(
-        '[class*="detailPanel"] [class*="sectionContent"]'
-    ).first
+    lyric_title = page.locator(
+        '[class*="detailPanel"] [class*="sectionTitle"]'
+    ).filter(has_text=re.compile(r"^\s*歌词\s*$")).first
+    detail_content = lyric_title.locator(
+        "xpath=following-sibling::*[contains(@class,'sectionContent')][1]"
+    )
     detail_text = await detail_content.inner_text()
     normalized_detail = _normalize_lyric_content(detail_text)
     if lyric_probe not in normalized_detail:

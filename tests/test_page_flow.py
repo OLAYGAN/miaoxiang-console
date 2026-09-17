@@ -412,16 +412,22 @@ async def test_wait_for_generation_refreshes_assets_once_and_waits_for_title(
 class FakeDetailPage:
     def __init__(self, detail_content: str) -> None:
         self.card = FakeDetailLocator("card", self)
+        self.title = FakeDetailLocator("title", self)
         self.content = FakeDetailLocator("content", self)
+        self.source_content = FakeDetailLocator("source_content", self)
         self.detail_content = detail_content
+        self.source_content_text = "这一段是灵感来源，不是歌词"
         self.calls: list[str] = []
         self.filter_calls: list[dict] = []
+        self.read_counts = {"source_content": 0, "content": 0}
 
     def locator(self, selector: str):
         if selector == '[class*="libraryItemWrapper"]':
             return self.card
+        if selector == '[class*="detailPanel"] [class*="sectionTitle"]':
+            return self.title
         if selector == '[class*="detailPanel"] [class*="sectionContent"]':
-            return self.content
+            return self.source_content
         raise AssertionError(f"unexpected selector: {selector}")
 
     async def wait_for_timeout(self, timeout: int) -> None:
@@ -438,13 +444,23 @@ class FakeDetailLocator:
         return self
 
     def filter(self, **kwargs):
-        self.page.filter_calls.append(kwargs)
+        if "visible" in kwargs:
+            self.page.filter_calls.append(kwargs)
         return self
+
+    def locator(self, selector: str):
+        if self.name == "title" and selector.startswith("xpath=following-sibling"):
+            return self.page.content
+        raise AssertionError(f"unexpected nested selector from {self.name}: {selector}")
 
     async def click(self, **kwargs) -> None:
         self.page.calls.append(f"click-{self.name}")
 
     async def inner_text(self) -> str:
+        if self.name in self.page.read_counts:
+            self.page.read_counts[self.name] += 1
+        if self.name == "source_content":
+            return self.page.source_content_text
         return self.page.detail_content
 
 
@@ -463,6 +479,7 @@ async def test_verify_generated_song_clicks_card_and_checks_lyric_content() -> N
 
     assert page.calls == ["click-card", "wait"]
     assert page.filter_calls == [{"visible": True}]
+    assert page.read_counts == {"source_content": 0, "content": 1}
 
 
 @pytest.mark.asyncio
