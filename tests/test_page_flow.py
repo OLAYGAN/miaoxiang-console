@@ -10,6 +10,7 @@ from backend.page_flow import (
         archive_download,
         clear_and_type,
         is_login_challenge,
+        select_model,
         trusted_click,
         type_segmented,
 )
@@ -124,6 +125,92 @@ def test_detects_platform_login_challenge_text() -> None:
 
     assert is_login_challenge(logged_in_text) is False
     assert is_login_challenge(challenge_text) is True
+
+
+class FakeModelPage:
+    def __init__(self, initial_text: str = "自动", switch_checked: bool = True) -> None:
+        self.dropdown = FakeModelLocator("dropdown", self)
+        self.switch = FakeModelLocator("switch", self)
+        self.option = FakeModelLocator("option", self)
+        self.dropdown_text = initial_text
+        self.switch_checked = switch_checked
+        self.calls: list[str] = []
+
+    def locator(self, selector: str):
+        if selector.startswith(".semi-select-option-custom"):
+            return self.option
+        if selector.startswith(".semi-select"):
+            return self.dropdown
+        if selector == ".semi-popover .semi-switch":
+            return self.switch
+        if selector.startswith(".semi-select-option-custom"):
+            return self.option
+        raise AssertionError(f"unexpected selector: {selector}")
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        self.calls.append("wait")
+
+    async def evaluate(self, script: str) -> None:
+        self.calls.append("scroll-model-list")
+
+
+class FakeModelLocator:
+    def __init__(self, name: str, page: FakeModelPage) -> None:
+        self.name = name
+        self.page = page
+
+    @property
+    def first(self):
+        return self
+
+    def filter(self, **kwargs):
+        return self
+
+    async def inner_text(self) -> str:
+        return self.page.dropdown_text
+
+    async def get_attribute(self, name: str):
+        if self.name == "switch" and name == "class":
+            return "semi-switch semi-switch-checked" if self.page.switch_checked else "semi-switch"
+        return None
+
+    async def click(self, **kwargs) -> None:
+        self.page.calls.append(f"click-{self.name}")
+        if self.name == "switch":
+            self.page.switch_checked = False
+        if self.name == "option":
+            self.page.dropdown_text = "Sway v5.5"
+
+    async def scroll_into_view_if_needed(self, **kwargs) -> None:
+        self.page.calls.append(f"scroll-{self.name}")
+
+
+@pytest.mark.asyncio
+async def test_select_model_closes_auto_switches_and_clicks_custom_option() -> None:
+    page = FakeModelPage()
+
+    await select_model(page, "Sway v5.5")
+
+    assert page.calls == [
+        "click-dropdown",
+        "wait",
+        "click-switch",
+        "wait",
+        "scroll-model-list",
+        "scroll-option",
+        "click-option",
+        "wait",
+    ]
+    assert page.dropdown_text == "Sway v5.5"
+
+
+@pytest.mark.asyncio
+async def test_select_model_keeps_existing_choice() -> None:
+    page = FakeModelPage(initial_text="Sway v5.5")
+
+    await select_model(page, "Sway v5.5")
+
+    assert page.calls == []
 
 
 @pytest.mark.asyncio

@@ -112,6 +112,40 @@ def is_login_challenge(body_text: str) -> bool:
     return any(marker in body_text for marker in markers)
 
 
+async def select_model(page: Any, model_name: str) -> None:
+    dropdown = page.locator(".semi-select").first
+    if model_name in await dropdown.inner_text():
+        return
+
+    await dropdown.click(timeout=5000)
+    await page.wait_for_timeout(1000)
+
+    switch = page.locator(".semi-popover .semi-switch").first
+    switch_class = await switch.get_attribute("class") or ""
+    if "semi-switch-checked" in switch_class:
+        await switch.click(timeout=5000)
+        await page.wait_for_timeout(1000)
+
+    await page.evaluate(
+        """() => {
+            document.querySelectorAll(
+                '.semi-select-option-list,[class*="option-list"]'
+            ).forEach(container => {
+                container.scrollTop = container.scrollHeight;
+            });
+        }"""
+    )
+    option = page.locator(
+        ".semi-select-option-custom, .semi-select-option"
+    ).filter(has_text=model_name).first
+    await option.scroll_into_view_if_needed(timeout=5000)
+    await option.click(timeout=5000)
+    await page.wait_for_timeout(1000)
+
+    if model_name not in await dropdown.inner_text():
+        raise BrowserFlowError(f"模型选择验证失败: {model_name}")
+
+
 class PageFlow:
     def __init__(
         self,
@@ -196,40 +230,7 @@ class PageFlow:
 
     async def select_model(self) -> None:
         try:
-            dropdown = self.page.locator(".semi-select").filter(
-                has_text="自动"
-            ).first
-            if self.account.model_name in await dropdown.inner_text():
-                return
-            await trusted_click(self.page, dropdown, "模型下拉框")
-            await self.page.wait_for_timeout(1000)
-
-            switches = await self.page.locator(".semi-switch").all()
-            for switch in switches:
-                parent_text = await switch.locator("xpath=ancestor::*[1]").inner_text()
-                if "自动" in parent_text:
-                    checked = "semi-switch-checked" in (await switch.get_attribute("class") or "")
-                    if checked:
-                        await dom_click(switch, "自动模型开关")
-                        await self.page.wait_for_timeout(1000)
-                    break
-
-            await self.page.evaluate(
-                """() => {
-                    const containers = document.querySelectorAll(
-                        '.semi-select-option-list,[class*="option-list"]'
-                    );
-                    containers.forEach(container => container.scrollTop = container.scrollHeight);
-                }"""
-            )
-            await self.page.wait_for_timeout(1000)
-            option = self.page.locator(".semi-select-option").filter(
-                has_text=self.account.model_name
-            ).first
-            await dom_click(option, self.account.model_name)
-            await self.page.wait_for_timeout(1000)
-            if self.account.model_name not in await dropdown.inner_text():
-                raise BrowserFlowError(f"模型选择验证失败: {self.account.model_name}")
+            await select_model(self.page, self.account.model_name)
         except GenerationLimitError:
             raise
         except Exception as error:
