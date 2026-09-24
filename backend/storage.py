@@ -1,5 +1,7 @@
 """Atomic local JSON repositories."""
 
+from __future__ import annotations
+
 import os
 from datetime import datetime
 from pathlib import Path
@@ -8,7 +10,13 @@ from typing import List
 from uuid import uuid4
 
 from backend.errors import ConflictError, NotFoundError
-from backend.models import AccountConfig, SongRecord
+from backend.models import (
+    AccountConfig,
+    LyricTemplateConfig,
+    PipelineSnapshot,
+    PipelineQueueSnapshot,
+    SongRecord,
+)
 
 
 class JsonStore:
@@ -145,3 +153,85 @@ class RunStateRepository:
     def _runs(self) -> dict:
         value = self._store.read()
         return value.get("runs", {}) if isinstance(value, dict) else {}
+
+
+class PipelineStateRepository:
+    def __init__(self, path: Path) -> None:
+        self._store = JsonStore(path, default=None)
+
+    def get(self) -> PipelineSnapshot | None:
+        value = self._store.read()
+        return PipelineSnapshot.model_validate(value) if value else None
+
+    def save(self, snapshot: PipelineSnapshot) -> None:
+        self._store.write(snapshot.model_dump(mode="json"))
+
+
+class PipelineQueueStateRepository:
+    def __init__(self, path: Path) -> None:
+        self._store = JsonStore(path, default=None)
+
+    def get(self) -> PipelineQueueSnapshot | None:
+        value = self._store.read()
+        return PipelineQueueSnapshot.model_validate(value) if value else None
+
+    def save(self, snapshot: PipelineQueueSnapshot) -> None:
+        self._store.write(snapshot.model_dump(mode="json"))
+
+
+class LyricTemplateRepository:
+    def __init__(self, path: Path) -> None:
+        self._store = JsonStore(path, default=[])
+
+    def list(self, account_id: str | None = None) -> list[LyricTemplateConfig]:
+        templates = [LyricTemplateConfig.model_validate(item) for item in self._store.read()]
+        return [template for template in templates if account_id is None or template.account_id == account_id]
+
+    def get(self, template_id: str) -> LyricTemplateConfig:
+        for template in self.list():
+            if template.id == template_id:
+                return template
+        raise NotFoundError(f"歌词模板不存在: {template_id}")
+
+    def create(self, template: LyricTemplateConfig) -> LyricTemplateConfig:
+        templates = self.list()
+        self._ensure_unique(template, templates)
+        templates.append(template)
+        self._persist(templates)
+        return template
+
+    def update(self, template_id: str, template: LyricTemplateConfig) -> LyricTemplateConfig:
+        templates = self.list()
+        self._ensure_unique(template, templates, ignored_id=template_id)
+        for index, current in enumerate(templates):
+            if current.id == template_id:
+                updated = template.model_copy(update={"id": template_id})
+                templates[index] = updated
+                self._persist(templates)
+                return updated
+        raise NotFoundError(f"歌词模板不存在: {template_id}")
+
+    def delete(self, template_id: str) -> None:
+        templates = self.list()
+        remaining = [template for template in templates if template.id != template_id]
+        if len(remaining) == len(templates):
+            raise NotFoundError(f"歌词模板不存在: {template_id}")
+        self._persist(remaining)
+
+    def delete_for_account(self, account_id: str) -> None:
+        self._persist([template for template in self.list() if template.account_id != account_id])
+
+    def _ensure_unique(
+        self,
+        template: LyricTemplateConfig,
+        templates: list[LyricTemplateConfig],
+        ignored_id: str | None = None,
+    ) -> None:
+        for current in templates:
+            if current.id == ignored_id:
+                continue
+            if current.account_id == template.account_id and current.name == template.name:
+                raise ConflictError(f"模板名称已存在: {template.name}")
+
+    def _persist(self, templates: list[LyricTemplateConfig]) -> None:
+        self._store.write([template.model_dump(mode="json") for template in templates])

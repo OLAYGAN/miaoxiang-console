@@ -98,13 +98,40 @@ async def test_chrome_session_cleanup_is_idempotent(tmp_path: Path) -> None:
     browser = session.browser
     playwright = session._playwright
     process = session._process
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        "backend.browser.subprocess.run",
+        lambda command, **kwargs: process.terminate(),
+    )
 
     await session.cleanup()
     await session.cleanup()
+    monkeypatch.undo()
 
     assert browser.closed_count == 1
     assert playwright.stopped_count == 1
     assert process.terminated
+
+
+@pytest.mark.asyncio
+async def test_chrome_session_cleanup_kills_windows_process_tree(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    account = make_account(tmp_path)
+    session = ChromeSession(account, ConsoleSettings())
+    process = FakeProcess(pid=34567)
+    session._process = process
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "backend.browser.subprocess.run",
+        lambda command, **kwargs: commands.append(command),
+    )
+
+    await session.cleanup()
+
+    assert commands == [["taskkill", "/PID", "34567", "/T", "/F"]]
 
 
 @pytest.mark.asyncio
@@ -202,7 +229,8 @@ class FakeSession:
 
 
 class FakeProcess:
-    def __init__(self) -> None:
+    def __init__(self, pid: int = 12345) -> None:
+        self.pid = pid
         self.terminated = False
 
     def terminate(self) -> None:

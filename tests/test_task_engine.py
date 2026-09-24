@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -176,6 +177,55 @@ async def test_batch_mode_retries_only_generation_failures(tmp_path: Path) -> No
     assert state.get("2026-09-17", "账号01", "02_second.md").attempts == 2
 
 
+async def test_batch_description_rejection_is_not_retried(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_first")
+    flow = FakeBatchFlow()
+    flow.results = [
+        [
+            BatchSongResult(
+                song_name="01_first",
+                status="description_rejected",
+                error="平台提示生成失败: 无法根据描述生成，请修改",
+            ),
+        ]
+    ]
+    engine, state, _ = make_engine(tmp_path, flow)
+
+    engine.start(account, [song], day="2026-09-17")
+    await engine.wait()
+
+    assert flow.batches == [["01_first"]]
+    record = state.get("2026-09-17", "账号01", "01_first.md")
+    assert record.status == "描述不符合"
+    assert record.attempts == 1
+    assert "无法根据描述生成" in record.error
+
+
+async def test_batch_title_mismatch_is_not_retried(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_first")
+    flow = FakeBatchFlow()
+    flow.results = [
+        [
+            BatchSongResult(
+                song_name="01_first",
+                status="title_unmatched",
+                error="生成结果标题与歌名不匹配，已跳过",
+            ),
+        ]
+    ]
+    engine, state, _ = make_engine(tmp_path, flow)
+
+    engine.start(account, [song], day="2026-09-17")
+    await engine.wait()
+
+    assert flow.batches == [["01_first"]]
+    record = state.get("2026-09-17", "账号01", "01_first.md")
+    assert record.status == "详情歌名不匹配"
+    assert record.attempts == 1
+
+
 async def test_batch_export_failure_does_not_regenerate(tmp_path: Path) -> None:
     account = make_account(tmp_path)
     song = make_song(account.lyric_dir, "01_first")
@@ -207,6 +257,320 @@ async def test_parse_failure_continues_without_browser_call(tmp_path: Path) -> N
     assert flow.processed == ["01_good"]
     assert state.get("2026-09-17", "账号01", "00_bad.md").status == "解析失败"
     assert state.get("2026-09-17", "账号01", "01_good.md").status == "成功"
+
+
+async def test_all_completed_songs_finish_without_opening_browser(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_first")
+    flow = FakeFlow()
+    engine, state, browser = make_engine(tmp_path, flow)
+    state.mark("2026-09-17", "账号01", SongRecord(
+        file_name=song.name,
+        song_name="01_first",
+        status="成功",
+        current_step="done",
+        output_path="output/01_first.mp3",
+    ))
+
+    engine.start(account, [song], day="2026-09-17")
+    await engine.wait()
+
+    assert engine.current.status == "completed"
+    assert engine.current.skipped_count == 1
+    assert browser.entered == browser.exited == 0
+
+
+async def test_stop_upload_cancels_waiting_upload_task(tmp_path: Path) -> None:
+    class WaitingUploadFlow:
+        async def upload_album(self, items, on_step, on_verification_requested):
+            on_step("waiting_external_verification_code", len(items))
+            await on_verification_requested()
+            await asyncio.Event().wait()
+
+    class WaitingUploadBrowser:
+        async def __aenter__(self):
+            return WaitingUploadFlow()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    account = make_account(tmp_path)
+    engine = TaskEngine(
+        state_repository=RunStateRepository(tmp_path / "state.json"),
+        event_bus=EventBus(),
+        settings=ConsoleSettings(),
+        browser_factory=lambda account, settings: WaitingUploadBrowser(),
+        poll_interval=0.01,
+    )
+    engine.start_upload(account, [{"title": "第一首"}], "2026-09-17")
+    await asyncio.sleep(0)
+
+    await engine.stop_upload()
+    await engine.wait_upload()
+
+    assert engine.current_upload["status"] == "stopped"
+    assert engine.current_upload["step"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_upload_manifest_records_only_platform_confirmed_songs(tmp_path: Path) -> None:
+    class SuccessfulUploadFlow:
+        async def upload_album(self, items, on_step, on_verification_requested):
+            return [items[0]]
+
+    class SuccessfulUploadBrowser:
+        async def __aenter__(self):
+            return SuccessfulUploadFlow()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    account = make_account(tmp_path)
+    first = tmp_path / "output" / "2026-09-17" / "第一首.mp3"
+    second = tmp_path / "output" / "2026-09-17" / "第二首.mp3"
+    first.parent.mkdir(parents=True)
+    first.write_bytes(b"audio")
+    second.write_bytes(b"audio")
+    engine = TaskEngine(
+        state_repository=RunStateRepository(tmp_path / "state.json"),
+        event_bus=EventBus(),
+        settings=ConsoleSettings(),
+        browser_factory=lambda account, settings: SuccessfulUploadBrowser(),
+        poll_interval=0.01,
+    )
+
+    engine.start_upload(
+        account,
+        [{"title": "第一首", "path": str(first)}, {"title": "第二首", "path": str(second)}],
+        "2026-09-17",
+    )
+    await engine.wait_upload()
+
+    manifest = json.loads(
+        (tmp_path / "output" / "2026-09-17" / ".uploaded.json").read_text(encoding="utf-8")
+    )
+    assert manifest == [str(first.resolve())]
+    rejected = json.loads(
+        (tmp_path / "output" / "2026-09-17" / ".rejected.json").read_text(encoding="utf-8")
+    )
+    assert rejected[0]["title"] == "第二首"
+    assert engine.current_upload["status"] == "completed"
+    assert engine.current_upload["uploaded_paths"] == [str(first.resolve())]
+
+
+@pytest.mark.asyncio
+async def test_upload_replaces_noncompliant_song_with_alternate_version(tmp_path: Path) -> None:
+    class FirstUploadFlow:
+        async def upload_album(self, items, on_step, on_verification_requested):
+            return [items[0]]
+
+    class AlternateFlow:
+        async def export_alternate_version(self, song_name, lyrics):
+            output = tmp_path / "output" / "2026-09-17" / f"{song_name}.mp3"
+            output.write_bytes(b"second-version")
+            return output
+
+    class SecondUploadFlow:
+        async def upload_album(self, items, on_step, on_verification_requested):
+            return items
+
+    class SequenceBrowser:
+        def __init__(self, flow):
+            self.flow = flow
+
+        async def __aenter__(self):
+            return self.flow
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    flows = [FirstUploadFlow(), AlternateFlow(), SecondUploadFlow()]
+    calls = iter(range(3))
+
+    def factory(account, settings):
+        next(calls)
+        return SequenceBrowser(flows.pop(0))
+
+    account = make_account(tmp_path)
+    first = tmp_path / "output" / "2026-09-17" / "第一首.mp3"
+    second = tmp_path / "output" / "2026-09-17" / "第二首.mp3"
+    first.parent.mkdir(parents=True)
+    first.write_bytes(b"first-version")
+    second.write_bytes(b"rejected-first-version")
+    engine = TaskEngine(
+        state_repository=RunStateRepository(tmp_path / "state.json"),
+        event_bus=EventBus(),
+        settings=ConsoleSettings(),
+        browser_factory=factory,
+        poll_interval=0.01,
+    )
+
+    engine.start_upload(
+        account,
+        [
+            {"title": "第一首", "path": str(first), "lyrics": "第一首歌词"},
+            {"title": "第二首", "path": str(second), "lyrics": "第二首歌词"},
+        ],
+        "2026-09-17",
+        auto_replace_noncompliant=True,
+    )
+    await engine.wait_upload()
+
+    manifest = json.loads(
+        (tmp_path / "output" / "2026-09-17" / ".uploaded.json").read_text(encoding="utf-8")
+    )
+    assert engine.current_upload["status"] == "completed"
+    assert engine.current_upload["rejected_titles"] == []
+    assert engine.current_upload["replaced_titles"] == ["第二首"]
+    assert set(manifest) == {str(first.resolve()), str(second.resolve())}
+    assert second.read_bytes() == b"second-version"
+    assert not (second.parent / "不及格").exists()
+
+
+@pytest.mark.asyncio
+async def test_regeneration_upload_generates_songs_before_reuploading(
+    tmp_path: Path,
+) -> None:
+    class GenerationFlow:
+        async def process_batch(self, lyric_data_list, on_step):
+            results = []
+            for lyric_data in lyric_data_list:
+                output = tmp_path / "output" / "2026-09-17" / f"{lyric_data.song_name}.mp3"
+                output.write_bytes(b"regenerated-version")
+                results.append(BatchSongResult(
+                    song_name=lyric_data.song_name,
+                    status="success",
+                    output_path=str(output),
+                ))
+            return results
+
+    class UploadFlow:
+        async def upload_album(self, items, on_step, on_verification_requested):
+            return items
+
+    class Browser:
+        def __init__(self, flow):
+            self.flow = flow
+
+        async def __aenter__(self):
+            return self.flow
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    flows = [GenerationFlow(), UploadFlow()]
+    calls: list[str] = []
+
+    def factory(account, settings):
+        flow = flows.pop(0)
+        calls.append(type(flow).__name__)
+        return Browser(flow)
+
+    account = make_account(tmp_path)
+    output = tmp_path / "output" / "2026-09-17" / "第二首.mp3"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"original-rejected")
+    lyric = make_song(account.lyric_dir, "01_lyric", title="第二首")
+    engine = TaskEngine(
+        state_repository=RunStateRepository(tmp_path / "state.json"),
+        event_bus=EventBus(),
+        settings=ConsoleSettings(),
+        browser_factory=factory,
+        poll_interval=0.01,
+    )
+
+    engine.start_regeneration_upload(
+        account,
+        [{"title": "第二首", "path": str(output), "lyrics": "第二首歌词"}],
+        [lyric],
+        "2026-09-17",
+        model_name="Sway v5.5",
+        singer_name="老岩",
+    )
+    await engine.wait_upload()
+
+    assert calls == ["GenerationFlow", "UploadFlow"]
+    assert output.read_bytes() == b"regenerated-version"
+    manifest = json.loads((output.parent / ".uploaded.json").read_text(encoding="utf-8"))
+    assert manifest == [str(output.resolve())]
+
+
+@pytest.mark.asyncio
+async def test_regeneration_upload_uploads_successful_songs_when_one_fails(
+    tmp_path: Path,
+) -> None:
+    class GenerationFlow:
+        async def process_batch(self, lyric_data_list, on_step):
+            first = lyric_data_list[0]
+            output = tmp_path / "output" / "2026-09-17" / f"{first.song_name}.mp3"
+            output.write_bytes(b"regenerated-first")
+            return [
+                BatchSongResult(
+                    song_name=first.song_name,
+                    status="success",
+                    output_path=str(output),
+                ),
+                BatchSongResult(
+                    song_name=lyric_data_list[1].song_name,
+                    status="title_unmatched",
+                    error="生成失败",
+                ),
+            ]
+
+    uploaded: list[str] = []
+
+    class UploadFlow:
+        async def upload_album(self, items, on_step, on_verification_requested):
+            uploaded.extend(item["title"] for item in items)
+            return items
+
+    class Browser:
+        def __init__(self, flow):
+            self.flow = flow
+
+        async def __aenter__(self):
+            return self.flow
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    flows = [GenerationFlow(), UploadFlow()]
+
+    def factory(account, settings):
+        return Browser(flows.pop(0))
+
+    account = make_account(tmp_path)
+    first = tmp_path / "output" / "2026-09-17" / "第一首.mp3"
+    second = tmp_path / "output" / "2026-09-17" / "第二首.mp3"
+    first.parent.mkdir(parents=True)
+    first.write_bytes(b"old-first")
+    second.write_bytes(b"old-second")
+    first_lyric = make_song(account.lyric_dir, "01_first", title="第一首")
+    second_lyric = make_song(account.lyric_dir, "02_second", title="第二首")
+    engine = TaskEngine(
+        state_repository=RunStateRepository(tmp_path / "state.json"),
+        event_bus=EventBus(),
+        settings=ConsoleSettings(),
+        browser_factory=factory,
+        poll_interval=0.01,
+    )
+
+    engine.start_regeneration_upload(
+        account,
+        [
+            {"title": "第一首", "path": str(first), "lyrics": "第一首歌词"},
+            {"title": "第二首", "path": str(second), "lyrics": "第二首歌词"},
+        ],
+        [first_lyric, second_lyric],
+        "2026-09-17",
+    )
+    await engine.wait_upload()
+
+    assert uploaded == ["第一首"]
+    assert first.read_bytes() == b"regenerated-first"
+    assert second.read_bytes() == b"old-second"
+    manifest = json.loads((first.parent / ".uploaded.json").read_text(encoding="utf-8"))
+    assert manifest == [str(first.resolve())]
 
 
 async def test_retryable_failure_respects_max_retries(tmp_path: Path) -> None:
@@ -274,7 +638,7 @@ async def test_song_verification_failure_stops_whole_run(tmp_path: Path) -> None
 
     assert len(flow.processed) == 0
     assert engine.current.status == "verification_failed"
-    assert state.get("2026-09-17", "账号01", "01_first.md").status == "详情校验失败"
+    assert state.get("2026-09-17", "账号01", "01_first.md").status == "标题校验失败"
     assert state.get("2026-09-17", "账号01", "01_first.md").attempts == 1
     assert state.get("2026-09-17", "账号01", "02_second.md") is None
 

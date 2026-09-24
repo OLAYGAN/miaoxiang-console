@@ -16,3 +16,15 @@ build/
 *.egg-info/
 *.log
 *.tmp
+*.bak
+*.bak-*
+
+# Local browser diagnostics and temporary captures
+all-states.json
+detail-buttons.json
+diagnose-*.json
+diagnose-*.png
+new-*-dom.json
+new-*-page.png
+tab-candidates.json
+task-ui-layout.png

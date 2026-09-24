@@ -1,6 +1,7 @@
 """Serialized task orchestration with bounded and controllable execution."""
 
 import asyncio
+import json
 import traceback
 from collections.abc import Callable
 from datetime import date
@@ -27,6 +28,7 @@ from backend.models import (
     BatchSongResult,
 )
 from backend.storage import RunStateRepository
+from backend.upload_rejections import clear_rejected_titles, write_rejected
 
 
 class TaskEngine:
@@ -45,7 +47,10 @@ class TaskEngine:
         self._poll_interval = poll_interval
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
+        self._upload_task: asyncio.Task | None = None
+        self._verification_future: asyncio.Future[str] | None = None
         self.current: TaskSnapshot | None = None
+        self.current_upload: dict | None = None
         self._pause_requested = asyncio.Event()
         self._resumed = asyncio.Event()
         self._stop_requested = asyncio.Event()
@@ -69,6 +74,8 @@ class TaskEngine:
         song_files: list[Path],
         day: str | None = None,
         fresh_run: bool = False,
+        model_name: str = "自动",
+        singer_name: str = "老岩",
     ) -> TaskSnapshot:
         if self.is_running:
             raise ConflictError("已有任务正在运行，请先停止当前任务")
@@ -88,14 +95,131 @@ class TaskEngine:
             ],
         )
         self._task = asyncio.create_task(
-            self._run(account, song_files, day or date.today().isoformat(), fresh_run)
+            self._run(
+                account,
+                song_files,
+                day or date.today().isoformat(),
+                fresh_run,
+                model_name,
+                singer_name,
+            )
         )
         return self.current
+
+    @property
+    def upload_is_running(self) -> bool:
+        return self._upload_task is not None and not self._upload_task.done()
+
+    def start_upload(
+        self,
+        account: AccountConfig,
+        items: list[dict],
+        day: str,
+        *,
+        auto_replace_noncompliant: bool = False,
+    ) -> dict:
+        if self.is_running:
+            raise ConflictError("生成任务正在运行，请先停止后再上传")
+        if self.upload_is_running:
+            raise ConflictError("已有上传任务正在运行")
+        if not items:
+            raise ValidationFailed("没有可上传的歌曲")
+        self._verification_future = asyncio.get_running_loop().create_future()
+        self.current_upload = {
+            "status": "running", "step": "starting", "day": day,
+            "account_id": account.id, "account_name": account.account_name,
+            "total": len(items), "processed": 0,
+            "verification_requested": False, "error": None,
+            "auto_replace_noncompliant": auto_replace_noncompliant,
+            "rejected_titles": [],
+            "replaced_titles": [],
+            "unreplaced_titles": [],
+        }
+        self._upload_task = asyncio.create_task(
+            self._run_upload(
+                account,
+                items,
+                day,
+                auto_replace_noncompliant,
+            )
+        )
+        return self.current_upload
+
+    def start_regeneration_upload(
+        self,
+        account: AccountConfig,
+        items: list[dict],
+        lyric_files: list[Path],
+        day: str,
+        *,
+        model_name: str = "自动",
+        singer_name: str = "老岩",
+        auto_replace_noncompliant: bool = False,
+    ) -> dict:
+        if self.is_running:
+            raise ConflictError("生成任务正在运行，请先停止后再操作")
+        if self.upload_is_running:
+            raise ConflictError("已有上传任务正在运行")
+        if not items or not lyric_files:
+            raise ValidationFailed("没有可重新生成发布的歌曲")
+
+        self._verification_future = asyncio.get_running_loop().create_future()
+        self.current_upload = {
+            "status": "running",
+            "step": "regenerating_songs",
+            "day": day,
+            "account_id": account.id,
+            "account_name": account.account_name,
+            "total": len(items),
+            "processed": 0,
+            "verification_requested": False,
+            "error": None,
+            "auto_replace_noncompliant": auto_replace_noncompliant,
+            "rejected_titles": [],
+            "replaced_titles": [],
+            "unreplaced_titles": [],
+        }
+        self._upload_task = asyncio.create_task(
+            self._run_regeneration_upload(
+                account,
+                items,
+                lyric_files,
+                day,
+                model_name,
+                singer_name,
+                auto_replace_noncompliant,
+            )
+        )
+        return self.current_upload
+
+    async def submit_upload_code(self, code: str) -> dict:
+        if not self.upload_is_running or self._verification_future is None:
+            raise ConflictError("当前没有等待验证码的上传任务")
+        if not self._verification_future.done():
+            self._verification_future.set_result(code)
+        self._update_upload(step="submitting_verification_code")
+        return self.current_upload or {}
+
+    async def stop_upload(self) -> dict:
+        if not self.upload_is_running:
+            raise ConflictError("当前没有正在运行的上传任务")
+        self._update_upload(status="stopping", step="stopping")
+        if self._verification_future is not None and not self._verification_future.done():
+            self._verification_future.cancel()
+        self._upload_task.cancel()
+        return self.current_upload or {}
 
     async def wait(self) -> None:
         if self._task is not None:
             try:
                 await self._task
+            except asyncio.CancelledError:
+                pass
+
+    async def wait_upload(self) -> None:
+        if self._upload_task is not None:
+            try:
+                await self._upload_task
             except asyncio.CancelledError:
                 pass
 
@@ -142,55 +266,79 @@ class TaskEngine:
         song_files: list[Path],
         day: str,
         fresh_run: bool,
+        model_name: str = "自动",
+        singer_name: str = "老岩",
     ) -> None:
         assert self.current is not None
         try:
+            self._update_status("running", step="checking_completed")
+            prepared: list[tuple[Path, SongProgress, object]] = []
+            for file_index, path in enumerate(song_files):
+                if self._stop_requested.is_set():
+                    break
+                await self._wait_while_paused()
+                if self._stop_requested.is_set():
+                    break
+
+                progress = self.current.songs[file_index]
+                self.current.current_file = progress.file_name
+                if not fresh_run:
+                    previous = self._state.get(day, account.account_name, path.name)
+                    if previous and previous.status == "成功":
+                        progress.status = "skipped"
+                        progress.current_step = "done"
+                        self.current.skipped_count += 1
+                        self._emit_status()
+                        self._log("info", "resume", f"跳过已完成歌曲: {path.name}", path.name)
+                        continue
+
+                try:
+                    lyric_data = parse_lyrics(path.read_text(encoding="utf-8"))
+                except ValidationFailed as error:
+                    self._finish_song(
+                        day,
+                        account,
+                        progress,
+                        status="解析失败",
+                        error=error.message,
+                    )
+                    continue
+                except OSError as error:
+                    self._finish_song(
+                        day,
+                        account,
+                        progress,
+                        status="解析失败",
+                        error=f"读取歌词失败: {error}",
+                    )
+                    continue
+
+                progress.song_name = lyric_data.song_name
+                prepared.append((path, progress, lyric_data))
+
+            if self._stop_requested.is_set():
+                self._complete("stopped")
+                return
+            if not prepared:
+                if self.current.failure_count:
+                    self._complete("failed")
+                else:
+                    self._log(
+                        "info",
+                        "resume",
+                        "选中歌曲均已完成；如需重新处理请勾选“全部重跑”",
+                    )
+                    self._complete("completed")
+                return
+
             self._update_status("running", step="opening_browser")
-            async with self._browser_factory(account, self._settings) as flow:
-                prepared: list[tuple[Path, SongProgress, object]] = []
-                for file_index, path in enumerate(song_files):
-                    if self._stop_requested.is_set():
-                        break
-                    await self._wait_while_paused()
-                    if self._stop_requested.is_set():
-                        break
-
-                    progress = self.current.songs[file_index]
-                    self.current.current_file = progress.file_name
-                    if not fresh_run:
-                        previous = self._state.get(day, account.account_name, path.name)
-                        if previous and previous.status == "成功":
-                            progress.status = "skipped"
-                            progress.current_step = "done"
-                            self.current.skipped_count += 1
-                            self._emit_status()
-                            self._log("info", "resume", f"跳过已完成歌曲: {path.name}", path.name)
-                            continue
-
-                    try:
-                        lyric_data = parse_lyrics(path.read_text(encoding="utf-8"))
-                    except ValidationFailed as error:
-                        self._finish_song(
-                            day,
-                            account,
-                            progress,
-                            status="解析失败",
-                            error=error.message,
-                        )
-                        continue
-                    except OSError as error:
-                        self._finish_song(
-                            day,
-                            account,
-                            progress,
-                            status="解析失败",
-                            error=f"读取歌词失败: {error}",
-                        )
-                        continue
-
-                    progress.song_name = lyric_data.song_name
-                    prepared.append((path, progress, lyric_data))
-
+            run_account = account.model_copy(update={
+                "model_name": model_name,
+                "singer_name": singer_name,
+            })
+            async with self._browser_factory(run_account, self._settings) as flow:
+                if hasattr(flow, "day"):
+                    flow.day = day
                 use_batch_flow = hasattr(flow, "process_batch")
                 batches = range(0, len(prepared), account.generation_batch_size) if use_batch_flow else range(0, len(prepared), 1)
                 last_batch_index = len(batches) - 1 if isinstance(batches, range) else 0
@@ -230,6 +378,206 @@ class TaskEngine:
         except Exception as error:
             self._log("error", "task", f"任务异常: {error}", traceback.format_exc(limit=2))
             self._complete("failed", error=str(error))
+
+    async def _run_regeneration_upload(
+        self,
+        account: AccountConfig,
+        items: list[dict],
+        lyric_files: list[Path],
+        day: str,
+        model_name: str,
+        singer_name: str,
+        auto_replace_noncompliant: bool,
+    ) -> None:
+        try:
+            self._update_upload(status="running", step="regenerating_songs")
+            self.start(
+                account,
+                lyric_files,
+                day=day,
+                fresh_run=True,
+                model_name=model_name,
+                singer_name=singer_name,
+            )
+            await self.wait()
+            assert self.current is not None
+            successful_titles = {
+                str(song.song_name)
+                for song in self.current.songs
+                if song.status == "成功" and song.song_name
+            }
+            upload_items = [
+                item for item in items
+                if str(item.get("title") or "") in successful_titles
+            ]
+            if not upload_items:
+                raise BrowserFlowError("重新生成完成，但没有可上传的新歌曲")
+            if self.current.status != "completed":
+                self._log(
+                    "warning",
+                    "upload_regenerate",
+                    f"部分歌曲重新生成失败，继续上传成功的 {len(upload_items)} 首",
+                )
+
+            self.current_upload["total"] = len(upload_items)
+            self._update_upload(step="reupload_replaced_songs")
+            await self._run_upload(
+                account,
+                upload_items,
+                day,
+                auto_replace_noncompliant,
+            )
+        except asyncio.CancelledError:
+            if self.is_running:
+                await self.stop()
+            self._update_upload(status="stopped", step="stopped")
+        except Exception as error:
+            self._log("error", "upload_regenerate", f"再次生成发布失败: {error}")
+            self._update_upload(status="failed", step="failed", error=str(error))
+
+    async def _run_upload(
+        self,
+        account: AccountConfig,
+        items: list[dict],
+        day: str,
+        auto_replace_noncompliant: bool = False,
+    ) -> None:
+        def on_step(step: str, processed: int) -> None:
+            self._update_upload(step=step, processed=processed)
+            self._log("info", f"upload_{step}", f"上传步骤: {step}")
+
+        async def notify_verification_requested() -> None:
+            self._update_upload(
+                verification_requested=True,
+                step="waiting_external_verification_code",
+            )
+            self._log(
+                "warning",
+                "upload_verification",
+                "请在平台验证码弹窗中输入短信验证码；弹窗消失后任务自动完成",
+            )
+
+        try:
+            async def upload_once(batch: list[dict]) -> list[dict]:
+                self._update_upload(status="running", step="opening_browser")
+                # Upload never needs to change the model selector; leave the
+                # platform's current/default choice untouched.
+                upload_account = account.model_copy(update={"model_name": "自动"})
+                async with self._browser_factory(upload_account, self._settings) as flow:
+                    result = await flow.upload_album(batch, on_step, notify_verification_requested)
+                return result if isinstance(result, list) else batch
+
+            assert self.current_upload is not None
+            confirmed_items = await upload_once(items)
+            if not confirmed_items and not auto_replace_noncompliant:
+                raise BrowserFlowError("所有歌曲均未通过平台音频检测，已停止发布")
+            confirmed_keys = {
+                str(Path(item["path"]).resolve()) for item in confirmed_items
+            }
+            rejected_items = [
+                item for item in items
+                if str(Path(item["path"]).resolve()) not in confirmed_keys
+            ]
+            if rejected_items:
+                write_rejected(account, day, rejected_items)
+            self.current_upload["rejected_titles"] = [item["title"] for item in rejected_items]
+
+            if rejected_items and auto_replace_noncompliant:
+                self._update_upload(step="replace_noncompliant_songs")
+                self._log(
+                    "warning",
+                    "upload_replace",
+                    f"平台剔除 {len(rejected_items)} 首，准备尝试未导出的第二版本",
+                )
+                replacement_items: list[dict] = []
+                replacement_account = account.model_copy(update={"model_name": "自动"})
+                async with self._browser_factory(replacement_account, self._settings) as flow:
+                    for item in rejected_items:
+                        try:
+                            output_path = await flow.export_alternate_version(
+                                item["title"],
+                                item["lyrics"],
+                            )
+                            replacement_items.append({
+                                **item,
+                                "path": str(output_path),
+                            })
+                            self.current_upload["replaced_titles"].append(item["title"])
+                            self._log(
+                                "info",
+                                "upload_replace",
+                                f"已导出第二版本: {item['title']}",
+                                item["title"],
+                            )
+                        except Exception as error:
+                            self.current_upload["unreplaced_titles"].append(item["title"])
+                            self._log(
+                                "warning",
+                                "upload_replace",
+                                f"第二版本导出失败: {item['title']}: {error}",
+                                item["title"],
+                            )
+
+                if replacement_items:
+                    self._update_upload(step="reupload_replaced_songs")
+                    reconfirmed = await upload_once(replacement_items)
+                    confirmed_items.extend(reconfirmed)
+                    confirmed_keys.update(
+                        str(Path(item["path"]).resolve()) for item in reconfirmed
+                    )
+                    self.current_upload["unreplaced_titles"] = [
+                        item["title"] for item in replacement_items
+                        if str(Path(item["path"]).resolve()) not in confirmed_keys
+                    ]
+
+            uploaded_paths = list(dict.fromkeys(
+                str(Path(item["path"]).resolve()) for item in confirmed_items
+            ))
+            if not uploaded_paths:
+                raise BrowserFlowError("所有歌曲均未通过平台音频检测，且没有可用替换版本")
+            manifest = Path(account.output_dir) / day / ".uploaded.json"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            existing = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else []
+            existing.extend(uploaded_paths)
+            manifest.write_text(json.dumps(sorted(set(existing)), ensure_ascii=False, indent=2), encoding="utf-8")
+            assert self.current_upload is not None
+            self.current_upload["uploaded_paths"] = uploaded_paths
+            clear_rejected_titles(
+                account,
+                day,
+                {str(item["title"]) for item in confirmed_items},
+            )
+            self.current_upload["rejected_titles"] = [
+                title for title in self.current_upload["rejected_titles"]
+                if title not in self.current_upload["replaced_titles"]
+                or title in self.current_upload["unreplaced_titles"]
+            ]
+            self._update_upload(status="completed", step="done", processed=len(confirmed_items))
+            self._log(
+                "info",
+                "upload_done",
+                f"平台确认发布完成: {len(confirmed_items)} 首"
+                + (f"；平台剔除 {len(items) - len(confirmed_items)} 首" if len(confirmed_items) < len(items) else ""),
+            )
+        except asyncio.CancelledError:
+            self._update_upload(status="stopped", step="stopped")
+        except Exception as error:
+            self._log("error", "upload", f"上传任务异常: {error}", traceback.format_exc(limit=2))
+            self._update_upload(status="failed", step="failed", error=str(error))
+
+    def _update_upload(
+        self, *, status: str | None = None, step: str | None = None,
+        processed: int | None = None, verification_requested: bool | None = None,
+        error: str | None = None,
+    ) -> None:
+        if self.current_upload is None:
+            return
+        if status is not None: self.current_upload["status"] = status
+        if step is not None: self.current_upload["step"] = step
+        if processed is not None: self.current_upload["processed"] = processed
+        if verification_requested is not None: self.current_upload["verification_requested"] = verification_requested
+        if error is not None: self.current_upload["error"] = error
+        self._events_task({"type": "upload_status", "data": self.current_upload})
 
     async def _process_batch_with_retries(
         self,
@@ -287,7 +635,7 @@ class TaskEngine:
                 for _, progress, _ in remaining:
                     self._finish_song(
                         day, account, progress,
-                        status="详情校验失败", current_step="verify_details", error=error.message,
+                        status="标题校验失败", current_step="match_titles", error=error.message,
                     )
                 self._complete("verification_failed", error.message)
                 return
@@ -317,6 +665,24 @@ class TaskEngine:
                         status="成功",
                         current_step="done",
                         output_path=result.output_path,
+                    )
+                elif result.status == "description_rejected":
+                    self._finish_song(
+                        day,
+                        account,
+                        progress,
+                        status="描述不符合",
+                        current_step="generation_rejected",
+                        error=result.error or "无法根据描述生成，请修改",
+                    )
+                elif result.status == "title_unmatched":
+                    self._finish_song(
+                        day,
+                        account,
+                        progress,
+                        status="详情歌名不匹配",
+                        current_step="match_titles",
+                        error=result.error or "歌曲详情歌名与歌词歌名不匹配，已跳过",
                     )
                 elif result.status == "export_failed":
                     self._finish_song(
@@ -416,7 +782,7 @@ class TaskEngine:
                     day,
                     account,
                     progress,
-                    status="详情校验失败",
+                    status="标题校验失败",
                     current_step=current_step,
                     error=error.message,
                 )

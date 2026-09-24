@@ -45,3 +45,7 @@ class LoginRequiredError(BrowserFlowError):
 
 class SongVerificationError(BrowserFlowError):
     code = "SONG_VERIFICATION_FAILED"
+
+
+class SongGenerationFailureError(BrowserFlowError):
+    code = "SONG_GENERATION_FAILED"

@@ -161,14 +161,29 @@ class ChromeSession:
                 pass
             self._playwright = None
         if self._process is not None and self._process.poll() is None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait(timeout=2)
+            self._terminate_process_tree(self._process)
         self._process = None
         self.page = None
+
+    def _terminate_process_tree(self, process: subprocess.Popen) -> None:
+        """Close Chrome's launcher and every child renderer/utility process."""
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    capture_output=True,
+                    check=False,
+                )
+            except Exception:
+                process.terminate()
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
 
     async def __aenter__(self) -> "ChromeSession":
         return await self.start()

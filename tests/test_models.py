@@ -15,7 +15,7 @@ def test_account_config_applies_stable_defaults() -> None:
         download_dir="downloads",
     )
 
-    assert account.model_name == "Sway v5.5"
+    assert account.model_name == "自动"
     assert account.singer_name == "老岩"
     assert account.max_retries == 3
     assert account.song_interval_seconds == 5
@@ -25,6 +25,58 @@ def test_account_config_applies_stable_defaults() -> None:
     assert account.upload_batch_size == 10
     assert account.upload_artist_name == "白日逐梦"
     assert account.upload_real_name == "龙英"
+
+
+def test_account_config_accepts_platform_models() -> None:
+    base = {
+        "account_name": "账号01",
+        "chrome_profile_dir": "chrome/accounts/account-01",
+        "lyric_dir": "lyrics",
+        "output_dir": "output",
+        "download_dir": "downloads",
+    }
+    expected_models = {
+        "自动",
+        "Sodance v2.0",
+        "MiniMax v2.6",
+        "TemPolor v4.1a",
+        "音潮 v3.0",
+        "SeedMusic v1.0 preview",
+        "TemPolor v4.0",
+        "Sway v5.5",
+    }
+
+    models = {
+        AccountConfig(**base, model_name=model).model_name
+        for model in expected_models
+    }
+
+    assert models == expected_models
+
+
+def test_account_config_rejects_unknown_platform_model() -> None:
+    with pytest.raises(ValidationError, match="model_name"):
+        AccountConfig(
+            account_name="账号01",
+            chrome_profile_dir="chrome/accounts/account-01",
+            lyric_dir="lyrics",
+            output_dir="output",
+            download_dir="downloads",
+            model_name="Unknown model",
+        )
+
+
+def test_account_config_allows_empty_real_name() -> None:
+    account = AccountConfig(
+        account_name="账号01",
+        chrome_profile_dir="chrome/accounts/account-01",
+        lyric_dir="lyrics",
+        output_dir="output",
+        download_dir="downloads",
+        upload_real_name="",
+    )
+
+    assert account.upload_real_name == ""
 
 
 def test_account_config_normalizes_paths() -> None:
