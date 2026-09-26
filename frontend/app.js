@@ -1968,6 +1968,7 @@ function bindEvents() {
       } else {
         state.view = "task";
       }
+      if (state.stage === "pipeline") void loadPipelineQueueOptions();
       renderView();
       const panel = document.querySelector({
         lyrics: ".lyric-layout",
@@ -2519,6 +2520,7 @@ function fillLyricTemplateForm(template = null) {
       try {
         await api(`/api/accounts/${template.account_id}/lyric/templates/${template.id}`, { method: "DELETE" });
         await loadLyricTemplates();
+        await loadPipelineQueueOptions();
         toast("模板已删除");
       } catch (error) {
         toast(error.message, true);
@@ -2598,6 +2600,7 @@ function fillLyricTemplateForm(template = null) {
       renderAccounts();
       await loadSongs();
       await loadLyricTemplates();
+      await loadPipelineQueueOptions();
       toast("模板已保存");
     } catch (error) {
       toast(error.message, true);
