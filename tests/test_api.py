@@ -530,6 +530,39 @@ def test_retry_rejected_upload_regenerates_pending_songs(tmp_path: Path, monkeyp
         assert captured["kwargs"]["singer_name"] == "小岩"
 
 
+def test_lyric_template_can_move_between_accounts(tmp_path: Path) -> None:
+    app, _ = make_client(tmp_path)
+    with TestClient(app) as client:
+        first = client.post("/api/accounts", json=account_payload(tmp_path, "账号01", 19222)).json()
+        second_payload = account_payload(tmp_path, "账号02", 19223)
+        second_payload["lyric_dir"] = str(tmp_path / "lyrics02")
+        second_payload["output_dir"] = str(tmp_path / "output02")
+        second_payload["download_dir"] = str(tmp_path / "downloads02")
+        second = client.post("/api/accounts", json=second_payload).json()
+
+        payload = {
+            "name": "可迁移模板",
+            "lyric_tone": "温暖叙事",
+            "song_style": "pop rock",
+            "themes": ["成长"],
+            "generation_count": 2,
+        }
+        template = client.post(
+            f"/api/accounts/{first['id']}/lyric/templates",
+            json=payload,
+        ).json()
+
+        moved = client.put(
+            f"/api/accounts/{second['id']}/lyric/templates/{template['id']}",
+            json=payload,
+        )
+
+        assert moved.status_code == 200
+        assert moved.json()["account_id"] == second["id"]
+        assert [item["id"] for item in client.get(f"/api/accounts/{first['id']}/lyric/templates").json()["templates"]] == []
+        assert [item["id"] for item in client.get(f"/api/accounts/{second['id']}/lyric/templates").json()["templates"]] == [template["id"]]
+
+
 def test_pipeline_endpoints_use_existing_account_and_template(tmp_path: Path, monkeypatch) -> None:
     from backend.models import PipelineSnapshot
 

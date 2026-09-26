@@ -778,8 +778,6 @@ def create_app(
     ) -> dict:
         account_repository.get(account_id)
         existing = lyric_template_repository.get(template_id)
-        if existing.account_id != account_id:
-            raise ValidationFailed("歌词模板不属于该账号")
         template = LyricTemplateConfig(
             id=template_id,
             account_id=account_id,
