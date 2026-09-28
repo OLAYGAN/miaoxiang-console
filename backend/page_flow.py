@@ -21,6 +21,104 @@ from backend.models import BatchSongResult, GeneratedCandidate
 
 T = TypeVar("T")
 
+MIN_DOWNLOAD_DURATION_SECONDS = 60.0
+
+_MPEG1_BITRATE_TABLE = {
+    1: [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+    2: [32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384],
+    3: [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+}
+_MPEG2_LAYER1_BITRATE_TABLE = [32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256]
+_MPEG2_LAYER23_BITRATE_TABLE = [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
+
+
+def read_mp3_duration_seconds(path: Path) -> float:
+    """Parse MP3 frame headers to obtain duration without external media tools."""
+    data = Path(path).read_bytes()
+    offset = 0
+    if data[:3] == b"ID3" and len(data) >= 10:
+        size = (
+            (data[6] & 0x7F) << 21
+            | (data[7] & 0x7F) << 14
+            | (data[8] & 0x7F) << 7
+            | (data[9] & 0x7F)
+        )
+        offset = min(len(data), size + 10)
+
+    frame_offset = -1
+    scan_limit = min(len(data) - 4, offset + 1_048_576)
+    while offset <= scan_limit:
+        if data[offset] == 0xFF and (data[offset + 1] & 0xE0) == 0xE0:
+            header = int.from_bytes(data[offset:offset + 4], "big")
+            version = (header >> 19) & 3
+            layer = (header >> 17) & 3
+            bitrate_index = (header >> 12) & 0xF
+            sample_index = (header >> 10) & 3
+            padding = (header >> 9) & 1
+            if (
+                version in {0, 2, 3}
+                and layer in {1, 2, 3}
+                and 1 <= bitrate_index <= 14
+                and sample_index != 3
+            ):
+                frame_offset = offset
+                break
+        offset += 1
+    if frame_offset < 0:
+        raise BrowserFlowError(f"无法解析 MP3 音频时长: {path}")
+
+    duration = 0.0
+    frames = 0
+    cursor = frame_offset
+    while cursor + 4 <= len(data):
+        if data[cursor] != 0xFF or (data[cursor + 1] & 0xE0) != 0xE0:
+            break
+        header = int.from_bytes(data[cursor:cursor + 4], "big")
+        version = (header >> 19) & 3
+        layer = (header >> 17) & 3
+        bitrate_index = (header >> 12) & 0xF
+        sample_index = (header >> 10) & 3
+        padding = (header >> 9) & 1
+        if (
+            version not in {0, 2, 3}
+            or layer not in {1, 2, 3}
+            or bitrate_index in {0, 15}
+            or sample_index == 3
+        ):
+            break
+
+        if version == 3:
+            bitrate = _MPEG1_BITRATE_TABLE[layer][bitrate_index - 1]
+            sample_rate = (44100, 48000, 32000)[sample_index]
+            samples_per_frame = 384 if layer == 3 else 1152
+        else:
+            bitrate = (
+                _MPEG2_LAYER1_BITRATE_TABLE
+                if layer == 3
+                else _MPEG2_LAYER23_BITRATE_TABLE
+            )[bitrate_index - 1]
+            sample_rate = (
+                (11025, 12000, 8000) if version == 0 else (22050, 24000, 16000)
+            )[sample_index]
+            samples_per_frame = 576 if layer == 1 else 1152
+
+        coefficient = samples_per_frame // 8
+        frame_length = (
+            coefficient * bitrate * 1000 // sample_rate
+            + padding
+        )
+        if layer == 3:
+            frame_length *= 4
+        if frame_length < 4:
+            break
+        duration += samples_per_frame / sample_rate
+        frames += 1
+        cursor += frame_length
+
+    if frames == 0:
+        raise BrowserFlowError(f"无法解析 MP3 音频时长: {path}")
+    return duration
+
 
 async def trusted_click(
     page: Any,
@@ -160,6 +258,11 @@ def archive_download(
     source = Path(downloaded_file)
     if not source.is_file() or source.stat().st_size == 0:
         raise BrowserFlowError(f"下载文件为空或不存在: {source}")
+    duration = read_mp3_duration_seconds(source)
+    if duration <= MIN_DOWNLOAD_DURATION_SECONDS:
+        raise BrowserFlowError(
+            f"下载音乐时长 {duration:.1f} 秒，必须大于 60 秒；已保留原成品文件"
+        )
 
     safe_song = re.sub(r'[\\/:*?"<>|]+', "_", song_name).strip() or "未命名歌曲"
     directory = Path(output_root) / day

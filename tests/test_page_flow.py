@@ -861,7 +861,11 @@ async def test_process_batch_marks_unmatched_titles_as_terminal_skip(
     assert results[0].error == "歌曲详情歌名与歌词歌名不匹配，已跳过"
 
 
-def test_archive_download_moves_file_and_overwrites_duplicate(tmp_path: Path) -> None:
+def test_archive_download_moves_file_and_overwrites_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(page_flow_module, "read_mp3_duration_seconds", lambda _: 61.0)
     downloaded = tmp_path / "downloaded.mp3"
     downloaded.write_bytes(b"audio")
     output_root = tmp_path / "成品"
@@ -887,6 +891,23 @@ def test_archive_download_moves_file_and_overwrites_duplicate(tmp_path: Path) ->
     empty.write_bytes(b"")
     with pytest.raises(BrowserFlowError, match="下载文件为空"):
         archive_download(empty, output_root, "坏文件", "2026-09-17")
+
+
+def test_archive_download_rejects_song_shorter_than_sixty_seconds(tmp_path: Path) -> None:
+    # MPEG 2.5 Layer III, 8 kbps, 8 kHz: each 72-byte frame is 0.072 seconds.
+    frame = bytes([0xFF, 0xE3, 0x18, 0x00]) + b"\x00" * 68
+    downloaded = tmp_path / "short.mp3"
+    downloaded.write_bytes(frame * 800)
+    output_root = tmp_path / "成品"
+    destination = output_root / "2026-09-17" / "短歌.mp3"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"old-valid-song")
+
+    with pytest.raises(BrowserFlowError, match="音乐时长 57\\.6 秒，必须大于 60 秒"):
+        archive_download(downloaded, output_root, "短歌", "2026-09-17")
+
+    assert destination.read_bytes() == b"old-valid-song"
+    assert downloaded.is_file()
 
 
 def test_detects_platform_login_challenge_text() -> None:
@@ -2290,7 +2311,11 @@ def test_new_cards_above_anchor_returns_empty_when_generation_fails() -> None:
 
 
 @pytest.mark.asyncio
-async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
+async def test_process_song_runs_all_states_in_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(page_flow_module, "read_mp3_duration_seconds", lambda _: 61.0)
     account = make_account(tmp_path)
     flow = PageFlow(page=FakePage(), account=account, settings=ConsoleSettings(), screenshot_dir=tmp_path)
     calls: list[str] = []
@@ -2355,7 +2380,11 @@ async def test_process_song_runs_all_states_in_order(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_process_song_uses_configured_run_day_for_archive(tmp_path: Path) -> None:
+async def test_process_song_uses_configured_run_day_for_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(page_flow_module, "read_mp3_duration_seconds", lambda _: 61.0)
     account = make_account(tmp_path)
     flow = PageFlow(
         page=FakePage(),
