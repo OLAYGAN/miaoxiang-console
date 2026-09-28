@@ -1552,10 +1552,24 @@ function renderCurrent() {
   renderControls();
 }
 
+function syncSongRunState(run) {
+  if (!run || run.account_id !== state.accountId) return;
+  const progressByFile = new Map(run.songs.map((song) => [song.file_name, song]));
+  for (const song of state.songs) {
+    const progress = progressByFile.get(song.file_name);
+    if (!progress) continue;
+    for (const key of ["status", "current_step", "attempts", "error", "output_path"]) {
+      if (progress[key] !== undefined) song[key] = progress[key];
+    }
+    if (progress.song_name) song.song_name = progress.song_name;
+  }
+}
+
 function applyCurrentRun(run, { immediate = false } = {}) {
   const previousStatus = state.runStatus;
   state.current = run;
   state.runStatus = run?.status || "";
+  syncSongRunState(run);
   renderCurrent();
 
   const terminalStatuses = new Set(["completed", "failed", "stopped", "generation_limit"]);
