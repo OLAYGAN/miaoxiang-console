@@ -923,6 +923,7 @@ function accountCategoryPath(category) {
 }
 
 function updateDerivedAccountPaths() {
+  if (state.formMode !== "create") return;
   const form = elements["account-form"];
   const paths = {
     lyric: accountCategoryPath("歌词"),
