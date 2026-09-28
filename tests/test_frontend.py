@@ -120,3 +120,45 @@ async def test_partial_retry_keeps_previously_successful_song_states() -> None:
             await browser.close()
     finally:
         pass
+
+
+@pytest.mark.asyncio
+async def test_upload_table_expands_instead_of_scrolling_internally() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 600})
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#upload-table", state="attached")
+                metrics = await page.evaluate(
+                    """() => {
+                    document.body.dataset.stage = "upload";
+                    const table = document.getElementById("upload-table");
+                    table.querySelectorAll(".upload-row:not(.upload-head)").forEach((node) => node.remove());
+                    for (let index = 1; index <= 12; index += 1) {
+                        const row = document.createElement("div");
+                        row.className = "upload-row";
+                        row.append(Object.assign(document.createElement("span"), { textContent: String(index) }));
+                        row.append(Object.assign(document.createElement("span"), { textContent: `第 ${index} 首歌曲.mp3` }));
+                        row.append(Object.assign(document.createElement("span"), { textContent: "4.2 MB" }));
+                        row.append(Object.assign(document.createElement("span"), { textContent: "待发布" }));
+                        table.append(row);
+                    }
+                    const style = getComputedStyle(table);
+                    return {
+                        maxHeight: style.maxHeight,
+                        overflowY: style.overflowY,
+                        clientHeight: table.clientHeight,
+                        scrollHeight: table.scrollHeight,
+                    };
+                    }""",
+                )
+
+                assert metrics["maxHeight"] == "none"
+                assert metrics["overflowY"] == "visible"
+                assert metrics["clientHeight"] == metrics["scrollHeight"]
+
+            await browser.close()
+    finally:
+        pass

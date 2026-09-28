@@ -1040,8 +1040,6 @@ body[data-stage="pipeline"] .task-layout {
 .upload-summary label { display: grid; gap: 5px; min-width: 0; margin: 0; }
 .upload-summary input { min-height: 32px; padding: 5px 8px; }
 
-.upload-table { max-height: 330px; overflow: auto; }
-
 .upload-row {
   display: grid;
   grid-template-columns: 44px minmax(140px, 1fr) 86px 78px;
