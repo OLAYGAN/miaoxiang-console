@@ -35,6 +35,14 @@ class QueuePipelineEngine(Protocol):
         ai_created: bool = True,
         real_name: str | None = None,
         auto_replace_noncompliant: bool = False,
+        stop_after_stage: str | None = None,
+    ) -> PipelineSnapshot: ...
+
+    def start_from(
+        self,
+        snapshot: PipelineSnapshot,
+        *,
+        stop_after_stage: str | None = None,
     ) -> PipelineSnapshot: ...
 
     async def wait(self) -> PipelineSnapshot | None: ...
@@ -106,6 +114,7 @@ class PipelineQueueEngine:
             queue_id=uuid4().hex,
             day=day,
             status="running",
+            phase="lyrics",
             current_index=-1,
             pause_before_upload=pause_before_upload,
             ai_created=ai_created,
@@ -165,7 +174,11 @@ class PipelineQueueEngine:
     async def _execute(self) -> None:
         assert self.current is not None
         try:
-            for index, (account, template) in enumerate(self._entries()):
+            entries = self._entries()
+
+            self.current.phase = "lyrics"
+            self._persist()
+            for index, (account, template) in enumerate(entries):
                 if self._stop_requested:
                     break
                 self.current.current_index = index
@@ -186,44 +199,111 @@ class PipelineQueueEngine:
                 }
                 if self.current.auto_replace_noncompliant:
                     start_options["auto_replace_noncompliant"] = True
-                snapshot = self._pipeline.start(
-                    account,
-                    template,
-                    day=self.current.day,
-                    **start_options,
-                )
-                item.run_id = snapshot.run_id
-                self._update_item_from_pipeline(item, snapshot)
-                self._persist()
+                try:
+                    snapshot = self._pipeline.start(
+                        account,
+                        template,
+                        day=self.current.day,
+                        stop_after_stage="lyrics",
+                        **start_options,
+                    )
+                    snapshot = await self._wait_for_stage(item, snapshot)
+                    if snapshot.status == "stage_completed":
+                        item.status = "pending"
+                        item.stage = snapshot.stage
+                        item.error = None
+                except Exception as error:
+                    item.status = "failed"
+                    item.stage = "generation"
+                    item.error = str(error)
+                    snapshot = None
+                if self._stop_requested:
+                    break
 
-                snapshot = await self._pipeline.wait()
-                while snapshot is not None and snapshot.status == "waiting_user":
+            if not self._stop_requested:
+                self.current.phase = "generation"
+                self.current.current_index = -1
+                self._persist()
+                for index, (account, _) in enumerate(entries):
                     if self._stop_requested:
                         break
-                    item.status = "waiting_user"
-                    item.stage = snapshot.stage
+                    item = self.current.items[index]
+                    snapshot = item.pipeline_snapshot
+                    if not snapshot or snapshot.status != "stage_completed" or snapshot.stage != "generation":
+                        continue
+                    self.current.current_index = index
+                    item.status = "running"
+                    item.stage = "generation"
+                    item.error = None
+                    self._persist()
+                    try:
+                        snapshot = self._pipeline.start_from(
+                            snapshot,
+                            stop_after_stage="generation",
+                        )
+                        snapshot = await self._wait_for_stage(item, snapshot)
+                        if snapshot.status == "stage_completed":
+                            item.status = "pending"
+                            item.stage = snapshot.stage
+                            item.error = None
+                    except Exception as error:
+                        item.status = "failed"
+                        item.stage = "pre_upload"
+                        item.error = str(error)
+                    if self._stop_requested:
+                        break
+
+            if not self._stop_requested:
+                self.current.phase = "upload"
+                self.current.current_index = -1
+                self._persist()
+                if self.current.pause_before_upload:
                     self.current.status = "waiting_user"
                     self._persist()
                     await self._resume.wait()
                     self._resume.clear()
                     if self._stop_requested:
-                        break
-                    snapshot = self._pipeline.resume()
-                    snapshot = await self._pipeline.wait()
+                        self._mark_stopped()
+                        return
+                    self.current.status = "running"
+                    self._persist()
 
-                if self._stop_requested:
-                    if self._pipeline.is_waiting_user or self._pipeline.is_running:
-                        snapshot = await self._pipeline.stop()
-                    item.status = "stopped"
-                    item.stage = snapshot.stage if snapshot else "report"
+                for index, (account, _) in enumerate(entries):
+                    if self._stop_requested:
+                        break
+                    item = self.current.items[index]
+                    snapshot = item.pipeline_snapshot
+                    if (
+                        not snapshot
+                        or snapshot.status != "stage_completed"
+                        or snapshot.stage != "pre_upload"
+                    ):
+                        continue
+                    self.current.current_index = index
+                    item.status = "running"
+                    item.stage = "upload"
                     item.error = None
                     self._persist()
-                    break
+                    try:
+                        snapshot = self._pipeline.start_from(
+                            snapshot.model_copy(update={
+                                "stage": "upload",
+                                "pause_before_upload": False,
+                            })
+                        )
+                        snapshot = await self._wait_for_stage(item, snapshot)
+                    except Exception as error:
+                        item.status = "failed"
+                        item.stage = "upload"
+                        item.error = str(error)
+                    if self._stop_requested:
+                        break
 
-                assert snapshot is not None
-                self._update_item_from_pipeline(item, snapshot)
-                self._persist()
-
+            if self._stop_requested:
+                self._mark_stopped()
+                return
+            self.current.phase = "report"
+            self.current.current_index = -1
             self._finish()
         except asyncio.CancelledError:
             if self.current:
@@ -243,6 +323,20 @@ class PipelineQueueEngine:
                 f"多账号队列异常: {error}",
                 traceback.format_exc(limit=2),
             )
+
+    async def _wait_for_stage(
+        self,
+        item: PipelineQueueItem,
+        snapshot: PipelineSnapshot,
+    ) -> PipelineSnapshot:
+        item.run_id = snapshot.run_id
+        self._update_item_from_pipeline(item, snapshot)
+        self._persist()
+        snapshot = await self._pipeline.wait()
+        assert snapshot is not None
+        self._update_item_from_pipeline(item, snapshot)
+        self._persist()
+        return snapshot
 
     def _entries(self) -> list[tuple[AccountConfig, LyricTemplateConfig]]:
         return self._queue_entries

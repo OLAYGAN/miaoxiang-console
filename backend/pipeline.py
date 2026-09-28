@@ -82,6 +82,7 @@ class PipelineEngine:
         ai_created: bool = True,
         real_name: str | None = None,
         auto_replace_noncompliant: bool = False,
+        stop_after_stage: str | None = None,
     ) -> PipelineSnapshot:
         if self.is_running:
             raise ConflictError("完整流水线正在运行")
@@ -101,13 +102,33 @@ class PipelineEngine:
             ai_created=ai_created,
             real_name=real_name,
             auto_replace_noncompliant=auto_replace_noncompliant,
+            generation_max_retries=2,
             songs=[
                 PipelineSongState(song_name=None)
                 for _ in range(template.generation_count)
             ],
         )
         self._persist()
-        self._task = asyncio.create_task(self._execute())
+        self._task = asyncio.create_task(self._execute(stop_after_stage=stop_after_stage))
+        return self.current
+
+    def start_from(
+        self,
+        snapshot: PipelineSnapshot,
+        *,
+        stop_after_stage: str | None = None,
+    ) -> PipelineSnapshot:
+        if self.is_running:
+            raise ConflictError("完整流水线正在运行")
+        if self.is_waiting_user:
+            raise ConflictError("完整流水线等待确认，请先继续或停止")
+        self.current = snapshot.model_copy(deep=True)
+        self.current.status = "running"
+        self.current.error = None
+        self._persist()
+        self._task = asyncio.create_task(
+            self._execute(stop_after_stage=stop_after_stage)
+        )
         return self.current
 
     def resume(self) -> PipelineSnapshot:
@@ -216,13 +237,28 @@ class PipelineEngine:
                 pass
         return self.current or PipelineSnapshot.model_validate({})
 
-    async def _execute(self, *, resume: bool = False) -> None:
+    async def _execute(
+        self,
+        *,
+        resume: bool = False,
+        stop_after_stage: str | None = None,
+    ) -> None:
         assert self.current is not None
         try:
             if self.current.stage == "lyrics":
                 await self._execute_lyrics()
+                if stop_after_stage == "lyrics":
+                    self.current.stage = "generation"
+                    self.current.status = "stage_completed"
+                    self._persist()
+                    return
             if self.current.stage == "generation":
                 await self._execute_generation()
+                if stop_after_stage == "generation":
+                    self.current.stage = "pre_upload"
+                    self.current.status = "stage_completed"
+                    self._persist()
+                    return
             if self.current.stage == "pre_upload":
                 await self._execute_pre_upload()
             if self.current.stage == "upload":

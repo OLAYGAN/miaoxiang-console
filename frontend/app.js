@@ -79,6 +79,7 @@ for (const id of [
   "pipeline-rejected-action",
   "pipeline-pause", "pipeline-start", "pipeline-resume", "pipeline-stop", "pipeline-stage-strip",
   "pipeline-refresh", "pipeline-queue-list", "pipeline-queue-caption", "pipeline-queue-table",
+  "pipeline-phase-summary",
   "pipeline-table", "pipeline-empty",
   "log-stream", "copy-logs", "open-logs", "open-screenshots", "toast",
   "upload-caption", "upload-count", "upload-limit",
@@ -1059,8 +1060,76 @@ function selectedPipelineDetailRun() {
   return detailItem.pipeline_snapshot || null;
 }
 
+function pipelineSongs(item) {
+  return item?.pipeline_snapshot?.songs || [];
+}
+
+function pipelineAccountStageComplete(item, stage) {
+  const songs = pipelineSongs(item);
+  if (!songs.length) return false;
+  if (stage === "lyrics") {
+    return songs.every((song) => song.lyrics_status === "completed");
+  }
+  if (stage === "generation") {
+    const eligible = songs.filter((song) => song.lyrics_status === "completed");
+    return Boolean(eligible.length) && eligible.every((song) => song.generation_status === "completed");
+  }
+  const uploaded = songs.filter((song) => song.generation_status === "completed");
+  return Boolean(uploaded.length) && uploaded.every((song) =>
+    song.upload_status === "completed" || song.upload_removed
+  );
+}
+
+function pipelineStageProgress(item, stage) {
+  const songs = pipelineSongs(item);
+  if (!songs.length) return "0/0";
+  if (stage === "lyrics") {
+    const completed = songs.filter((song) => song.lyrics_status === "completed").length;
+    return `${completed}/${songs.length}`;
+  }
+  if (stage === "generation") {
+    const eligible = songs.filter((song) => song.lyrics_status === "completed");
+    const completed = eligible.filter((song) => song.generation_status === "completed").length;
+    return `${completed}/${eligible.length || songs.length}`;
+  }
+  const eligible = songs.filter((song) => song.generation_status === "completed");
+  const completed = eligible.filter((song) =>
+    song.upload_status === "completed" || song.upload_removed
+  ).length;
+  return `${completed}/${eligible.length || songs.length}`;
+}
+
+function renderPipelinePhaseSummary() {
+  const container = elements["pipeline-phase-summary"];
+  const queue = state.pipelineQueue;
+  const items = queue?.items || [];
+  const phases = [
+    { id: "lyrics", label: "AI 作词" },
+    { id: "generation", label: "生成下载" },
+    { id: "upload", label: "上传发布" },
+    { id: "report", label: "运行报告" },
+  ];
+  container.innerHTML = "";
+  for (const phase of phases) {
+    const cell = document.createElement("div");
+    cell.className = `pipeline-phase-cell${queue?.phase === phase.id ? " is-active" : ""}`;
+    const title = document.createElement("span");
+    title.textContent = phase.label;
+    const value = document.createElement("strong");
+    if (phase.id === "report") {
+      value.textContent = queue?.phase === "report" ? "生成中" : "待进入";
+    } else {
+      const completed = items.filter((item) => pipelineAccountStageComplete(item, phase.id)).length;
+      value.textContent = `账号 ${completed}/${items.length}`;
+    }
+    cell.append(title, value);
+    container.append(cell);
+  }
+}
+
 function renderPipelineQueue() {
   renderPipelineQueueBuilder();
+  renderPipelinePhaseSummary();
   const queue = state.pipelineQueue;
   const statusLabels = {
     pending: "等待中",
@@ -1083,24 +1152,25 @@ function renderPipelineQueue() {
   table.innerHTML = "";
   const head = document.createElement("div");
   head.className = "pipeline-row pipeline-head pipeline-queue-row";
-  for (const label of ["顺序", "账号", "模板", "状态", "阶段", "说明", "明细"]) {
+  for (const label of ["账号", "模板", "作词", "生成", "上传", "状态", "说明", "明细"]) {
     const span = document.createElement("span");
     span.textContent = label;
     head.append(span);
   }
   table.append(head);
 
-  for (const [index, item] of (queue?.items || []).entries()) {
+  for (const item of queue?.items || []) {
     const row = document.createElement("div");
     row.className = `pipeline-row pipeline-queue-row${
       item.account_id === state.selectedPipelineDetailAccountId ? " is-selected" : ""
     }`;
     const cells = [
-      String(index + 1),
       item.account_name,
       item.template_name,
+      pipelineStageProgress(item, "lyrics"),
+      pipelineStageProgress(item, "generation"),
+      pipelineStageProgress(item, "upload"),
       statusLabels[item.status] || item.status,
-      stageLabels[item.stage] || item.stage,
       item.error || "-",
     ];
     for (const cell of cells) {

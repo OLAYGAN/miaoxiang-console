@@ -243,6 +243,7 @@ class PipelineSnapshot(BaseModel):
     ai_created: bool = True
     real_name: str | None = None
     auto_replace_noncompliant: bool = False
+    generation_max_retries: int = Field(default=2, ge=1, le=10)
     songs: list[PipelineSongState] = Field(default_factory=list)
     error: str | None = None
     created_at: datetime = Field(default_factory=datetime.now)
@@ -266,6 +267,7 @@ class PipelineQueueSnapshot(BaseModel):
     queue_id: str = Field(default_factory=lambda: uuid4().hex)
     day: str
     status: str = "running"
+    phase: str = "lyrics"
     current_index: int = -1
     pause_before_upload: bool = False
     ai_created: bool = True

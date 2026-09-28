@@ -4,8 +4,10 @@ import asyncio
 import pytest
 
 from backend.events import EventBus
-from backend.models import AccountConfig, LyricTemplateConfig, PipelineSnapshot
+from backend.models import AccountConfig, LyricData, LyricTemplateConfig, PipelineSnapshot
 from backend.pipeline_queue import PipelineQueueEngine
+from backend.pipeline import PipelineEngine
+from backend.storage import PipelineStateRepository
 from backend.storage import PipelineQueueStateRepository
 
 
@@ -61,11 +63,20 @@ class FakePipelineEngine:
         ai_created: bool,
         real_name: str | None,
         auto_replace_noncompliant: bool = False,
+        stop_after_stage: str | None = None,
     ) -> PipelineSnapshot:
         self.started.append((account, template))
         self.real_names.append(real_name)
         self.auto_replace_options.append(auto_replace_noncompliant)
         self._sequence += 1
+        stage = "report"
+        status = "completed"
+        if stop_after_stage == "lyrics":
+            stage = "generation"
+            status = "stage_completed"
+        elif stop_after_stage == "generation":
+            stage = "pre_upload"
+            status = "stage_completed"
         self.current = PipelineSnapshot(
             run_id=f"run-{self._sequence}",
             account_id=account.id,
@@ -73,13 +84,24 @@ class FakePipelineEngine:
             template_id=template.id,
             template_name=template.name,
             day=day,
-            status="waiting_user" if pause_before_upload and self.pause_before_upload else "completed",
-            stage="pre_upload" if pause_before_upload and self.pause_before_upload else "report",
+            status=status,
+            stage=stage,
             pause_before_upload=pause_before_upload,
             ai_created=ai_created,
             real_name=real_name,
             auto_replace_noncompliant=auto_replace_noncompliant,
         )
+        return self.current
+
+    def start_from(
+        self,
+        snapshot: PipelineSnapshot,
+        *,
+        stop_after_stage: str | None = None,
+    ) -> PipelineSnapshot:
+        self.current = snapshot.model_copy(deep=True)
+        self.current.status = "stage_completed" if stop_after_stage == "generation" else "completed"
+        self.current.stage = "pre_upload" if stop_after_stage == "generation" else "report"
         return self.current
 
     async def wait(self) -> PipelineSnapshot | None:
@@ -211,7 +233,142 @@ async def test_pipeline_queue_runs_accounts_sequentially(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_pipeline_queue_waits_for_user_resume_between_accounts(tmp_path: Path) -> None:
+async def test_pipeline_queue_runs_each_stage_across_all_accounts(tmp_path: Path) -> None:
+    first = make_account(tmp_path, "first")
+    second = make_account(tmp_path, "second")
+    calls: list[tuple[str, str]] = []
+    pipeline: PipelineEngine | None = None
+
+    async def generate_lyrics(template: LyricTemplateConfig, count: int) -> list[LyricData]:
+        assert pipeline is not None and pipeline.current is not None
+        calls.append((pipeline.current.account_name, "lyrics"))
+        return [
+            LyricData(song_name=f"第{index}首", lyrics="风 把 灯光 吹成 街", style="s" * 60)
+            for index in range(count)
+        ]
+
+    async def save_lyrics(account: AccountConfig, day: str, songs: list[LyricData]):
+        return [
+            {
+                "song_name": song.song_name,
+                "file_name": f"{index + 1:02d}_{song.song_name}.md",
+                "path": str(tmp_path / account.account_name / f"{index + 1:02d}_{song.song_name}.md"),
+            }
+            for index, song in enumerate(songs)
+        ]
+
+    async def run_generation(account: AccountConfig, day: str, files: list[Path]):
+        assert pipeline is not None and pipeline.current is not None
+        calls.append((pipeline.current.account_name, "generation"))
+        return {
+            path.name: {
+                "status": "成功",
+                "output_path": str(tmp_path / pipeline.current.account_name / f"{path.stem}.mp3"),
+            }
+            for path in files
+        }
+
+    async def run_upload(account: AccountConfig, day: str, files: list[str], *args):
+        assert pipeline is not None and pipeline.current is not None
+        calls.append((pipeline.current.account_name, "upload"))
+        return {"status": "completed"}
+
+    pipeline = PipelineEngine(
+        state_repository=PipelineStateRepository(tmp_path / "pipeline.json"),
+        event_bus=EventBus(),
+        lyric_generator=generate_lyrics,
+        lyric_saver=save_lyrics,
+        generation_runner=run_generation,
+        upload_runner=run_upload,
+    )
+    engine = PipelineQueueEngine(
+        state_repository=PipelineQueueStateRepository(tmp_path / "queue.json"),
+        event_bus=EventBus(),
+        pipeline_engine=pipeline,
+    )
+
+    queue = engine.start(
+        [(first, make_template(first)), (second, make_template(second))],
+        day="2026-09-29",
+    )
+    await engine.wait()
+
+    assert calls == [
+        ("first", "lyrics"),
+        ("second", "lyrics"),
+        ("first", "generation"),
+        ("second", "generation"),
+        ("first", "upload"),
+        ("second", "upload"),
+    ]
+    assert queue.phase == "report"
+    assert queue.status == "completed"
+    assert [item.status for item in queue.items] == ["completed", "completed"]
+    assert [item.stage for item in queue.items] == ["report", "report"]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_queue_pauses_once_after_all_generation(tmp_path: Path) -> None:
+    first = make_account(tmp_path, "first")
+    second = make_account(tmp_path, "second")
+    calls: list[tuple[str, str]] = []
+    pipeline: PipelineEngine | None = None
+
+    async def generate_lyrics(template: LyricTemplateConfig, count: int) -> list[LyricData]:
+        assert pipeline is not None and pipeline.current is not None
+        calls.append((pipeline.current.account_name, "lyrics"))
+        return [LyricData(song_name="第一首", lyrics="风 把 灯光 吹成 街", style="s" * 60)]
+
+    async def save_lyrics(account: AccountConfig, day: str, songs: list[LyricData]):
+        return [{"song_name": "第一首", "file_name": "01_第一首.md", "path": str(tmp_path / "01.md")}]
+
+    async def run_generation(account: AccountConfig, day: str, files: list[Path]):
+        assert pipeline is not None and pipeline.current is not None
+        calls.append((pipeline.current.account_name, "generation"))
+        return {files[0].name: {"status": "成功", "output_path": str(tmp_path / "out.mp3")}}
+
+    async def run_upload(account: AccountConfig, day: str, files: list[str], *args):
+        assert pipeline is not None and pipeline.current is not None
+        calls.append((pipeline.current.account_name, "upload"))
+        return {"status": "completed"}
+
+    pipeline = PipelineEngine(
+        state_repository=PipelineStateRepository(tmp_path / "pipeline.json"),
+        event_bus=EventBus(),
+        lyric_generator=generate_lyrics,
+        lyric_saver=save_lyrics,
+        generation_runner=run_generation,
+        upload_runner=run_upload,
+    )
+    engine = PipelineQueueEngine(
+        state_repository=PipelineQueueStateRepository(tmp_path / "queue.json"),
+        event_bus=EventBus(),
+        pipeline_engine=pipeline,
+    )
+    queue = engine.start(
+        [(first, make_template(first)), (second, make_template(second))],
+        day="2026-09-29",
+        pause_before_upload=True,
+    )
+    for _ in range(100):
+        if queue.status == "waiting_user":
+            break
+        await asyncio.sleep(0.01)
+
+    assert queue.phase == "upload"
+    assert queue.status == "waiting_user"
+    assert ("first", "upload") not in calls
+    assert ("second", "upload") not in calls
+
+    engine.resume()
+    await engine.wait()
+
+    assert calls[-2:] == [("first", "upload"), ("second", "upload")]
+    assert queue.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_queue_waits_for_user_resume_before_upload_phase(tmp_path: Path) -> None:
     first = make_account(tmp_path, "first")
     second = make_account(tmp_path, "second")
     first_template = make_template(first)
@@ -228,18 +385,15 @@ async def test_pipeline_queue_waits_for_user_resume_between_accounts(tmp_path: P
     )
     await asyncio.sleep(0)
     assert queue.status == "waiting_user"
-    assert queue.items[0].status == "waiting_user"
-    assert [account.account_name for account, _ in pipeline.started] == ["first"]
-
-    engine.resume()
-    await asyncio.sleep(0)
-    assert queue.items[1].status == "waiting_user"
+    assert queue.phase == "upload"
+    assert [item.status for item in queue.items] == ["pending", "pending"]
     assert [account.account_name for account, _ in pipeline.started] == ["first", "second"]
 
     engine.resume()
+    await asyncio.sleep(0)
     await engine.wait()
 
-    assert pipeline.resume_count == 2
+    assert pipeline.resume_count == 0
     assert queue.status == "completed"
     assert [item.status for item in queue.items] == ["completed", "completed"]
     assert [account.account_name for account, _ in pipeline.started] == ["first", "second"]
@@ -312,4 +466,4 @@ async def test_pipeline_queue_stop_marks_remaining_accounts_stopped(tmp_path: Pa
 
     assert queue.status == "stopped"
     assert [item.status for item in queue.items] == ["stopped", "stopped"]
-    assert pipeline.stop_count >= 1
+    assert queue.phase == "upload"

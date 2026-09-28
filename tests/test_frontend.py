@@ -162,3 +162,69 @@ async def test_upload_table_expands_instead_of_scrolling_internally() -> None:
             await browser.close()
     finally:
         pass
+
+
+@pytest.mark.asyncio
+async def test_pipeline_queue_shows_global_phase_and_account_stage_counts() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#pipeline-phase-summary", state="attached")
+                rendered = await page.evaluate(
+                    """() => {
+                    state.pipelineQueue = {
+                        queue_id: "queue",
+                        day: "2026-09-29",
+                        status: "running",
+                        phase: "generation",
+                        current_index: 0,
+                        items: [
+                            {
+                                account_name: "first",
+                                template_name: "模板一",
+                                status: "running",
+                                stage: "generation",
+                                pipeline_snapshot: {
+                                    songs: [
+                                        { lyrics_status: "completed", generation_status: "completed", upload_status: "pending" },
+                                        { lyrics_status: "completed", generation_status: "running", upload_status: "pending" },
+                                    ],
+                                },
+                            },
+                            {
+                                account_name: "second",
+                                template_name: "模板二",
+                                status: "pending",
+                                stage: "generation",
+                                pipeline_snapshot: {
+                                    songs: [
+                                        { lyrics_status: "completed", generation_status: "pending", upload_status: "pending" },
+                                    ],
+                                },
+                            },
+                        ],
+                    };
+                    renderPipelinePanel();
+                    return {
+                        summary: document.getElementById("pipeline-phase-summary").innerText,
+                        table: document.getElementById("pipeline-queue-table").innerText,
+                    };
+                    }""",
+                )
+
+                assert "AI 作词" in rendered["summary"]
+                assert "账号 2/2" in rendered["summary"]
+                assert "生成下载" in rendered["summary"]
+                assert "账号 0/2" in rendered["summary"]
+                assert "作词" in rendered["table"]
+                assert "生成" in rendered["table"]
+                assert "上传" in rendered["table"]
+                assert "2/2" in rendered["table"]
+                assert "1/2" in rendered["table"]
+
+            await browser.close()
+    finally:
+        pass

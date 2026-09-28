@@ -602,14 +602,14 @@ def test_pipeline_endpoints_use_existing_account_and_template(tmp_path: Path, mo
     app, _ = make_client(tmp_path)
     captured: dict = {}
 
-    def fake_start(account, template, *, day, pause_before_upload, ai_created, real_name):
+    def fake_start(account, template, *, day, **kwargs):
         captured.update({
             "account": account,
             "template": template,
             "day": day,
-            "pause": pause_before_upload,
-            "ai_created": ai_created,
-            "real_name": real_name,
+            "pause": kwargs["pause_before_upload"],
+            "ai_created": kwargs["ai_created"],
+            "real_name": kwargs["real_name"],
         })
         snapshot = PipelineSnapshot(
             account_id=account.id,
@@ -684,7 +684,7 @@ def test_pipeline_queue_endpoint_runs_selected_accounts_in_order(tmp_path: Path,
     app, _ = make_client(tmp_path)
     started: list[str] = []
 
-    def fake_start(account, template, *, day, pause_before_upload, ai_created, real_name):
+    def fake_start(account, template, *, day, **kwargs):
         started.append(account.account_name)
         snapshot = PipelineSnapshot(
             account_id=account.id,
@@ -830,6 +830,76 @@ def test_pipeline_endpoint_runs_orchestrated_stages(tmp_path: Path, monkeypatch)
         assert current["auto_replace_noncompliant"] is True
         assert current["stage"] == "report"
         assert [song["upload_status"] for song in current["songs"]] == ["completed", "completed"]
+
+
+def test_pipeline_generation_uses_two_retries_even_if_account_allows_more(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from backend.models import LyricData, TaskSnapshot
+
+    app, _ = make_client(tmp_path)
+    captured: list[int] = []
+
+    async def generate_lyrics(template, count):
+        return [
+            LyricData(song_name=f"第{index}首", lyrics="风 把 灯光 吹成 街", style="s" * 60)
+            for index in range(count)
+        ]
+
+    async def save_lyrics(account, day, songs):
+        return [
+            {"song_name": song.song_name, "file_name": f"{index + 1:02d}_{song.song_name}.md"}
+            for index, song in enumerate(songs)
+        ]
+
+    def capture_generation_start(account, files, **kwargs):
+        captured.append(account.max_retries)
+        app.state.engine.current = TaskSnapshot(
+            run_id="generation-run",
+            account_id=account.id,
+            account_name=account.account_name,
+            status="completed",
+            current_step="done",
+        )
+        return app.state.engine.current
+
+    async def run_upload(account, day, files, ai_created, real_name, auto_replace_noncompliant):
+        return {"status": "completed"}
+
+    monkeypatch.setattr(app.state.pipeline_engine, "_generate_lyrics", generate_lyrics)
+    monkeypatch.setattr(app.state.pipeline_engine, "_save_lyrics", save_lyrics)
+    monkeypatch.setattr(app.state.pipeline_engine, "_run_upload", run_upload)
+    monkeypatch.setattr(app.state.engine, "start", capture_generation_start)
+
+    with TestClient(app) as client:
+        payload = account_payload(tmp_path)
+        payload["max_retries"] = 5
+        account = client.post("/api/accounts", json=payload).json()
+        template = client.post(
+            f"/api/accounts/{account['id']}/lyric/templates",
+            json={
+                "name": "重试模板",
+                "lyric_tone": "温暖叙事",
+                "song_style": "pop",
+                "themes": ["成长"],
+                "generation_count": 1,
+            },
+        ).json()
+        response = client.post(
+            "/api/pipeline/runs",
+            json={"account_id": account["id"], "template_id": template["id"], "day": "2026-09-29"},
+        )
+        assert response.status_code == 202
+
+        for _ in range(30):
+            current = client.get("/api/pipeline/runs/current").json()
+            if current["status"] in {"completed", "failed", "stopped"}:
+                break
+            time.sleep(0.02)
+
+        assert captured == [2]
+        assert current["generation_max_retries"] == 2
 
 
 def test_pipeline_reuses_existing_lyrics_when_day_already_has_enough(
