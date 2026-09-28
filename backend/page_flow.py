@@ -330,6 +330,9 @@ async def select_model(page: Any, model_name: str) -> None:
 
 
 async def select_singer(page: Any, singer_name: str) -> None:
+    if not singer_name.strip():
+        return
+
     switch = page.locator('[class*="vocalTimbreWrapper"] .semi-switch').first
     switch_class = await switch.get_attribute("class") or ""
     if "semi-switch-checked" not in switch_class:

@@ -29,7 +29,7 @@ const state = {
   view: "task",
   stage: "generation",
   generationModel: "自动",
-  generationSinger: "老岩",
+  generationSinger: "",
   settingsTab: "runtime",
   accountMenuOpen: false,
   accountReloadId: 0,
@@ -320,14 +320,14 @@ function saveGenerationModel(value) {
 }
 
 function restoreGenerationSinger() {
-  let value = "老岩";
+  let value = "";
   try {
-    value = localStorage.getItem(GENERATION_SINGER_STORAGE_KEY) || "老岩";
+    value = localStorage.getItem(GENERATION_SINGER_STORAGE_KEY) ?? "";
   } catch {
-    value = "老岩";
+    value = "";
   }
   const select = elements["generation-singer"];
-  if (![...select.options].some((option) => option.value === value)) value = "老岩";
+  if (![...select.options].some((option) => option.value === value)) value = "";
   select.value = value;
   state.generationSinger = value;
 }
@@ -2267,7 +2267,7 @@ function bindEvents() {
           body: JSON.stringify({
             ai_created: state.uploadAiCreated,
             model_name: state.generationModel || "自动",
-            singer_name: elements["generation-singer"].value || "老岩",
+            singer_name: elements["generation-singer"].value,
           }),
         },
       );
@@ -2703,7 +2703,7 @@ function fillLyricTemplateForm(template = null) {
           day: todayValue(),
           fresh_run: elements["fresh-run"].checked,
           model_name: state.generationModel || elements["generation-model"].value,
-          singer_name: elements["generation-singer"].value || "老岩",
+          singer_name: elements["generation-singer"].value,
         }),
       });
       applyCurrentRun(state.current, { immediate: true });

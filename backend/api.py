@@ -70,7 +70,7 @@ class RunRequest(BaseModel):
     day: str | None = None
     fresh_run: bool = False
     model_name: MusicModelName = Field(default="自动")
-    singer_name: str = Field(default="老岩", min_length=1, max_length=64)
+    singer_name: str = Field(default="老岩", max_length=64)
 
 
 class RunControlRequest(BaseModel):
@@ -91,7 +91,7 @@ class UploadRetryRejectedRequest(BaseModel):
     ai_created: bool = True
     real_name: str | None = Field(default=None, max_length=64)
     model_name: MusicModelName = Field(default="自动")
-    singer_name: str = Field(default="老岩", min_length=1, max_length=64)
+    singer_name: str = Field(default="老岩", max_length=64)
 
 
 class UploadResetRequest(BaseModel):

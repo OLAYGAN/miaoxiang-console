@@ -1013,6 +1013,35 @@ def test_run_stop_releases_browser_and_reports_state(tmp_path: Path) -> None:
         assert holder["singers"] == ["小岩"]
 
 
+def test_run_allows_blank_sway_singer_choice(tmp_path: Path) -> None:
+    app, holder = make_client(tmp_path, stop_after=1)
+    write_song(tmp_path, "01_first")
+    with TestClient(app) as client:
+        account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
+        started = client.post(
+            "/api/runs",
+            json={
+                "account_id": account["id"],
+                "song_files": ["01_first.md"],
+                "day": "2026-09-17",
+                "fresh_run": True,
+                "model_name": "Sway v5.5",
+                "singer_name": "",
+            },
+        )
+
+        assert started.status_code == 202
+        for _ in range(100):
+            current = client.get("/api/runs/current").json()
+            if current["status"] == "stopped":
+                break
+            client.post("/api/runs/control", json={"action": "stop"})
+
+        assert current["status"] == "stopped"
+        assert holder["models"] == ["Sway v5.5"]
+        assert holder["singers"] == [""]
+
+
 def test_pause_resume_and_conflict(tmp_path: Path) -> None:
     app, _ = make_client(tmp_path)
     write_song(tmp_path, "01_first")

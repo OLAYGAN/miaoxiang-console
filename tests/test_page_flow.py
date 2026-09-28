@@ -1097,6 +1097,15 @@ async def test_select_singer_keeps_existing_choice() -> None:
 
 
 @pytest.mark.asyncio
+async def test_select_singer_blank_skips_platform_singer_control() -> None:
+    page = FakeSingerPage()
+
+    await select_singer(page, "")
+
+    assert page.calls == []
+
+
+@pytest.mark.asyncio
 async def test_create_page_ready_auto_model_skips_model_selection(
     tmp_path: Path,
     monkeypatch,

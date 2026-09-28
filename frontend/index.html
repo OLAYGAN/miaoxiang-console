@@ -174,10 +174,11 @@
                 <option value="Sway v5.5">Sway v5.5</option>
               </select>
             </label>
-            <label class="field singer-field" data-tip="仅 Sway v5.5 显示；用于虚拟歌手音色。">
+            <label class="field singer-field" data-tip="仅 Sway v5.5 显示；选择“不选择”时脚本不会操作虚拟歌手音色。">
               <span>人声选择</span>
-              <select id="generation-singer" required>
-                <option value="老岩" selected>老岩</option>
+              <select id="generation-singer">
+                <option value="" selected>不选择（平台默认）</option>
+                <option value="老岩">老岩</option>
               </select>
             </label>
             <button type="button" id="start-run" class="button primary run-button" data-tip="按勾选顺序批量生成，并逐首导出下载。">开始生成</button>
@@ -537,6 +538,6 @@
 
 <div id="toast" class="toast" role="status"></div>
 <div id="floating-tooltip" class="floating-tooltip" role="tooltip" aria-hidden="true"></div>
-<script src="/assets/app.js?v=59"></script>
+<script src="/assets/app.js?v=60"></script>
 </body>
 </html>
