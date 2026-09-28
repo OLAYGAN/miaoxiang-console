@@ -675,15 +675,6 @@ class TaskEngine:
                         current_step="generation_rejected",
                         error=result.error or "无法根据描述生成，请修改",
                     )
-                elif result.status == "title_unmatched":
-                    self._finish_song(
-                        day,
-                        account,
-                        progress,
-                        status="详情歌名不匹配",
-                        current_step="match_titles",
-                        error=result.error or "歌曲详情歌名与歌词歌名不匹配，已跳过",
-                    )
                 elif result.status == "export_failed":
                     self._finish_song(
                         day,

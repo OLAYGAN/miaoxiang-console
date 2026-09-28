@@ -516,7 +516,7 @@ def create_app(
         assert pipeline_engine.current is not None
         actual_account = account_repository.get(pipeline_engine.current.account_id)
         actual_account = actual_account.model_copy(update={
-            "max_retries": pipeline_engine.current.generation_max_retries,
+            "max_retries": pipeline_engine.current.generation_max_retries + 1,
         })
         root = Path(actual_account.lyric_dir) / day
         paths = [(root / path.name).resolve() for path in lyric_files]

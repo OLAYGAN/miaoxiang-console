@@ -898,7 +898,7 @@ def test_pipeline_generation_uses_two_retries_even_if_account_allows_more(
                 break
             time.sleep(0.02)
 
-        assert captured == [2]
+        assert captured == [3]
         assert current["generation_max_retries"] == 2
 
 

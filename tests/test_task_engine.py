@@ -202,7 +202,7 @@ async def test_batch_description_rejection_is_not_retried(tmp_path: Path) -> Non
     assert "无法根据描述生成" in record.error
 
 
-async def test_batch_title_mismatch_is_not_retried(tmp_path: Path) -> None:
+async def test_batch_title_mismatch_is_retried(tmp_path: Path) -> None:
     account = make_account(tmp_path)
     song = make_song(account.lyric_dir, "01_first")
     flow = FakeBatchFlow()
@@ -213,17 +213,24 @@ async def test_batch_title_mismatch_is_not_retried(tmp_path: Path) -> None:
                 status="title_unmatched",
                 error="生成结果标题与歌名不匹配，已跳过",
             ),
-        ]
+        ],
+        [
+            BatchSongResult(
+                song_name="01_first",
+                status="success",
+                output_path="output/01_first.mp3",
+            ),
+        ],
     ]
     engine, state, _ = make_engine(tmp_path, flow)
 
     engine.start(account, [song], day="2026-09-17")
     await engine.wait()
 
-    assert flow.batches == [["01_first"]]
+    assert flow.batches == [["01_first"], ["01_first"]]
     record = state.get("2026-09-17", "账号01", "01_first.md")
-    assert record.status == "详情歌名不匹配"
-    assert record.attempts == 1
+    assert record.status == "成功"
+    assert record.attempts == 2
 
 
 async def test_batch_export_failure_does_not_regenerate(tmp_path: Path) -> None:
@@ -500,9 +507,21 @@ async def test_regeneration_upload_uploads_successful_songs_when_one_fails(
     tmp_path: Path,
 ) -> None:
     class GenerationFlow:
+        def __init__(self):
+            self.calls = 0
+
         async def process_batch(self, lyric_data_list, on_step):
+            self.calls += 1
             first = lyric_data_list[0]
             output = tmp_path / "output" / "2026-09-17" / f"{first.song_name}.mp3"
+            if self.calls > 1:
+                return [
+                    BatchSongResult(
+                        song_name=lyric_data_list[0].song_name,
+                        status="title_unmatched",
+                        error="生成失败",
+                    ),
+                ]
             output.write_bytes(b"regenerated-first")
             return [
                 BatchSongResult(
