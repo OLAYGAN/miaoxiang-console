@@ -29,7 +29,7 @@ from backend.ai_lyrics import (
     stream_generate_lyrics as stream_lyrics_with_ai,
 )
 from backend.config import RuntimePaths, build_runtime_paths, ensure_runtime_directories, get_runtime_paths
-from backend.errors import AppError, ConflictError, NotFoundError, ValidationFailed
+from backend.errors import AppError, BrowserFlowError, ConflictError, NotFoundError, ValidationFailed
 from backend.events import EventBus
 from backend.lyrics import list_lyric_files, parse_lyrics
 from backend.models import (
@@ -41,7 +41,11 @@ from backend.models import (
     LyricTemplateConfig,
     MusicModelName,
 )
-from backend.page_flow import PageFlow
+from backend.page_flow import (
+    MIN_DOWNLOAD_DURATION_SECONDS,
+    PageFlow,
+    read_mp3_duration_seconds,
+)
 from backend.pipeline import PipelineEngine
 from backend.pipeline_queue import PipelineQueueEngine
 from backend.storage import (
@@ -298,7 +302,7 @@ def build_upload_items(
     output_files = {
         path.stem: path
         for path in sorted(directory.glob("*.mp3"))
-        if path.is_file() and path.stat().st_size > 0
+        if is_uploadable_audio(path)
     }
     selected_files = {
         path.name for path in output_files.values()
@@ -323,6 +327,15 @@ def build_upload_items(
         if len(items) >= account.upload_batch_size:
             break
     return items
+
+
+def is_uploadable_audio(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    try:
+        return read_mp3_duration_seconds(path) > MIN_DOWNLOAD_DURATION_SECONDS
+    except BrowserFlowError:
+        return False
 
 
 def ensure_workflow_directories(account: AccountConfig, day: str | None = None) -> None:
@@ -920,7 +933,7 @@ def create_app(
         rejected_files = read_rejected(account, day_value)
         if directory.is_dir():
             for path in sorted(directory.glob("*.mp3")):
-                if not path.is_file() or path.stat().st_size == 0:
+                if not is_uploadable_audio(path):
                     continue
                 item = {
                     "file_name": path.name,

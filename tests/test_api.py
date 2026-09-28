@@ -9,9 +9,10 @@ from fastapi.testclient import TestClient
 
 from backend.api import create_app
 from backend.api import build_upload_lyrics
+from backend.api import build_upload_items
 from backend.config import RuntimePaths
 from backend.lyrics import parse_lyrics
-from backend.models import ConsoleSettings, SongRecord
+from backend.models import AccountConfig, ConsoleSettings, SongRecord
 from tests.test_ai_lyrics import make_song
 
 
@@ -67,6 +68,12 @@ def write_song(tmp_path: Path, name: str = "01_song") -> Path:
         f"# 歌名：《{name}》\n\n## 歌词\n《{name}》\n{lyrics}\n[End]\n\n## 歌曲风格\n{style}\n",
         encoding="utf-8",
     )
+    return path
+
+
+def write_duration_mp3(path: Path, seconds: float) -> Path:
+    frame = bytes([0xFF, 0xE3, 0x18, 0x00]) + b"\x00" * 68
+    path.write_bytes(frame * round(seconds / 0.072))
     return path
 
 
@@ -244,7 +251,7 @@ def test_upload_batch_listing_reads_output_directory(tmp_path: Path) -> None:
         output = tmp_path / "output" / "2026-09-18"
         output.mkdir(parents=True, exist_ok=True)
         for name in ("第一首.mp3", "第二首.mp3"):
-            (output / name).write_bytes(b"audio")
+            write_duration_mp3(output / name, 61.0)
         (output / "invalid.txt").write_text("not audio", encoding="utf-8")
         (output / ".uploaded.json").write_text(
             json.dumps([str((output / "第一首.mp3").resolve())]),
@@ -259,7 +266,33 @@ def test_upload_batch_listing_reads_output_directory(tmp_path: Path) -> None:
         assert body["batch_size"] == 10
         assert [item["file_name"] for item in body["files"]] == ["第二首.mp3"]
         assert [item["file_name"] for item in body["uploaded_files"]] == ["第一首.mp3"]
-        assert all(item["size"] == 5 for item in body["files"])
+        assert all(item["size"] > 0 for item in body["files"])
+
+
+def test_upload_listing_and_items_skip_music_shorter_than_sixty_seconds(
+    tmp_path: Path,
+) -> None:
+    app, _ = make_client(tmp_path)
+    with TestClient(app) as client:
+        account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
+        output = Path(account["output_dir"]) / "2026-09-18"
+        output.mkdir(parents=True, exist_ok=True)
+        write_duration_mp3(output / "短歌.mp3", 59.0)
+        write_duration_mp3(output / "长歌.mp3", 61.0)
+
+        listing = client.get(f"/api/accounts/{account['id']}/uploads?day=2026-09-18")
+
+        assert listing.status_code == 200
+        assert [item["file_name"] for item in listing.json()["files"]] == ["长歌.mp3"]
+
+        lyric_day = Path(account["lyric_dir"]) / "2026-09-18"
+        lyric_day.mkdir(parents=True, exist_ok=True)
+        for title in ("短歌", "长歌"):
+            lyric_file = write_song(tmp_path, title)
+            lyric_file.replace(lyric_day / lyric_file.name)
+        items = build_upload_items(AccountConfig.model_validate(account), "2026-09-18")
+
+        assert [item["title"] for item in items] == ["长歌"]
 
 
 def test_upload_reset_removes_only_selected_manifest_entries(tmp_path: Path) -> None:
@@ -336,7 +369,7 @@ def test_start_upload_filters_selected_tracks(tmp_path: Path, monkeypatch) -> No
         output.mkdir(parents=True, exist_ok=True)
         for lyric_path in (selected_song, other_song):
             parsed = parse_lyrics(lyric_path.read_text(encoding="utf-8"))
-            (output / f"{parsed.song_name}.mp3").write_bytes(b"audio")
+            write_duration_mp3(output / f"{parsed.song_name}.mp3", 61.0)
 
         response = client.post(
             f"/api/uploads/runs?account_id={account['id']}&day=2026-09-17",
@@ -369,7 +402,7 @@ def test_start_upload_can_disable_ai_creation(tmp_path: Path, monkeypatch) -> No
         output = tmp_path / "output" / "2026-09-17"
         output.mkdir(parents=True)
         parsed = parse_lyrics(song.read_text(encoding="utf-8"))
-        (output / f"{parsed.song_name}.mp3").write_bytes(b"audio")
+        write_duration_mp3(output / f"{parsed.song_name}.mp3", 61.0)
 
         response = client.post(
             f"/api/uploads/runs?account_id={account['id']}&day=2026-09-17",
@@ -405,7 +438,7 @@ def test_start_upload_uses_account_real_name_when_request_omits_it(
         output = tmp_path / "output" / "2026-09-17"
         output.mkdir(parents=True)
         parsed = parse_lyrics(song.read_text(encoding="utf-8"))
-        (output / f"{parsed.song_name}.mp3").write_bytes(b"audio")
+        write_duration_mp3(output / f"{parsed.song_name}.mp3", 61.0)
 
         response = client.post(
             f"/api/uploads/runs?account_id={account['id']}&day=2026-09-17",
@@ -438,7 +471,7 @@ def test_start_upload_allows_blank_real_name(tmp_path: Path, monkeypatch) -> Non
         output = tmp_path / "output" / "2026-09-17"
         output.mkdir(parents=True)
         parsed = parse_lyrics(song.read_text(encoding="utf-8"))
-        (output / f"{parsed.song_name}.mp3").write_bytes(b"audio")
+        write_duration_mp3(output / f"{parsed.song_name}.mp3", 61.0)
 
         response = client.post(
             f"/api/uploads/runs?account_id={account['id']}&day=2026-09-17",
@@ -469,7 +502,7 @@ def test_start_upload_can_enable_noncompliant_replacement(tmp_path: Path, monkey
         output = tmp_path / "output" / "2026-09-17"
         output.mkdir(parents=True)
         parsed = parse_lyrics(song.read_text(encoding="utf-8"))
-        (output / f"{parsed.song_name}.mp3").write_bytes(b"audio")
+        write_duration_mp3(output / f"{parsed.song_name}.mp3", 61.0)
 
         response = client.post(
             f"/api/uploads/runs?account_id={account['id']}&day=2026-09-17",
@@ -509,7 +542,7 @@ def test_retry_rejected_upload_regenerates_pending_songs(tmp_path: Path, monkeyp
         output = tmp_path / "output" / "2026-09-17"
         output.mkdir(parents=True)
         output_path = output / f"{parsed.song_name}.mp3"
-        output_path.write_bytes(b"audio")
+        write_duration_mp3(output_path, 61.0)
         listing = client.get(
             f"/api/accounts/{account['id']}/uploads?day=2026-09-17"
         ).json()
