@@ -16,6 +16,7 @@ from backend.models import (
     AccountConfig,
     LyricData,
     LyricTemplateConfig,
+    MusicModelName,
     PipelineSnapshot,
     PipelineSongState,
 )
@@ -82,6 +83,8 @@ class PipelineEngine:
         ai_created: bool = True,
         real_name: str | None = None,
         auto_replace_noncompliant: bool = False,
+        model_name: MusicModelName = "自动",
+        singer_name: str = "老岩",
         stop_after_stage: str | None = None,
     ) -> PipelineSnapshot:
         if self.is_running:
@@ -102,6 +105,8 @@ class PipelineEngine:
             ai_created=ai_created,
             real_name=real_name,
             auto_replace_noncompliant=auto_replace_noncompliant,
+            model_name=model_name,
+            singer_name=singer_name,
             generation_max_retries=2,
             songs=[
                 PipelineSongState(song_name=None)

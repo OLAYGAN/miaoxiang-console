@@ -94,6 +94,26 @@
                 <option value="no">否</option>
               </select>
             </label>
+            <label class="field model-field" data-tip="流水线生成阶段使用的妙响模型；与“生成”页共用同一个选择，“自动”表示不操作平台下拉。">
+              <span>模型</span>
+              <select id="pipeline-model">
+                <option value="自动" selected>自动（平台默认）</option>
+                <option value="Sodance v2.0">Sodance v2.0 · 限时畅用</option>
+                <option value="MiniMax v2.6">MiniMax v2.6</option>
+                <option value="TemPolor v4.1a">TemPolor v4.1a</option>
+                <option value="音潮 v3.0">音潮 v3.0</option>
+                <option value="SeedMusic v1.0 preview">SeedMusic v1.0 preview</option>
+                <option value="TemPolor v4.0">TemPolor v4.0</option>
+                <option value="Sway v5.5">Sway v5.5</option>
+              </select>
+            </label>
+            <label class="field singer-field" data-tip="仅 Sway v5.5 显示；选择“不选择”时脚本不会操作虚拟歌手音色。">
+              <span>人声选择</span>
+              <select id="pipeline-singer">
+                <option value="" selected>不选择（平台默认）</option>
+                <option value="老岩">老岩</option>
+              </select>
+            </label>
             <label class="field" data-tip="平台判定不及格时，自动寻找同歌名的未导出第二版本，导出后重新上传。">
               <span>不及格歌曲处理</span>
               <select id="pipeline-rejected-action">

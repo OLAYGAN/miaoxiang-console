@@ -77,6 +77,7 @@ for (const id of [
   "lyric-dir-input", "current-lyric-folder", "apply-lyric-dir",
   "pipeline-caption", "pipeline-ai-created",
   "pipeline-rejected-action",
+  "pipeline-model", "pipeline-singer",
   "pipeline-pause", "pipeline-start", "pipeline-resume", "pipeline-stop", "pipeline-stage-strip",
   "pipeline-refresh", "pipeline-queue-list", "pipeline-queue-caption", "pipeline-queue-table",
   "pipeline-phase-summary",
@@ -298,6 +299,30 @@ function todayValue() {
   return `${now.getFullYear()}-${month}-${day}`;
 }
 
+// The generation stage and the full pipeline share one remembered choice so a
+// model picked in either place is used everywhere on this machine.
+function generationModelSelects() {
+  return [elements["generation-model"], elements["pipeline-model"]].filter(Boolean);
+}
+
+function generationSingerSelects() {
+  return [elements["generation-singer"], elements["pipeline-singer"]].filter(Boolean);
+}
+
+function applyGenerationModel(value) {
+  for (const select of generationModelSelects()) {
+    if ([...select.options].some((option) => option.value === value)) select.value = value;
+  }
+  state.generationModel = value;
+}
+
+function applyGenerationSinger(value) {
+  for (const select of generationSingerSelects()) {
+    if ([...select.options].some((option) => option.value === value)) select.value = value;
+  }
+  state.generationSinger = value;
+}
+
 function restoreGenerationModel() {
   let value = "自动";
   try {
@@ -307,12 +332,12 @@ function restoreGenerationModel() {
   }
   const select = elements["generation-model"];
   if (![...select.options].some((option) => option.value === value)) value = "自动";
-  select.value = value;
-  state.generationModel = value;
+  applyGenerationModel(value);
 }
 
 function saveGenerationModel(value) {
-  state.generationModel = value;
+  applyGenerationModel(value);
+  renderGenerationModelControls();
   try {
     localStorage.setItem(GENERATION_MODEL_STORAGE_KEY, value);
   } catch {
@@ -329,12 +354,11 @@ function restoreGenerationSinger() {
   }
   const select = elements["generation-singer"];
   if (![...select.options].some((option) => option.value === value)) value = "";
-  select.value = value;
-  state.generationSinger = value;
+  applyGenerationSinger(value);
 }
 
 function saveGenerationSinger(value) {
-  state.generationSinger = value;
+  applyGenerationSinger(value);
   try {
     localStorage.setItem(GENERATION_SINGER_STORAGE_KEY, value);
   } catch {
@@ -342,11 +366,15 @@ function saveGenerationSinger(value) {
   }
 }
 
-function renderGenerationSingerVisibility() {
+function renderGenerationModelControls(locked) {
   const visible = elements["generation-model"].value === "Sway v5.5";
-  const field = elements["generation-singer"].closest(".singer-field");
-  field.hidden = !visible;
-  elements["generation-singer"].disabled = !visible;
+  const disabled = Boolean(locked);
+  for (const select of generationModelSelects()) select.disabled = disabled;
+  for (const select of generationSingerSelects()) {
+    const field = select.closest(".singer-field");
+    if (field) field.hidden = !visible;
+    select.disabled = disabled || !visible;
+  }
 }
 
 function joinDayFolder(root, day) {
@@ -1236,8 +1264,8 @@ function renderPipelinePanel() {
     [song.lyrics_status, song.generation_status, song.upload_status].includes("failed")
   ).length;
   elements["pipeline-caption"].textContent = run
-    ? `${run.account_name} · ${run.day} · ${statusLabels[run.status] || run.status} · ${stageLabels[run.stage] || run.stage} · 完成 ${finishedSongs}/${run.songs.length} · 失败 ${failedSongs}`
-    : "AI 作词 → 生成下载 → 上传发布";
+    ? `${run.account_name} · ${run.day} · 模型 ${run.model_name || "自动"} · ${statusLabels[run.status] || run.status} · ${stageLabels[run.stage] || run.stage} · 完成 ${finishedSongs}/${run.songs.length} · 失败 ${failedSongs}`
+    : `AI 作词 → 生成下载 → 上传发布 · 模型 ${state.generationModel || "自动"}`;
 
   document.querySelectorAll("#pipeline-stage-strip [data-stage]").forEach((item) => {
     const generationDone = run?.stage === "upload" && item.dataset.stage === "generation";
@@ -1573,7 +1601,8 @@ function renderControls() {
   elements["resume-run"].disabled = !running || state.current?.status !== "paused";
   elements["stop-run"].disabled = !running;
   elements["fresh-run"].disabled = running;
-  elements["generation-model"].disabled = running || pipelineBusy;
+  const modelLocked = running || pipelineBusy;
+  renderGenerationModelControls(modelLocked);
   const account = state.accounts.find((item) => item.id === state.accountId);
   const lyricDirDirty = Boolean(account) && elements["lyric-dir-input"].value.trim() !== account.lyric_dir;
   elements["apply-lyric-dir"].disabled = running || pipelineBusy || !state.accountId;
@@ -1912,7 +1941,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupTooltips();
   restoreGenerationModel();
   restoreGenerationSinger();
-  renderGenerationSingerVisibility();
+  renderGenerationModelControls();
   bindEvents();
   renderView();
   await Promise.allSettled([loadHealth(), loadSettings()]);
@@ -2461,6 +2490,8 @@ function bindEvents() {
           pause_before_upload: elements["pipeline-pause"].checked,
           ai_created: elements["pipeline-ai-created"].value === "yes",
           auto_replace_noncompliant: state.autoReplaceNoncompliant,
+          model_name: state.generationModel || elements["pipeline-model"].value,
+          singer_name: elements["pipeline-singer"].value,
         }),
       });
       renderPipelinePanel();
@@ -2770,10 +2801,16 @@ function fillLyricTemplateForm(template = null) {
 
   elements["generation-model"].addEventListener("change", () => {
     saveGenerationModel(elements["generation-model"].value);
-    renderGenerationSingerVisibility();
   });
   elements["generation-singer"].addEventListener("change", () => {
     saveGenerationSinger(elements["generation-singer"].value);
+  });
+  elements["pipeline-model"].addEventListener("change", () => {
+    saveGenerationModel(elements["pipeline-model"].value);
+    renderPipelinePanel();
+  });
+  elements["pipeline-singer"].addEventListener("change", () => {
+    saveGenerationSinger(elements["pipeline-singer"].value);
   });
 
   elements["start-run"].addEventListener("click", async () => {

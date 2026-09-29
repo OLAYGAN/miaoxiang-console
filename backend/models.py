@@ -243,6 +243,8 @@ class PipelineSnapshot(BaseModel):
     ai_created: bool = True
     real_name: str | None = None
     auto_replace_noncompliant: bool = False
+    model_name: MusicModelName = "自动"
+    singer_name: str = "老岩"
     generation_max_retries: int = Field(default=2, ge=1, le=10)
     songs: list[PipelineSongState] = Field(default_factory=list)
     error: str | None = None
@@ -273,6 +275,8 @@ class PipelineQueueSnapshot(BaseModel):
     ai_created: bool = True
     real_name: str | None = None
     auto_replace_noncompliant: bool = False
+    model_name: MusicModelName = "自动"
+    singer_name: str = "老岩"
     items: list[PipelineQueueItem] = Field(default_factory=list)
     error: str | None = None
     created_at: datetime = Field(default_factory=datetime.now)

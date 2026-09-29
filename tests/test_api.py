@@ -610,6 +610,8 @@ def test_pipeline_endpoints_use_existing_account_and_template(tmp_path: Path, mo
             "pause": kwargs["pause_before_upload"],
             "ai_created": kwargs["ai_created"],
             "real_name": kwargs["real_name"],
+            "model_name": kwargs["model_name"],
+            "singer_name": kwargs["singer_name"],
         })
         snapshot = PipelineSnapshot(
             account_id=account.id,
@@ -662,6 +664,8 @@ def test_pipeline_endpoints_use_existing_account_and_template(tmp_path: Path, mo
                 "pause_before_upload": True,
                 "ai_created": False,
                 "real_name": "李四",
+                "model_name": "Sway v5.5",
+                "singer_name": "老岩",
             },
         )
 
@@ -670,6 +674,8 @@ def test_pipeline_endpoints_use_existing_account_and_template(tmp_path: Path, mo
         assert captured["pause"] is True
         assert captured["ai_created"] is False
         assert captured["real_name"] == "李四"
+        assert captured["model_name"] == "Sway v5.5"
+        assert captured["singer_name"] == "老岩"
         assert client.get("/api/pipeline/runs/current").json()["status"] == "running"
         assert client.get("/api/pipeline/runs/current?day=2026-09-20").json() is None
         assert client.get(f"/api/pipeline/runs/current?account_id={account['id']}").json()["status"] == "running"
@@ -683,9 +689,11 @@ def test_pipeline_queue_endpoint_runs_selected_accounts_in_order(tmp_path: Path,
 
     app, _ = make_client(tmp_path)
     started: list[str] = []
+    captured_models: list[str] = []
 
     def fake_start(account, template, *, day, **kwargs):
         started.append(account.account_name)
+        captured_models.append(kwargs["model_name"])
         snapshot = PipelineSnapshot(
             account_id=account.id,
             account_name=account.account_name,
@@ -694,6 +702,7 @@ def test_pipeline_queue_endpoint_runs_selected_accounts_in_order(tmp_path: Path,
             day=day,
             status="completed",
             stage="report",
+            model_name=kwargs["model_name"],
         )
         app.state.pipeline_engine.current = snapshot
         return snapshot
@@ -745,12 +754,14 @@ def test_pipeline_queue_endpoint_runs_selected_accounts_in_order(tmp_path: Path,
                     {"account_id": second["id"], "template_id": second_template["id"]},
                 ],
                 "real_name": "",
+                "model_name": "TemPolor v4.1a",
             },
         )
 
         assert response.status_code == 202
         queue = response.json()
         assert [item["account_name"] for item in queue["items"]] == ["账号01", "账号02"]
+        assert queue["model_name"] == "TemPolor v4.1a"
 
         finished = None
         for _ in range(30):
@@ -759,6 +770,7 @@ def test_pipeline_queue_endpoint_runs_selected_accounts_in_order(tmp_path: Path,
                 break
             time.sleep(0.02)
         assert started == ["账号01", "账号02"]
+        assert captured_models == ["TemPolor v4.1a", "TemPolor v4.1a"]
         assert finished is not None
         assert finished["status"] == "completed"
         assert [item["status"] for item in finished["items"]] == ["completed", "completed"]
@@ -900,6 +912,81 @@ def test_pipeline_generation_uses_two_retries_even_if_account_allows_more(
 
         assert captured == [3]
         assert current["generation_max_retries"] == 2
+
+
+def test_pipeline_generation_uses_selected_model(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from backend.models import LyricData, TaskSnapshot
+
+    app, _ = make_client(tmp_path)
+    captured: list[tuple[str, str]] = []
+
+    async def generate_lyrics(template, count):
+        return [
+            LyricData(song_name=f"第{index}首", lyrics="风 把 灯光 吹成 街", style="s" * 60)
+            for index in range(count)
+        ]
+
+    async def save_lyrics(account, day, songs):
+        return [
+            {"song_name": song.song_name, "file_name": f"{index + 1:02d}_{song.song_name}.md"}
+            for index, song in enumerate(songs)
+        ]
+
+    def capture_generation_start(account, files, **kwargs):
+        captured.append((kwargs.get("model_name"), kwargs.get("singer_name")))
+        app.state.engine.current = TaskSnapshot(
+            run_id="generation-run",
+            account_id=account.id,
+            account_name=account.account_name,
+            status="completed",
+            current_step="done",
+        )
+        return app.state.engine.current
+
+    async def run_upload(account, day, files, ai_created, real_name, auto_replace_noncompliant):
+        return {"status": "completed"}
+
+    monkeypatch.setattr(app.state.pipeline_engine, "_generate_lyrics", generate_lyrics)
+    monkeypatch.setattr(app.state.pipeline_engine, "_save_lyrics", save_lyrics)
+    monkeypatch.setattr(app.state.pipeline_engine, "_run_upload", run_upload)
+    monkeypatch.setattr(app.state.engine, "start", capture_generation_start)
+
+    with TestClient(app) as client:
+        account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
+        template = client.post(
+            f"/api/accounts/{account['id']}/lyric/templates",
+            json={
+                "name": "模型模板",
+                "lyric_tone": "温暖叙事",
+                "song_style": "pop",
+                "themes": ["成长"],
+                "generation_count": 1,
+            },
+        ).json()
+        response = client.post(
+            "/api/pipeline/runs",
+            json={
+                "account_id": account["id"],
+                "template_id": template["id"],
+                "day": "2026-09-30",
+                "model_name": "Sway v5.5",
+                "singer_name": "老岩",
+            },
+        )
+        assert response.status_code == 202
+
+        current = None
+        for _ in range(60):
+            current = client.get("/api/pipeline/runs/current").json()
+            if current["status"] in {"completed", "failed", "stopped"}:
+                break
+            time.sleep(0.02)
+
+        assert captured == [("Sway v5.5", "老岩")]
+        assert current["model_name"] == "Sway v5.5"
 
 
 def test_pipeline_reuses_existing_lyrics_when_day_already_has_enough(

@@ -257,3 +257,46 @@ async def test_generation_and_upload_pages_use_available_content_width() -> None
             await browser.close()
     finally:
         pass
+
+
+@pytest.mark.asyncio
+async def test_pipeline_and_generation_share_one_model_choice() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page()
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#pipeline-model", state="attached")
+                values = await page.evaluate(
+                    """() => {
+                    saveGenerationModel("Sway v5.5");
+                    const fromGeneration = {
+                        generation: document.getElementById("generation-model").value,
+                        pipeline: document.getElementById("pipeline-model").value,
+                        pipelineSingerVisible: !document.getElementById("pipeline-singer").closest(".singer-field").hidden,
+                        pipelineSingerDisabled: document.getElementById("pipeline-singer").disabled,
+                    };
+                    saveGenerationModel("MiniMax v2.6");
+                    const fromPipeline = {
+                        generation: document.getElementById("generation-model").value,
+                        pipeline: document.getElementById("pipeline-model").value,
+                        pipelineSingerVisible: !document.getElementById("pipeline-singer").closest(".singer-field").hidden,
+                        pipelineSingerDisabled: document.getElementById("pipeline-singer").disabled,
+                    };
+                    return { fromGeneration, fromPipeline };
+                    }""",
+                )
+
+                assert values["fromGeneration"]["generation"] == "Sway v5.5"
+                assert values["fromGeneration"]["pipeline"] == "Sway v5.5"
+                assert values["fromGeneration"]["pipelineSingerVisible"] is True
+                assert values["fromGeneration"]["pipelineSingerDisabled"] is False
+                assert values["fromPipeline"]["generation"] == "MiniMax v2.6"
+                assert values["fromPipeline"]["pipeline"] == "MiniMax v2.6"
+                assert values["fromPipeline"]["pipelineSingerVisible"] is False
+                assert values["fromPipeline"]["pipelineSingerDisabled"] is True
+
+            await browser.close()
+    finally:
+        pass

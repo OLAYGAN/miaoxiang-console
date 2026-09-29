@@ -11,6 +11,7 @@ from backend.events import EventBus
 from backend.models import (
     AccountConfig,
     LyricTemplateConfig,
+    MusicModelName,
     PipelineQueueItem,
     PipelineQueueSnapshot,
     PipelineSnapshot,
@@ -35,6 +36,8 @@ class QueuePipelineEngine(Protocol):
         ai_created: bool = True,
         real_name: str | None = None,
         auto_replace_noncompliant: bool = False,
+        model_name: MusicModelName = "自动",
+        singer_name: str = "老岩",
         stop_after_stage: str | None = None,
     ) -> PipelineSnapshot: ...
 
@@ -99,6 +102,8 @@ class PipelineQueueEngine:
         ai_created: bool = True,
         real_name: str | None = None,
         auto_replace_noncompliant: bool = False,
+        model_name: MusicModelName = "自动",
+        singer_name: str = "老岩",
     ) -> PipelineQueueSnapshot:
         if self.is_running or self.is_waiting_user:
             raise ConflictError("多账号流水线队列正在运行")
@@ -120,6 +125,8 @@ class PipelineQueueEngine:
             ai_created=ai_created,
             real_name=real_name,
             auto_replace_noncompliant=auto_replace_noncompliant,
+            model_name=model_name,
+            singer_name=singer_name,
             items=[
                 PipelineQueueItem(
                     account_id=account.id,
@@ -196,6 +203,8 @@ class PipelineQueueEngine:
                         if self.current.real_name is None
                         else self.current.real_name
                     ),
+                    "model_name": self.current.model_name,
+                    "singer_name": self.current.singer_name,
                 }
                 if self.current.auto_replace_noncompliant:
                     start_options["auto_replace_noncompliant"] = True

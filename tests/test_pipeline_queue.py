@@ -39,6 +39,8 @@ class FakePipelineEngine:
         self.pause_before_upload = pause_before_upload
         self.started: list[tuple[AccountConfig, LyricTemplateConfig]] = []
         self.real_names: list[str | None] = []
+        self.models: list[str] = []
+        self.singers: list[str] = []
         self.auto_replace_options: list[bool] = []
         self.resume_count = 0
         self.stop_count = 0
@@ -63,10 +65,14 @@ class FakePipelineEngine:
         ai_created: bool,
         real_name: str | None,
         auto_replace_noncompliant: bool = False,
+        model_name: str = "自动",
+        singer_name: str = "老岩",
         stop_after_stage: str | None = None,
     ) -> PipelineSnapshot:
         self.started.append((account, template))
         self.real_names.append(real_name)
+        self.models.append(model_name)
+        self.singers.append(singer_name)
         self.auto_replace_options.append(auto_replace_noncompliant)
         self._sequence += 1
         stage = "report"
@@ -90,6 +96,8 @@ class FakePipelineEngine:
             ai_created=ai_created,
             real_name=real_name,
             auto_replace_noncompliant=auto_replace_noncompliant,
+            model_name=model_name,
+            singer_name=singer_name,
         )
         return self.current
 
@@ -145,6 +153,30 @@ async def test_pipeline_queue_propagates_noncompliant_replacement_policy(tmp_pat
 
     assert pipeline.auto_replace_options == [True]
     assert engine.current.auto_replace_noncompliant is True
+
+
+@pytest.mark.asyncio
+async def test_pipeline_queue_forwards_selected_model_to_every_account(tmp_path: Path) -> None:
+    first = make_account(tmp_path, "first")
+    second = make_account(tmp_path, "second")
+    pipeline = FakePipelineEngine()
+    engine = make_engine(tmp_path, pipeline)
+
+    queue = engine.start(
+        [(first, make_template(first)), (second, make_template(second))],
+        day="2026-09-21",
+        model_name="SeedMusic v1.0 preview",
+        singer_name="老岩",
+    )
+    await engine.wait()
+
+    assert pipeline.models == ["SeedMusic v1.0 preview", "SeedMusic v1.0 preview"]
+    assert pipeline.singers == ["老岩", "老岩"]
+    assert queue.model_name == "SeedMusic v1.0 preview"
+    assert [item.pipeline_snapshot.model_name for item in queue.items] == [
+        "SeedMusic v1.0 preview",
+        "SeedMusic v1.0 preview",
+    ]
 
 
 @pytest.mark.asyncio

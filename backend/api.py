@@ -106,6 +106,8 @@ class PipelineStartRequest(BaseModel):
     ai_created: bool = True
     real_name: str | None = Field(default=None, max_length=64)
     auto_replace_noncompliant: bool = False
+    model_name: MusicModelName = Field(default="自动")
+    singer_name: str = Field(default="老岩", max_length=64)
 
 
 class PipelineQueueItemRequest(BaseModel):
@@ -120,6 +122,8 @@ class PipelineQueueStartRequest(BaseModel):
     ai_created: bool = True
     real_name: str | None = Field(default=None, max_length=64)
     auto_replace_noncompliant: bool = False
+    model_name: MusicModelName = Field(default="自动")
+    singer_name: str = Field(default="老岩", max_length=64)
 
 
 class FolderOpenRequest(BaseModel):
@@ -518,11 +522,20 @@ def create_app(
         actual_account = actual_account.model_copy(update={
             "max_retries": pipeline_engine.current.generation_max_retries + 1,
         })
+        model_name = pipeline_engine.current.model_name
+        singer_name = pipeline_engine.current.singer_name
         root = Path(actual_account.lyric_dir) / day
         paths = [(root / path.name).resolve() for path in lyric_files]
         await login_browser.close()
         try:
-            engine.start(actual_account, paths, day=day, fresh_run=False)
+            engine.start(
+                actual_account,
+                paths,
+                day=day,
+                fresh_run=False,
+                model_name=model_name,
+                singer_name=singer_name,
+            )
             await engine.wait()
         except asyncio.CancelledError:
             if engine.is_running:
@@ -1109,6 +1122,8 @@ def create_app(
             pause_before_upload=request.pause_before_upload,
             ai_created=request.ai_created,
             real_name=account.upload_real_name if request.real_name is None else request.real_name,
+            model_name=request.model_name,
+            singer_name=request.singer_name,
             **({"auto_replace_noncompliant": True} if request.auto_replace_noncompliant else {}),
         )
         return snapshot.model_dump(mode="json")
@@ -1167,6 +1182,8 @@ def create_app(
             pause_before_upload=request.pause_before_upload,
             ai_created=request.ai_created,
             real_name=request.real_name,
+            model_name=request.model_name,
+            singer_name=request.singer_name,
             **({"auto_replace_noncompliant": True} if request.auto_replace_noncompliant else {}),
         )
         return snapshot.model_dump(mode="json")
