@@ -228,3 +228,32 @@ async def test_pipeline_queue_shows_global_phase_and_account_stage_counts() -> N
             await browser.close()
     finally:
         pass
+
+
+@pytest.mark.asyncio
+async def test_generation_and_upload_pages_use_available_content_width() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1600, "height": 900})
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector(".task-layout", state="attached")
+                widths = await page.evaluate(
+                    """() => {
+                    const layout = document.querySelector('.task-layout');
+                    const result = {};
+                    for (const stage of ['generation', 'upload']) {
+                        document.body.dataset.stage = stage;
+                        result[stage] = layout.getBoundingClientRect().width;
+                    }
+                    return result;
+                    }""",
+                )
+
+                assert widths["generation"] > 1200
+                assert widths["upload"] > 1200
+
+            await browser.close()
+    finally:
+        pass

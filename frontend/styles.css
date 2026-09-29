@@ -420,17 +420,18 @@ button:disabled { cursor: not-allowed; opacity: 0.46; }
 
 body.task-view-active .task-frame {
   display: grid;
-  grid-template-columns: 214px minmax(0, 1fr);
-  gap: 16px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
   align-items: start;
 }
 
 .task-sidebar {
   position: sticky;
   top: 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+  display: grid;
+  grid-template-columns: auto minmax(420px, 62%);
+  gap: 18px;
+  align-items: center;
   margin: 0;
   padding: 14px;
   border: 1px solid rgba(255, 255, 255, 0.12);
@@ -457,7 +458,7 @@ body.task-view-active .task-frame {
 .task-stage-strip {
   display: grid !important;
   width: 100%;
-  grid-template-columns: 1fr !important;
+  grid-template-columns: repeat(4, minmax(118px, 1fr)) !important;
   gap: 5px;
   padding: 5px;
   border-radius: 7px;
@@ -511,7 +512,7 @@ body[data-stage="pipeline"] .upload-panel { display: none; }
 body[data-stage="generation"] .task-layout,
 body[data-stage="upload"] .task-layout,
 body[data-stage="pipeline"] .task-layout {
-  grid-template-columns: minmax(0, min(980px, 1fr));
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .panel {
@@ -1531,7 +1532,9 @@ input:focus, select:focus, button:focus-visible {
 .floating-tooltip.show { opacity: 1; transform: translateY(0); }
 
 @media (max-width: 1180px) {
-  body.task-view-active .task-frame { grid-template-columns: 182px minmax(0, 1fr); }
+  body.task-view-active .task-frame { grid-template-columns: minmax(0, 1fr); }
+  .task-sidebar { grid-template-columns: 1fr; }
+  .task-stage-strip { grid-template-columns: repeat(2, minmax(140px, 1fr)) !important; }
   .task-layout { grid-template-columns: 1fr; }
   .lyric-layout { grid-template-columns: 1fr; }
   .log-panel { min-height: 540px; }
