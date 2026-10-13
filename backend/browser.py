@@ -98,21 +98,34 @@ class ChromeSession:
         self._playwright: Any = None
         self._process: subprocess.Popen | None = None
 
+    async def _cdp_available(self) -> bool:
+        try:
+            await wait_for_cdp(
+                port=self.account.chrome_debug_port,
+                fetch_json=self._fetch_json,
+                attempts=1,
+                interval=0,
+            )
+            return True
+        except Exception:
+            return False
+
     async def start(self) -> "ChromeSession":
-        executable = resolve_chrome_executable()
         profile = Path(self.account.chrome_profile_dir)
         profile.mkdir(parents=True, exist_ok=True)
-        command = build_chrome_command(
-            executable,
-            profile=profile,
-            port=self.account.chrome_debug_port,
-        )
-        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        self._process = subprocess.Popen(
-            command,
-            creationflags=creationflags,
-            close_fds=True,
-        )
+        if not await self._cdp_available():
+            executable = resolve_chrome_executable()
+            command = build_chrome_command(
+                executable,
+                profile=profile,
+                port=self.account.chrome_debug_port,
+            )
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            self._process = subprocess.Popen(
+                command,
+                creationflags=creationflags,
+                close_fds=True,
+            )
         try:
             await wait_for_cdp(
                 port=self.account.chrome_debug_port,

@@ -12,6 +12,7 @@ dependencies = [
   "uvicorn[standard]>=0.30",
   "playwright>=1.47",
   "pydantic>=2.8",
+  "pypinyin>=0.53",
 ]
 
 [project.optional-dependencies]

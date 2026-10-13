@@ -12,7 +12,13 @@ from backend.api import build_upload_lyrics
 from backend.api import build_upload_items
 from backend.config import RuntimePaths
 from backend.lyrics import parse_lyrics
-from backend.models import AccountConfig, ConsoleSettings, SongRecord
+from backend.models import (
+    AccountConfig,
+    ConsoleSettings,
+    MultiStageSnapshot,
+    PipelineSnapshot,
+    SongRecord,
+)
 from tests.test_ai_lyrics import make_song
 
 
@@ -21,12 +27,18 @@ class FakeFlow:
         self.engine = engine
         self.stop_after = stop_after
         self.processed = 0
+        self.redownloaded: list[str] = []
 
     async def process_song(self, lyric_data, on_step):
         self.processed += 1
         on_step("generate")
         if self.stop_after and self.processed >= self.stop_after:
             await self.engine.stop()
+        return Path("output") / f"{lyric_data.song_name}.mp3"
+
+    async def redownload_song(self, lyric_data, on_step):
+        self.redownloaded.append(lyric_data.song_name)
+        on_step("download_song")
         return Path("output") / f"{lyric_data.song_name}.mp3"
 
 
@@ -135,6 +147,35 @@ def test_health_and_account_crud(tmp_path: Path) -> None:
         deleted = client.delete(f"/api/accounts/{account['id']}")
         assert deleted.status_code == 204
         assert client.get(f"/api/accounts/{account['id']}").status_code == 404
+
+
+def test_stop_is_idempotent_when_task_finishes_before_request(tmp_path: Path) -> None:
+    app, _ = make_client(tmp_path)
+    day = "2026-10-12"
+    with TestClient(app) as client:
+        app.state.multi_stage_engine.current = MultiStageSnapshot(
+            stage="generation",
+            day=day,
+            status="completed",
+        )
+        app.state.engine.current_upload = {
+            "status": "completed",
+            "step": "done",
+            "day": day,
+        }
+        app.state.pipeline_engine.current = PipelineSnapshot(
+            account_id="account",
+            account_name="账号01",
+            template_id="template",
+            template_name="模板",
+            day=day,
+            status="completed",
+            stage="report",
+        )
+
+        assert client.post("/api/multi-stage/runs/stop").json()["status"] == "completed"
+        assert client.post("/api/uploads/runs/stop").json()["status"] == "completed"
+        assert client.post("/api/pipeline/runs/stop").json()["status"] == "completed"
 
 
 def test_account_directories_are_created_automatically(tmp_path: Path) -> None:
@@ -264,9 +305,46 @@ def test_upload_batch_listing_reads_output_directory(tmp_path: Path) -> None:
         body = response.json()
         assert body["ready"] is True
         assert body["batch_size"] == 10
+        assert body["daily_limit"] == 10
+        assert body["daily_used"] == 1
+        assert body["remaining_uploads"] == 9
         assert [item["file_name"] for item in body["files"]] == ["第二首.mp3"]
         assert [item["file_name"] for item in body["uploaded_files"]] == ["第一首.mp3"]
         assert all(item["size"] > 0 for item in body["files"])
+
+
+def test_upload_items_stop_at_daily_remaining_slots(tmp_path: Path) -> None:
+    app, _ = make_client(tmp_path)
+    with TestClient(app) as client:
+        account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
+        day = "2026-09-18"
+        output = Path(account["output_dir"]) / day
+        output.mkdir(parents=True, exist_ok=True)
+        lyric_day = Path(account["lyric_dir"]) / day
+        lyric_day.mkdir(parents=True, exist_ok=True)
+
+        for index in range(1, 4):
+            lyric_file = write_song(tmp_path, f"{index:02d}_song")
+            lyric_file.replace(lyric_day / lyric_file.name)
+
+        for index in range(1, 4):
+            parsed = parse_lyrics(
+                (lyric_day / f"{index:02d}_song.md").read_text(encoding="utf-8")
+            )
+            write_duration_mp3(output / f"{parsed.song_name}.mp3", 61.0)
+
+        used_paths = [
+            str((output / f"old-{index:02d}.mp3").resolve())
+            for index in range(9)
+        ]
+        (output / ".uploaded.json").write_text(
+            json.dumps(used_paths),
+            encoding="utf-8",
+        )
+
+        items = build_upload_items(AccountConfig.model_validate(account), day)
+
+        assert len(items) == 1
 
 
 def test_upload_listing_and_items_skip_music_shorter_than_sixty_seconds(
@@ -345,6 +423,38 @@ def test_start_upload_requires_account_query_parameter(tmp_path: Path) -> None:
 
         missing_account = client.post("/api/uploads/runs?day=2026-09-18", json={})
         assert missing_account.status_code in {404, 422}
+
+
+def test_start_upload_rejects_when_daily_limit_is_reached(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app, _ = make_client(tmp_path)
+    called = False
+
+    def fake_start(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(app.state.engine, "start_upload", fake_start)
+    with TestClient(app) as client:
+        account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
+        day = "2026-09-18"
+        output = Path(account["output_dir"]) / day
+        output.mkdir(parents=True, exist_ok=True)
+        (output / ".uploaded.json").write_text(
+            json.dumps([str((output / f"old-{index:02d}.mp3").resolve()) for index in range(10)]),
+            encoding="utf-8",
+        )
+
+        response = client.post(
+            f"/api/uploads/runs?account_id={account['id']}&day={day}",
+            json={"file_names": ["01_selected.mp3"]},
+        )
+
+        assert response.status_code == 422
+        assert "上限已用完" in response.json()["detail"]
+        assert called is False
 
 
 def test_start_upload_filters_selected_tracks(tmp_path: Path, monkeypatch) -> None:
@@ -563,7 +673,7 @@ def test_retry_rejected_upload_regenerates_pending_songs(tmp_path: Path, monkeyp
         assert captured["kwargs"]["singer_name"] == "小岩"
 
 
-def test_lyric_template_can_move_between_accounts(tmp_path: Path) -> None:
+def test_lyric_template_cannot_move_between_accounts(tmp_path: Path) -> None:
     app, _ = make_client(tmp_path)
     with TestClient(app) as client:
         first = client.post("/api/accounts", json=account_payload(tmp_path, "账号01", 19222)).json()
@@ -590,10 +700,10 @@ def test_lyric_template_can_move_between_accounts(tmp_path: Path) -> None:
             json=payload,
         )
 
-        assert moved.status_code == 200
-        assert moved.json()["account_id"] == second["id"]
-        assert [item["id"] for item in client.get(f"/api/accounts/{first['id']}/lyric/templates").json()["templates"]] == []
-        assert [item["id"] for item in client.get(f"/api/accounts/{second['id']}/lyric/templates").json()["templates"]] == [template["id"]]
+        assert moved.status_code == 422
+        assert moved.json()["detail"] == "歌词模板不属于该账号"
+        assert [item["id"] for item in client.get(f"/api/accounts/{first['id']}/lyric/templates").json()["templates"]] == [template["id"]]
+        assert client.get(f"/api/accounts/{second['id']}/lyric/templates").json()["templates"] == []
 
 
 def test_pipeline_endpoints_use_existing_account_and_template(tmp_path: Path, monkeypatch) -> None:
@@ -1098,6 +1208,144 @@ def test_song_listing_detects_completion_from_output_files(tmp_path: Path) -> No
         assert songs["03_external.md"]["output_path"].endswith("03_external.mp3")
 
 
+def test_redownload_uses_existing_lyrics_without_starting_generation(tmp_path: Path) -> None:
+    app, holder = make_client(tmp_path)
+    with TestClient(app) as client:
+        account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
+        write_song(tmp_path, "01_song")
+
+        response = client.post(
+            "/api/runs/redownload",
+            json={
+                "account_id": account["id"],
+                "file_name": "01_song.md",
+                "day": "2026-09-17",
+            },
+        )
+
+        assert response.status_code == 202
+        for _ in range(100):
+            current = client.get("/api/runs/current").json()
+            if current["status"] in {"completed", "failed"}:
+                break
+            time.sleep(0.01)
+
+        assert current["status"] == "completed"
+        assert current["songs"][0]["status"] == "成功"
+        assert holder["browser"].flow.redownloaded == ["01_song"]
+        assert holder["browser"].flow.processed == 0
+
+
+def test_repair_run_handles_all_abnormal_songs_in_one_browser_session(
+    tmp_path: Path,
+) -> None:
+    app, holder = make_client(tmp_path)
+    with TestClient(app) as client:
+        account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
+        download = write_song(tmp_path, "01_download")
+        export = write_song(tmp_path, "02_export")
+        generate = write_song(tmp_path, "03_generate")
+        success = write_song(tmp_path, "04_success")
+        output = tmp_path / "output" / "2026-09-17"
+        output.mkdir(parents=True, exist_ok=True)
+        (output / success.name).with_suffix(".mp3").write_bytes(b"audio")
+        for path, status, error in (
+            (download, "下载失败", "下载中断"),
+            (export, "导出失败", "导出中断"),
+            (generate, "生成失败", "平台没有返回生成结果"),
+        ):
+            app.state.run_state.mark(
+                "2026-09-17",
+                account["account_name"],
+                SongRecord(
+                    file_name=path.name,
+                    status=status,
+                    current_step="failed",
+                    attempts=1,
+                    error=error,
+                ),
+            )
+
+        response = client.post(
+            "/api/runs/repair",
+            json={"account_id": account["id"], "day": "2026-09-17"},
+        )
+
+        assert response.status_code == 202
+        assert [song["file_name"] for song in response.json()["songs"]] == [
+            download.name,
+            export.name,
+            generate.name,
+        ]
+        for _ in range(100):
+            current = client.get("/api/runs/current").json()
+            if current["status"] in {"completed", "failed"}:
+                break
+            time.sleep(0.01)
+
+        assert current["status"] == "completed"
+        assert holder["browser"].entered == 1
+        assert holder["browser"].flow.redownloaded == ["01_download", "02_export"]
+        assert holder["browser"].flow.processed == 1
+
+
+def test_song_listing_reclassifies_legacy_title_mismatch_as_download_failure(
+    tmp_path: Path,
+) -> None:
+    app, _ = make_client(tmp_path)
+    with TestClient(app) as client:
+        account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
+        write_song(tmp_path, "01_song")
+        app.state.run_state.mark(
+            "2026-09-17",
+            account["account_name"],
+            SongRecord(
+                file_name="01_song.md",
+                status="生成失败",
+                current_step="batch_generate",
+                attempts=1,
+                error="歌曲详情歌名与歌词歌名不匹配，已跳过",
+            ),
+        )
+
+        response = client.get(f"/api/accounts/{account['id']}/songs?day=2026-09-17")
+
+        assert response.status_code == 200
+        song = response.json()[0]
+        assert song["status"] == "下载失败"
+        assert song["current_step"] == "batch_generate"
+
+
+def test_song_listing_keeps_export_failure_status(tmp_path: Path) -> None:
+    app, _ = make_client(tmp_path)
+    with TestClient(app) as client:
+        account = client.post(
+            "/api/accounts",
+            json=account_payload(tmp_path),
+        ).json()
+        write_song(tmp_path, "01_song")
+        app.state.run_state.mark(
+            "2026-09-17",
+            account["account_name"],
+            SongRecord(
+                file_name="01_song.md",
+                status="导出失败",
+                current_step="export_song",
+                attempts=1,
+                error="编辑器导出失败",
+            ),
+        )
+
+        response = client.get(
+            f"/api/accounts/{account['id']}/songs?day=2026-09-17"
+        )
+
+        assert response.status_code == 200
+        song = response.json()[0]
+        assert song["status"] == "导出失败"
+        assert song["current_step"] == "export_song"
+
+
 def test_start_requires_existing_account_and_songs(tmp_path: Path) -> None:
     app, _ = make_client(tmp_path)
     with TestClient(app) as client:
@@ -1107,6 +1355,84 @@ def test_start_requires_existing_account_and_songs(tmp_path: Path) -> None:
         account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
         empty = client.post("/api/runs", json={"account_id": account["id"], "song_files": []})
         assert empty.status_code == 422
+
+
+def test_multi_generation_runs_accounts_serially(tmp_path: Path) -> None:
+    app, holder = make_client(tmp_path)
+    write_song(tmp_path, "01_first")
+    with TestClient(app) as client:
+        first = client.post("/api/accounts", json=account_payload(tmp_path, "账号01", 19222)).json()
+        second = client.post("/api/accounts", json=account_payload(tmp_path, "账号02", 19223)).json()
+        response = client.post(
+            "/api/multi-stage/generation/runs",
+            json={
+                "day": "2026-09-17",
+                "items": [
+                    {
+                        "account_id": first["id"],
+                        "song_files": ["01_first.md"],
+                        "model_name": "Sway v5.5",
+                        "singer_name": "",
+                    },
+                    {
+                        "account_id": second["id"],
+                        "song_files": ["01_first.md"],
+                        "model_name": "MiniMax v2.6",
+                        "singer_name": "老岩",
+                    },
+                ],
+            },
+        )
+        assert response.status_code == 202
+        for _ in range(100):
+            queue = client.get("/api/multi-stage/runs/current").json()
+            if queue["status"] in {"completed", "failed", "stopped"}:
+                break
+
+        assert queue["stage"] == "generation"
+        assert queue["concurrency"] == 1
+        assert queue["status"] == "completed"
+        assert [item["account_name"] for item in queue["items"]] == ["账号01", "账号02"]
+        assert all(item["status"] == "completed" for item in queue["items"])
+        assert holder["models"] == ["Sway v5.5", "MiniMax v2.6"]
+        assert holder["singers"] == ["", ""]
+
+
+def test_multi_lyrics_runs_accounts_in_parallel_and_saves(tmp_path: Path, monkeypatch) -> None:
+    app, _ = make_client(tmp_path)
+
+    async def fake_generate(settings, *, template, count):
+        return [make_song("平行创作")]
+
+    monkeypatch.setattr("backend.api.generate_lyrics_with_ai", fake_generate)
+    with TestClient(app) as client:
+        account = client.post("/api/accounts", json=account_payload(tmp_path)).json()
+        template = client.post(
+            f"/api/accounts/{account['id']}/lyric/templates",
+            json={
+                "name": "并行模板",
+                "themes": ["都市"],
+                "generation_count": 1,
+            },
+        ).json()
+        response = client.post(
+            "/api/multi-stage/lyrics/runs",
+            json={
+                "day": "2026-09-17",
+                "items": [{"account_id": account["id"], "template_id": template["id"]}],
+            },
+        )
+        assert response.status_code == 202
+        for _ in range(100):
+            queue = client.get("/api/multi-stage/runs/current").json()
+            if queue["status"] in {"completed", "failed", "stopped"}:
+                break
+
+        assert queue["stage"] == "lyrics"
+        assert queue["concurrency"] == 20
+        assert queue["status"] == "completed"
+        assert queue["items"][0]["result"]["saved_count"] == 1
+        assert list((Path(account["lyric_dir"]) / "2026-09-17").glob("*.md"))
 
 
 def test_start_uses_today_when_day_is_omitted(tmp_path: Path) -> None:
@@ -1279,6 +1605,51 @@ def test_ai_settings_connection(tmp_path: Path, monkeypatch) -> None:
 
         assert response.status_code == 200
         assert response.json()["model"] == "lyric-model"
+
+
+def test_settings_support_multiple_ai_api_configs_and_switching(tmp_path: Path) -> None:
+    app, _ = make_client(tmp_path)
+    with TestClient(app) as client:
+        first = {
+            "id": "first",
+            "name": "接口一",
+            "api_base_url": "https://api-one.example.com/v1",
+            "api_key": "key-one",
+            "model": "model-one",
+            "max_retries": 1,
+        }
+        second = {
+            "id": "second",
+            "name": "接口二",
+            "api_base_url": "https://api-two.example.com/v1",
+            "api_key": "key-two",
+            "model": "model-two",
+            "max_retries": 3,
+        }
+        created = client.put(
+            "/api/settings",
+            json={
+                "ai_api_configs": [first, second],
+                "active_ai_api_config_id": "second",
+            },
+        )
+
+        assert created.status_code == 200
+        assert created.json()["ai_api_base_url"] == second["api_base_url"]
+        assert created.json()["ai_model"] == second["model"]
+        assert created.json()["active_ai_api_config_id"] == "second"
+
+        switched = client.put(
+            "/api/settings",
+            json={"active_ai_api_config_id": "first"},
+        )
+
+        assert switched.status_code == 200
+        assert switched.json()["ai_api_base_url"] == first["api_base_url"]
+        assert switched.json()["ai_api_key"] == first["api_key"]
+        assert switched.json()["ai_model"] == first["model"]
+        assert switched.json()["ai_max_retries"] == first["max_retries"]
+        assert switched.json()["active_ai_api_config_id"] == "first"
 
 
 def test_ai_lyric_templates_generate_and_save(tmp_path: Path, monkeypatch) -> None:

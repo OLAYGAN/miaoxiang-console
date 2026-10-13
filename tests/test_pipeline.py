@@ -214,6 +214,59 @@ async def test_pipeline_upload_marks_only_platform_confirmed_songs(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_pipeline_upload_preserves_confirmed_songs_on_partial_failure(
+    tmp_path: Path,
+) -> None:
+    first_output = tmp_path / "第一首.mp3"
+    second_output = tmp_path / "第二首.mp3"
+
+    async def run_upload(account, day, files, ai_created, real_name):
+        return {
+            "status": "partial_failed",
+            "uploaded_paths": [str(first_output.resolve())],
+            "error": "第二首第二版本未发布成功",
+        }
+
+    engine = PipelineEngine(
+        state_repository=PipelineStateRepository(tmp_path / "pipeline_state.json"),
+        event_bus=EventBus(),
+        lyric_generator=lambda *args, **kwargs: None,
+        lyric_saver=lambda *args, **kwargs: None,
+        generation_runner=lambda *args, **kwargs: None,
+        upload_runner=run_upload,
+    )
+    engine.current = PipelineSnapshot(
+        account_id="account-1",
+        account_name="账号01",
+        template_id="template-1",
+        template_name="模板01",
+        day="2026-09-20",
+        status="running",
+        stage="upload",
+        songs=[
+            PipelineSongState(
+                song_name="第一首",
+                generation_status="completed",
+                output_path=str(first_output),
+            ),
+            PipelineSongState(
+                song_name="第二首",
+                generation_status="completed",
+                output_path=str(second_output),
+            ),
+        ],
+    )
+
+    await engine._execute_upload()
+
+    assert engine.current.status == "partial_failed"
+    assert engine.current.error == "第二首第二版本未发布成功"
+    assert engine.current.songs[0].upload_status == "completed"
+    assert engine.current.songs[1].upload_status == "pending"
+    assert engine.current.songs[1].upload_removed is True
+
+
+@pytest.mark.asyncio
 async def test_pipeline_refresh_keeps_platform_removed_songs_completed(tmp_path: Path) -> None:
     account = make_refresh_account(tmp_path)
     day = "2026-09-20"

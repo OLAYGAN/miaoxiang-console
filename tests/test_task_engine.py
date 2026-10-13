@@ -9,6 +9,8 @@ from backend.errors import (
     ConflictError,
     GenerationLimitError,
     LoginRequiredError,
+    SongDownloadError,
+    SongExportError,
     SongVerificationError,
     ValidationFailed,
 )
@@ -16,7 +18,7 @@ from backend.events import EventBus
 from backend.models import AccountConfig, ConsoleSettings, SongRecord
 from backend.models import BatchSongResult
 from backend.storage import RunStateRepository
-from backend.task_engine import TaskEngine
+from backend.task_engine import TaskEngine, classify_repair_action
 
 
 def make_account(tmp_path: Path) -> AccountConfig:
@@ -77,6 +79,44 @@ class FakeBatchFlow:
             on_step("generate", item.song_name)
         result = self.results.pop(0)
         return result
+
+
+class FakeRedownloadFlow:
+    def __init__(self) -> None:
+        self.redownload_stage = "auto"
+        self.stages: list[str] = []
+
+    async def redownload_song(self, lyric_data, on_step) -> Path:
+        self.stages.append(self.redownload_stage)
+        on_step("download_song")
+        return Path("output") / f"{lyric_data.song_name}.mp3"
+
+
+class FailingRedownloadFlow:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.redownload_stage = "auto"
+
+    async def redownload_song(self, lyric_data, on_step) -> Path:
+        on_step("download_song")
+        raise self.error
+
+
+class FakeRepairFlow:
+    def __init__(self) -> None:
+        self.redownload_stage = "auto"
+        self.redownloaded: list[tuple[str, str]] = []
+        self.regenerated: list[str] = []
+
+    async def redownload_song(self, lyric_data, on_step) -> Path:
+        self.redownloaded.append((lyric_data.song_name, self.redownload_stage))
+        on_step("download_song")
+        return Path("output") / f"{lyric_data.song_name}.mp3"
+
+    async def process_song(self, lyric_data, on_step) -> Path:
+        self.regenerated.append(lyric_data.song_name)
+        on_step("generate")
+        return Path("output") / f"{lyric_data.song_name}.mp3"
 
 
 class FakeBrowser:
@@ -210,8 +250,8 @@ async def test_batch_title_mismatch_is_retried(tmp_path: Path) -> None:
         [
             BatchSongResult(
                 song_name="01_first",
-                status="title_unmatched",
-                error="生成结果标题与歌名不匹配，已跳过",
+                status="lyric_unmatched",
+                error="歌曲详情歌词与本地歌词不匹配，已跳过",
             ),
         ],
         [
@@ -233,12 +273,12 @@ async def test_batch_title_mismatch_is_retried(tmp_path: Path) -> None:
     assert record.attempts == 2
 
 
-async def test_batch_export_failure_does_not_regenerate(tmp_path: Path) -> None:
+async def test_batch_download_failure_does_not_regenerate(tmp_path: Path) -> None:
     account = make_account(tmp_path)
     song = make_song(account.lyric_dir, "01_first")
     flow = FakeBatchFlow()
     flow.results = [
-        [BatchSongResult(song_name="01_first", status="export_failed", error="下载失败")],
+        [BatchSongResult(song_name="01_first", status="download_failed", error="下载失败")],
     ]
     engine, state, _ = make_engine(tmp_path, flow)
 
@@ -246,8 +286,192 @@ async def test_batch_export_failure_does_not_regenerate(tmp_path: Path) -> None:
     await engine.wait()
 
     assert flow.batches == [["01_first"]]
-    assert state.get("2026-09-17", "账号01", "01_first.md").status == "导出失败"
+    assert state.get("2026-09-17", "账号01", "01_first.md").status == "下载失败"
     assert state.get("2026-09-17", "账号01", "01_first.md").attempts == 1
+
+
+async def test_batch_export_failure_does_not_regenerate(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_first")
+    flow = FakeBatchFlow()
+    flow.results = [
+        [
+            BatchSongResult(
+                song_name="01_first",
+                status="export_failed",
+                error="导出失败",
+            )
+        ],
+    ]
+    engine, state, _ = make_engine(tmp_path, flow)
+
+    engine.start(account, [song], day="2026-09-17")
+    await engine.wait()
+
+    assert flow.batches == [["01_first"]]
+    record = state.get("2026-09-17", "账号01", "01_first.md")
+    assert record.status == "导出失败"
+    assert record.current_step == "export_song"
+    assert record.attempts == 1
+
+
+async def test_redownload_uses_saved_failure_stage(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_first")
+    flow = FakeRedownloadFlow()
+    engine, state, _ = make_engine(tmp_path, flow)
+    state.mark(
+        "2026-09-17",
+        account.account_name,
+        SongRecord(
+            file_name=song.name,
+            status="导出失败",
+            current_step="export_song",
+            attempts=1,
+            error="导出失败",
+        ),
+    )
+
+    engine.start_redownload(account, song, day="2026-09-17")
+    await engine.wait()
+
+    assert flow.stages == ["导出失败"]
+    assert engine.current.status == "completed"
+
+
+async def test_failed_redownload_escalates_to_regeneration(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_first")
+    flow = FailingRedownloadFlow(SongExportError("导出歌曲失败: 编辑器超时"))
+    engine, state, _ = make_engine(tmp_path, flow)
+    state.mark(
+        "2026-09-17",
+        account.account_name,
+        SongRecord(
+            file_name=song.name,
+            status="导出失败",
+            current_step="export_song",
+            attempts=1,
+            error="导出失败",
+        ),
+    )
+
+    engine.start_redownload(account, song, day="2026-09-17")
+    await engine.wait()
+
+    record = state.get("2026-09-17", "账号01", song.name)
+    assert record.status == "生成失败"
+    assert "已有版本修复失败，需要重新生成" in record.error
+    assert classify_repair_action(record.status, record.error) == "generate"
+
+
+async def test_failed_repair_escalates_and_next_repair_regenerates(
+    tmp_path: Path,
+) -> None:
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_first")
+    failing_engine, state, _ = make_engine(
+        tmp_path,
+        FailingRedownloadFlow(SongDownloadError("下载歌曲失败: 下载菜单超时")),
+    )
+
+    failing_engine.start_repair(
+        account,
+        [(song, "下载失败", "下载中断")],
+        day="2026-09-17",
+    )
+    await failing_engine.wait()
+
+    record = state.get("2026-09-17", "账号01", song.name)
+    assert record.status == "生成失败"
+    assert classify_repair_action(record.status, record.error) == "generate"
+
+    recovery_flow = FakeRepairFlow()
+    recovery_engine, _, _ = make_engine(tmp_path, recovery_flow)
+    recovery_engine.start_repair(
+        account,
+        [(song, record.status, record.error)],
+        day="2026-09-17",
+    )
+    await recovery_engine.wait()
+
+    assert recovery_flow.redownloaded == []
+    assert recovery_flow.regenerated == ["01_first"]
+    assert recovery_engine.current.status == "completed"
+
+
+async def test_repair_uses_the_cheapest_safe_action_for_each_failure(
+    tmp_path: Path,
+) -> None:
+    account = make_account(tmp_path)
+    download = make_song(account.lyric_dir, "01_download")
+    export = make_song(account.lyric_dir, "02_export")
+    legacy_match = make_song(account.lyric_dir, "03_legacy_match")
+    generate = make_song(account.lyric_dir, "04_generate")
+    flow = FakeRepairFlow()
+    engine, state, browser = make_engine(tmp_path, flow)
+    entries = [
+        (download, "下载失败", "下载中断"),
+        (export, "导出失败", "导出中断"),
+        (legacy_match, "生成失败", "歌曲详情歌名与歌词歌名不匹配，已跳过"),
+        (generate, "生成失败", "平台没有返回生成结果"),
+    ]
+
+    engine.start_repair(account, entries, day="2026-09-17")
+    await engine.wait()
+
+    assert flow.redownloaded == [
+        ("01_download", "下载失败"),
+        ("02_export", "导出失败"),
+        ("03_legacy_match", "导出失败"),
+    ]
+    assert flow.regenerated == ["04_generate"]
+    assert browser.entered == browser.exited == 1
+    assert engine.current.status == "completed"
+    assert engine.current.success_count == 4
+    assert state.get("2026-09-17", "账号01", generate.name).status == "成功"
+
+
+async def test_repair_routes_legacy_failed_download_without_regenerating(
+    tmp_path: Path,
+) -> None:
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_download")
+    flow = FakeRepairFlow()
+    engine, _, _ = make_engine(tmp_path, flow)
+
+    engine.start_repair(
+        account,
+        [(song, "失败", "下载歌曲失败: 未找到可下载的导出歌曲")],
+        day="2026-09-17",
+    )
+    await engine.wait()
+
+    assert flow.redownloaded == [("01_download", "下载失败")]
+    assert flow.regenerated == []
+    assert engine.current.status == "completed"
+
+
+async def test_repair_reports_manual_failures_without_retrying_them(
+    tmp_path: Path,
+) -> None:
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_description")
+    flow = FakeRepairFlow()
+    engine, _, browser = make_engine(tmp_path, flow)
+
+    engine.start_repair(
+        account,
+        [(song, "描述不符合", "请先修改平台不接受的歌曲描述")],
+        day="2026-09-17",
+    )
+    await engine.wait()
+
+    assert flow.redownloaded == []
+    assert flow.regenerated == []
+    assert browser.entered == browser.exited == 0
+    assert engine.current.status == "failed"
+    assert engine.current.songs[0].current_step == "manual_required"
 
 
 async def test_parse_failure_continues_without_browser_call(tmp_path: Path) -> None:
@@ -363,23 +587,68 @@ async def test_upload_manifest_records_only_platform_confirmed_songs(tmp_path: P
     assert rejected[0]["title"] == "第二首"
     assert engine.current_upload["status"] == "completed"
     assert engine.current_upload["uploaded_paths"] == [str(first.resolve())]
+    history = json.loads(
+        (tmp_path / "output" / "2026-09-17" / ".upload-history.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert history == [str(first.resolve())]
+
+
+@pytest.mark.asyncio
+async def test_upload_stops_when_daily_limit_is_already_used(tmp_path: Path) -> None:
+    class UnexpectedUploadFlow:
+        async def upload_album(self, items, on_step, on_verification_requested):
+            raise AssertionError("upload should not start")
+
+    class UnexpectedUploadBrowser:
+        async def __aenter__(self):
+            return UnexpectedUploadFlow()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    account = make_account(tmp_path)
+    day = "2026-09-17"
+    output = tmp_path / "output" / day
+    output.mkdir(parents=True)
+    (output / ".uploaded.json").write_text(
+        json.dumps(
+            [str((output / f"old-{index:02d}.mp3").resolve()) for index in range(10)]
+        ),
+        encoding="utf-8",
+    )
+    engine = TaskEngine(
+        state_repository=RunStateRepository(tmp_path / "state.json"),
+        event_bus=EventBus(),
+        settings=ConsoleSettings(),
+        browser_factory=lambda account, settings: UnexpectedUploadBrowser(),
+        poll_interval=0.01,
+    )
+
+    engine.start_upload(
+        account,
+        [{"title": "第一首", "path": str(output / "第一首.mp3")}],
+        day,
+    )
+    await engine.wait_upload()
+
+    assert engine.current_upload["status"] == "failed"
+    assert "每日上传上限已用完" in engine.current_upload["error"]
 
 
 @pytest.mark.asyncio
 async def test_upload_replaces_noncompliant_song_with_alternate_version(tmp_path: Path) -> None:
-    class FirstUploadFlow:
+    class ReplacementFlow:
         async def upload_album(self, items, on_step, on_verification_requested):
-            return [items[0]]
+            if len(items) == 2:
+                return [items[0]]
+            return items
 
-    class AlternateFlow:
         async def export_alternate_version(self, song_name, lyrics):
             output = tmp_path / "output" / "2026-09-17" / f"{song_name}.mp3"
             output.write_bytes(b"second-version")
             return output
-
-    class SecondUploadFlow:
-        async def upload_album(self, items, on_step, on_verification_requested):
-            return items
 
     class SequenceBrowser:
         def __init__(self, flow):
@@ -391,12 +660,13 @@ async def test_upload_replaces_noncompliant_song_with_alternate_version(tmp_path
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-    flows = [FirstUploadFlow(), AlternateFlow(), SecondUploadFlow()]
-    calls = iter(range(3))
+    flow = ReplacementFlow()
+    sessions = []
 
     def factory(account, settings):
-        next(calls)
-        return SequenceBrowser(flows.pop(0))
+        browser = SequenceBrowser(flow)
+        sessions.append(browser)
+        return browser
 
     account = make_account(tmp_path)
     first = tmp_path / "output" / "2026-09-17" / "第一首.mp3"
@@ -432,6 +702,79 @@ async def test_upload_replaces_noncompliant_song_with_alternate_version(tmp_path
     assert set(manifest) == {str(first.resolve()), str(second.resolve())}
     assert second.read_bytes() == b"second-version"
     assert not (second.parent / "不及格").exists()
+    assert len(sessions) == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_reports_failed_alternate_reupload_as_partial_failure(
+    tmp_path: Path,
+) -> None:
+    class FirstUploadFlow:
+        async def upload_album(self, items, on_step, on_verification_requested):
+            return [items[0]]
+
+    class ReplacementFlow:
+        async def export_alternate_version(self, song_name, lyrics):
+            output = tmp_path / "output" / "2026-09-17" / f"{song_name}.mp3"
+            output.write_bytes(b"second-version")
+            return output
+
+        async def upload_album(self, items, on_step, on_verification_requested):
+            return []
+
+    class SequenceBrowser:
+        def __init__(self, flow):
+            self.flow = flow
+
+        async def __aenter__(self):
+            return self.flow
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    flows = [FirstUploadFlow(), ReplacementFlow()]
+    calls = iter(range(2))
+
+    def factory(account, settings):
+        next(calls)
+        return SequenceBrowser(flows.pop(0))
+
+    account = make_account(tmp_path)
+    first = tmp_path / "output" / "2026-09-17" / "第一首.mp3"
+    second = tmp_path / "output" / "2026-09-17" / "第二首.mp3"
+    first.parent.mkdir(parents=True)
+    first.write_bytes(b"first-version")
+    second.write_bytes(b"rejected-first-version")
+    engine = TaskEngine(
+        state_repository=RunStateRepository(tmp_path / "state.json"),
+        event_bus=EventBus(),
+        settings=ConsoleSettings(),
+        browser_factory=factory,
+        poll_interval=0.01,
+    )
+
+    engine.start_upload(
+        account,
+        [
+            {"title": "第一首", "path": str(first), "lyrics": "第一首歌词"},
+            {"title": "第二首", "path": str(second), "lyrics": "第二首歌词"},
+        ],
+        "2026-09-17",
+        auto_replace_noncompliant=True,
+    )
+    await engine.wait_upload()
+
+    manifest = json.loads(
+        (tmp_path / "output" / "2026-09-17" / ".uploaded.json").read_text(encoding="utf-8")
+    )
+    assert manifest == [str(first.resolve())]
+    assert engine.current_upload["status"] == "partial_failed"
+    assert engine.current_upload["step"] == "replace_noncompliant_failed"
+    assert engine.current_upload["uploaded_paths"] == [str(first.resolve())]
+    assert engine.current_upload["rejected_titles"] == ["第二首"]
+    assert engine.current_upload["replaced_titles"] == []
+    assert engine.current_upload["unreplaced_titles"] == ["第二首"]
+    assert "第二版本未发布成功" in engine.current_upload["error"]
 
 
 @pytest.mark.asyncio
@@ -518,8 +861,8 @@ async def test_regeneration_upload_uploads_successful_songs_when_one_fails(
                 return [
                     BatchSongResult(
                         song_name=lyric_data_list[0].song_name,
-                        status="title_unmatched",
-                        error="生成失败",
+                        status="lyric_unmatched",
+                        error="歌曲详情歌词与本地歌词不匹配",
                     ),
                 ]
             output.write_bytes(b"regenerated-first")
@@ -531,8 +874,8 @@ async def test_regeneration_upload_uploads_successful_songs_when_one_fails(
                 ),
                 BatchSongResult(
                     song_name=lyric_data_list[1].song_name,
-                    status="title_unmatched",
-                    error="生成失败",
+                    status="lyric_unmatched",
+                    error="歌曲详情歌词与本地歌词不匹配",
                 ),
             ]
 
@@ -608,6 +951,29 @@ async def test_retryable_failure_respects_max_retries(tmp_path: Path) -> None:
     assert record.error == "页面操作失败"
 
 
+async def test_download_failure_does_not_retry_generation(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_song")
+    flow = FakeFlow()
+
+    async def fail_download(lyric_data, on_step):
+        flow.processed.append(lyric_data.song_name)
+        on_step("download_song")
+        raise SongDownloadError("下载菜单超时")
+
+    flow.process_song = fail_download
+    engine, state, _ = make_engine(tmp_path, flow)
+
+    engine.start(account, [song], day="2026-09-17")
+    await engine.wait()
+
+    assert flow.processed == ["01_song"]
+    record = state.get("2026-09-17", "账号01", "01_song.md")
+    assert record.status == "下载失败"
+    assert record.attempts == 1
+    assert "下载菜单超时" in record.error
+
+
 async def test_generation_limit_stops_whole_run(tmp_path: Path) -> None:
     account = make_account(tmp_path)
     songs = [make_song(account.lyric_dir, "01_first"), make_song(account.lyric_dir, "02_second")]
@@ -657,7 +1023,7 @@ async def test_song_verification_failure_stops_whole_run(tmp_path: Path) -> None
 
     assert len(flow.processed) == 0
     assert engine.current.status == "verification_failed"
-    assert state.get("2026-09-17", "账号01", "01_first.md").status == "标题校验失败"
+    assert state.get("2026-09-17", "账号01", "01_first.md").status == "歌词校验失败"
     assert state.get("2026-09-17", "账号01", "01_first.md").attempts == 1
     assert state.get("2026-09-17", "账号01", "02_second.md") is None
 
@@ -750,6 +1116,24 @@ async def test_completed_songs_are_skipped_unless_fresh(tmp_path: Path) -> None:
     engine2.start(account, songs, day="2026-09-17", fresh_run=True)
     await engine2.wait()
     assert flow2.processed == ["01_done", "02_todo"]
+
+
+async def test_fresh_batch_run_disables_existing_asset_recovery(tmp_path: Path) -> None:
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_song")
+    flow = FakeBatchFlow()
+    flow.force_new_generation = False
+    flow.results = [[BatchSongResult(
+        song_name="01_song",
+        status="success",
+        output_path=str(tmp_path / "01_song.mp3"),
+    )]]
+    engine, _, _ = make_engine(tmp_path, flow)
+
+    engine.start(account, [song], day="2026-09-17", fresh_run=True)
+    await engine.wait()
+
+    assert flow.force_new_generation is True
 
 
 async def test_conflict_and_unexpected_error_do_not_deadlock(tmp_path: Path) -> None:

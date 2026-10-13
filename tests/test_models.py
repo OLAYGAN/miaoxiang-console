@@ -16,7 +16,7 @@ def test_account_config_applies_stable_defaults() -> None:
     )
 
     assert account.model_name == "自动"
-    assert account.singer_name == "老岩"
+    assert account.singer_name == ""
     assert account.max_retries == 3
     assert account.song_interval_seconds == 5
     assert account.chrome_debug_port == 9222
@@ -52,6 +52,23 @@ def test_account_config_accepts_platform_models() -> None:
     }
 
     assert models == expected_models
+
+
+def test_account_config_clears_singer_for_non_sway_models() -> None:
+    base = {
+        "account_name": "账号01",
+        "chrome_profile_dir": "chrome/accounts/account-01",
+        "lyric_dir": "lyrics",
+        "output_dir": "output",
+        "download_dir": "downloads",
+        "singer_name": "老岩",
+    }
+
+    mini_max = AccountConfig(**base, model_name="MiniMax v2.6")
+    sway = AccountConfig(**base, model_name="Sway v5.5")
+
+    assert mini_max.singer_name == ""
+    assert sway.singer_name == "老岩"
 
 
 def test_account_config_rejects_unknown_platform_model() -> None:

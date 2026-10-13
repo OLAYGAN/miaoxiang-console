@@ -89,6 +89,26 @@ async def test_wait_for_cdp_returns_version() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cdp_availability_does_not_require_launching_chrome(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    session = ChromeSession(make_account(tmp_path), ConsoleSettings())
+
+    async def available(**kwargs) -> dict:
+        return {"Browser": "Chrome/1"}
+
+    monkeypatch.setattr("backend.browser.wait_for_cdp", available)
+    assert await session._cdp_available() is True
+
+    async def unavailable(**kwargs) -> dict:
+        raise BrowserFlowError("not ready")
+
+    monkeypatch.setattr("backend.browser.wait_for_cdp", unavailable)
+    assert await session._cdp_available() is False
+
+
+@pytest.mark.asyncio
 async def test_chrome_session_cleanup_is_idempotent(tmp_path: Path) -> None:
     account = make_account(tmp_path)
     session = ChromeSession(account, ConsoleSettings())

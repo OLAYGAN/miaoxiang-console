@@ -1,5 +1,5 @@
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
 
 import asyncio
 import pytest
@@ -9,6 +9,8 @@ import re
 from backend.errors import (
     BrowserFlowError,
     GenerationLimitError,
+    SongDownloadError,
+    SongExportError,
     SongGenerationFailureError,
     SongVerificationError,
 )
@@ -18,9 +20,11 @@ from backend.page_flow import (
         PageFlow,
         _detail_song_name,
         _lyric_probe,
+        _lyrics_match,
         _normalize_generated_detail,
         archive_download,
         clear_and_type,
+        dom_click,
         is_login_challenge,
         refresh_asset_tabs,
         select_model,
@@ -108,6 +112,10 @@ class FakeLocator:
     def first(self) -> "FakeLocator":
         return self
 
+    @property
+    def last(self) -> "FakeLocator":
+        return self
+
     async def input_value(self) -> str:
         return self.text
 
@@ -186,17 +194,79 @@ class FakeAuthorizationLocator:
             self.page.link_count = 0
             self.page.alternative_count = 0
 
+    async def evaluate(self, script: str, value: object = None) -> None:
+        if self.mode == "link":
+            self.page.option_count = 1
+        if self.mode == "option":
+            self.page.link_count = 0
+            self.page.option_count = 0
+        if self.mode == "alternative":
+            self.page.link_count = 0
+            self.page.alternative_count = 0
+
+
+class FakeProducerSelectionLocator:
+    def __init__(self, field: "FakeProducerFieldLocator") -> None:
+        self.field = field
+
+    async def count(self) -> int:
+        return int(self.field.selected)
+
+
+class FakeProducerButtonLocator:
+    def __init__(self, field: "FakeProducerFieldLocator") -> None:
+        self.field = field
+
+    @property
+    def first(self) -> "FakeProducerButtonLocator":
+        return self
+
+    def filter(self, **kwargs) -> "FakeProducerButtonLocator":
+        return self
+
+    async def count(self) -> int:
+        return 1
+
+    async def evaluate(self, script: str, value: object = None) -> None:
+        self.field.selected = True
+
+
+class FakeProducerFieldLocator:
+    def __init__(self) -> None:
+        self.selected = False
+
+    def locator(self, selector: str) -> object:
+        if selector == ".douyin-music-tag-group":
+            return FakeProducerSelectionLocator(self)
+        if selector == "button":
+            return FakeProducerButtonLocator(self)
+        raise AssertionError(f"Unexpected producer selector: {selector}")
+
+
+class FakeProducerFieldsLocator:
+    def __init__(self, fields: list[FakeProducerFieldLocator]) -> None:
+        self.fields = fields
+
+    async def count(self) -> int:
+        return len(self.fields)
+
+    def nth(self, index: int) -> FakeProducerFieldLocator:
+        return self.fields[index]
+
 
 class FakeAuthorizationPage(FakePage):
     def __init__(self) -> None:
         super().__init__()
         self.names = ["tonyxx"]
         self.producer_count = 1
+        self.producer_field = FakeProducerFieldLocator()
         self.link_count = 1
         self.option_count = 0
         self.alternative_count = 0
 
     def locator(self, selector: str) -> FakeAuthorizationLocator:
+        if "producerArtists" in selector:
+            return FakeProducerFieldsLocator([self.producer_field])
         if selector.startswith("input[placeholder"):
             mode = "name"
         elif selector.startswith(".douyin-music-select:visible"):
@@ -223,14 +293,39 @@ def _completed_future() -> object:
 
 
 @pytest.mark.asyncio
-async def test_trusted_click_moves_hovers_and_clicks_center() -> None:
+async def test_trusted_click_uses_playwright_element_mouse_click() -> None:
     page = FakePage()
     locator = FakeLocator()
 
     await trusted_click(page, locator, "生成按钮", hover_ms=10)
 
-    assert locator.calls == ["scroll"]
-    assert page.mouse.calls == [("move", 120.0, 210.0), ("click", 120.0, 210.0)]
+    assert locator.calls == ["scroll", "click"]
+    assert page.mouse.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dom_click_uses_element_click_for_moving_upload_controls() -> None:
+    class MovingLocator(FakeLocator):
+        def __init__(self) -> None:
+            super().__init__("智能封面")
+            self.dom_clicked = False
+
+        async def click(self, **kwargs) -> None:
+            raise AssertionError("moving control should not use mouse click")
+
+        async def evaluate(
+            self,
+            script: str,
+            value: object = None,
+        ) -> None:
+            assert "element.click()" in script
+            self.dom_clicked = True
+
+    locator = MovingLocator()
+
+    await dom_click(locator, "智能封面")
+
+    assert locator.dom_clicked is True
 
 
 @pytest.mark.asyncio
@@ -316,6 +411,80 @@ async def test_upload_hidden_control_is_written_through_input_events(
 
 
 @pytest.mark.asyncio
+async def test_upload_visible_control_fills_without_clicking(
+    tmp_path: Path,
+) -> None:
+    flow = PageFlow(
+        page=FakePage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    locator = FakeLocator()
+
+    await flow._fill_upload_control(locator, "专辑名称")
+
+    assert ("fill", "专辑名称") in locator.calls
+    assert "click" not in locator.calls
+
+
+@pytest.mark.asyncio
+async def test_use_smart_cover_waits_for_enabled_control(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class CoverControl:
+        def __init__(self) -> None:
+            self.wait_states: list[tuple[str, int]] = []
+            self.filled: list[str] = []
+
+        def filter(self, **kwargs) -> "CoverControl":
+            return self
+
+        @property
+        def first(self) -> "CoverControl":
+            return self
+
+        async def count(self) -> int:
+            return 0
+
+        async def wait_for(self, state: str, timeout: int = 0) -> None:
+            self.wait_states.append((state, timeout))
+
+        async def is_enabled(self) -> bool:
+            return True
+
+        async def fill(self, value: str) -> None:
+            self.filled.append(value)
+
+    control = CoverControl()
+
+    class CoverPage(FakePage):
+        def locator(self, selector: str) -> CoverControl:
+            return control
+
+    async def click(locator, description: str) -> None:
+        return None
+
+    async def cover_ready(**kwargs) -> bool:
+        return True
+
+    flow = PageFlow(
+        page=CoverPage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    monkeypatch.setattr(page_flow_module, "dom_click", click)
+    monkeypatch.setattr(flow, "_wait_for_album_cover", cover_ready)
+
+    await flow._use_smart_cover("校园、灯光")
+
+    assert ("visible", 120000) in control.wait_states
+    assert control.filled == ["校园、灯光"]
+
+
+@pytest.mark.asyncio
 async def test_fill_upload_song_adds_next_song_without_waiting(
     tmp_path: Path,
     monkeypatch,
@@ -347,6 +516,106 @@ async def test_fill_upload_song_adds_next_song_without_waiting(
 
 
 @pytest.mark.asyncio
+async def test_upload_local_cover_targets_album_field(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class CoverUploadPage(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.selectors: list[str] = []
+            self.locator_object = FakeLocator()
+
+        def locator(self, selector: str) -> FakeLocator:
+            self.selectors.append(selector)
+            return self.locator_object
+
+    page = CoverUploadPage()
+    flow = PageFlow(
+        page=page,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    async def cover_ready(**kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(flow, "_wait_for_album_cover", cover_ready)
+    cover = tmp_path / "cover.jpg"
+    cover.write_bytes(b"cover")
+
+    await flow._upload_local_cover(str(cover))
+
+    assert page.selectors == [
+        'div[x-field-id="album[_coverValue]"] '
+        'input.douyin-music-upload-hidden-input',
+        '.douyin-music-modal-content',
+    ]
+    assert page.locator_object.calls == [
+        ("set_input_files", str(cover)),
+        "filter",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fill_upload_song_selects_original_without_scrolling(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class MovingOriginalLocator(FakeLocator):
+        def __init__(self) -> None:
+            super().__init__("原创")
+            self.dom_clicked = False
+
+        async def scroll_into_view_if_needed(self, timeout: int = 0) -> None:
+            raise RuntimeError("element is not stable")
+
+        async def evaluate(
+            self,
+            script: str,
+            value: object = None,
+        ) -> None:
+            assert "element.click()" in script
+            self.dom_clicked = True
+
+    class MovingUploadPage(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.original = MovingOriginalLocator()
+
+        def locator(self, selector: str) -> FakeLocator:
+            if "originalType" in selector:
+                return self.original
+            return FakeLocator()
+
+    page = MovingUploadPage()
+    flow = PageFlow(
+        page=page,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    async def add_next(index: int) -> None:
+        return None
+
+    monkeypatch.setattr(flow, "_add_next_upload_song", add_next)
+
+    await flow._fill_upload_song(
+        {
+            "title": "第七首",
+            "lyrics": "歌词",
+            "path": str(tmp_path / "第七首.mp3"),
+        },
+        6,
+        is_last=False,
+    )
+
+    assert page.original.dom_clicked is True
+
+
+@pytest.mark.asyncio
 async def test_fill_authorization_uses_generic_no_link_options(
     tmp_path: Path,
     monkeypatch,
@@ -358,21 +627,12 @@ async def test_fill_authorization_uses_generic_no_link_options(
         settings=ConsoleSettings(),
         screenshot_dir=tmp_path,
     )
-    clicks: list[str] = []
-
-    async def fake_click(page, locator, description, **kwargs):
-        clicks.append(description)
-        if description == "切换无主页链接":
-            page.option_count = 1
-
-    monkeypatch.setattr(page_flow_module, "trusted_click", fake_click)
 
     await flow._fill_authorization("甘斯敏")
 
     assert page.names == ["甘斯敏"]
-    assert page.producer_count == 0
+    assert page.producer_field.selected is True
     assert page.link_count == 0
-    assert clicks == ["切换无主页链接"]
 
 
 @pytest.mark.asyncio
@@ -387,21 +647,12 @@ async def test_fill_authorization_skips_name_when_real_name_is_blank(
         settings=ConsoleSettings(),
         screenshot_dir=tmp_path,
     )
-    clicks: list[str] = []
-
-    async def fake_click(page, locator, description, **kwargs):
-        clicks.append(description)
-        if description == "切换无主页链接":
-            page.option_count = 1
-
-    monkeypatch.setattr(page_flow_module, "trusted_click", fake_click)
 
     await flow._fill_authorization("")
 
     assert page.names == ["tonyxx"]
-    assert page.producer_count == 0
+    assert page.producer_field.selected is True
     assert page.link_count == 0
-    assert clicks == ["切换无主页链接"]
 
 
 @pytest.mark.asyncio
@@ -425,8 +676,89 @@ async def test_fill_authorization_accepts_platform_info_without_homepage_link(
 
     await flow._fill_authorization("龙英")
 
+    assert page.producer_field.selected is True
     assert page.link_count == 0
     assert page.alternative_count == 0
+
+
+@pytest.mark.asyncio
+async def test_add_self_to_upload_producers_clicks_and_verifies_each_song(
+    tmp_path: Path,
+) -> None:
+    fields = [FakeProducerFieldLocator() for _ in range(3)]
+
+    class ProducerPage(FakePage):
+        def locator(self, selector: str) -> object:
+            if "producerArtists" not in selector:
+                raise AssertionError(f"Unexpected selector: {selector}")
+            return FakeProducerFieldsLocator(fields)
+
+    flow = PageFlow(
+        page=ProducerPage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    await flow._add_self_to_upload_producers(expected_songs=3)
+
+    assert [field.selected for field in fields] == [True, True, True]
+
+
+@pytest.mark.asyncio
+async def test_wait_upload_audio_ready_waits_for_cover_upload(
+    tmp_path: Path,
+) -> None:
+    bodies = ["请等待封面上传完成", "", "", "", "", ""]
+
+    class UploadWaitPage(FakePage):
+        async def inner_text(self, selector: str = "body") -> str:
+            return bodies.pop(0)
+
+    flow = PageFlow(
+        page=UploadWaitPage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    await flow._wait_upload_audio_ready()
+
+    assert bodies == []
+
+
+@pytest.mark.asyncio
+async def test_find_sign_frame_accepts_empty_remote_frame_url(
+    tmp_path: Path,
+) -> None:
+    class BodyLocator:
+        async def inner_text(self, timeout: int = 0) -> str:
+            return "签约主体：甘斯敏 文件签署 签署"
+
+    class SignFrame:
+        url = ""
+
+        def locator(self, selector: str) -> BodyLocator:
+            assert selector == "body"
+            return BodyLocator()
+
+    class Page(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.main_frame = FakePage()
+            self.frames = [self.main_frame, SignFrame()]
+
+    page = Page()
+    flow = PageFlow(
+        page=page,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    frame = await flow._find_sign_frame()
+
+    assert frame is page.frames[1]
 
 
 @pytest.mark.asyncio
@@ -476,11 +808,13 @@ async def test_upload_album_waits_for_all_files_after_album_info(
         lambda: _completed_future(),
     )
 
-    assert calls.index("fill-song:2") < calls.index("cover")
-    assert calls.index("cover") < calls.index("wait-all")
+    assert calls.index("fill-song:2") < calls.index("wait-all")
+    assert calls.index("wait-all") < calls.index("cover")
     assert calls.index("wait-all") < calls.index("remove")
     assert calls.index("remove") < calls.index("click:专辑下一步")
-    assert calls.count("wait-all") == 1
+    cover_index = calls.index("cover")
+    assert calls.count("wait-all") == 3
+    assert calls.index("wait-all", cover_index + 1) < calls.index("remove")
 
 
 @pytest.mark.asyncio
@@ -652,6 +986,9 @@ async def test_enter_editor_refreshes_assets_and_retries_transient_card(
             super().__init__()
             self.url = "https://music.douyin.com/studio/create"
 
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator("编辑器")
+
         def get_by_text(self, text: str, exact: bool = False) -> FakeLocator:
             return FakeLocator(text)
 
@@ -675,14 +1012,189 @@ async def test_enter_editor_refreshes_assets_and_retries_transient_card(
     async def click(page, locator, description, **kwargs) -> None:
         page.url = "https://music.douyin.com/playground/editor"
 
+    async def wait_for_editor_ready(song_name: str) -> None:
+        return None
+
     monkeypatch.setattr(flow, "_visible_asset_card", visible_asset_card)
     monkeypatch.setattr(page_flow_module, "refresh_asset_tabs", refresh)
     monkeypatch.setattr(page_flow_module, "trusted_click", click)
+    monkeypatch.setattr(flow, "_wait_for_editor_ready", wait_for_editor_ready)
 
     await flow.enter_editor("闹钟响三遍")
 
     assert len(refreshes) == 1
     assert card.hovered == 1
+
+
+@pytest.mark.asyncio
+async def test_enter_editor_switches_to_new_editor_tab(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class Card:
+        async def scroll_into_view_if_needed(self, timeout: int = 0) -> None:
+            return None
+
+        async def hover(self, timeout: int = 0) -> None:
+            return None
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator("编辑")
+
+    class SourcePage(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.url = "https://music.douyin.com/studio/create"
+            self.closed = False
+            self.context.pages = [self]
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator("编辑器")
+
+        def get_by_text(self, text: str, exact: bool = False) -> FakeLocator:
+            return FakeLocator(text)
+
+    source = SourcePage()
+    editor = FakePage()
+    editor.url = "about:blank"
+    flow = PageFlow(
+        page=source,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(editor_import_wait_seconds=1),
+        screenshot_dir=tmp_path,
+    )
+
+    async def visible_asset_card(song_name: str):
+        return Card()
+
+    async def click(page, locator, description, **kwargs) -> None:
+        if description == "编辑器菜单":
+            source.context.pages.append(editor)
+            editor.url = "https://music.douyin.com/studio/playground"
+
+    async def wait_for_editor_ready(song_name: str) -> None:
+        assert flow.page is editor
+
+    monkeypatch.setattr(flow, "_visible_asset_card", visible_asset_card)
+    monkeypatch.setattr(page_flow_module, "trusted_click", click)
+    monkeypatch.setattr(flow, "_wait_for_editor_ready", wait_for_editor_ready)
+
+    await flow.enter_editor("闹钟响三遍")
+
+    assert flow.page is editor
+    assert source.closed is False
+
+
+@pytest.mark.asyncio
+async def test_upload_recovers_when_editor_closed_current_tab(
+    tmp_path: Path,
+) -> None:
+    closed = FakePage()
+    replacement = FakePage()
+    replacement.url = "https://music.douyin.com/studio/assets"
+    closed.context.pages = [closed, replacement]
+    closed.is_closed = lambda: True
+    replacement.is_closed = lambda: False
+    flow = PageFlow(
+        page=closed,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    await flow._ensure_active_page()
+
+    assert flow.page is replacement
+
+
+@pytest.mark.asyncio
+async def test_upload_opens_publish_tab_without_closing_create_page(
+    tmp_path: Path,
+) -> None:
+    source = FakePage()
+    publish = FakePage()
+    source.context.pages = [source]
+
+    async def new_page():
+        publish.context = source.context
+        source.context.pages.append(publish)
+        return publish
+
+    source.context.new_page = new_page
+    flow = PageFlow(
+        page=source,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    await flow._open_publish_tab()
+
+    assert flow.page is publish
+    assert source in source.context.pages
+
+
+@pytest.mark.asyncio
+async def test_wait_for_editor_page_handles_still_open_source(
+    tmp_path: Path,
+) -> None:
+    class WaitingPage(FakePage):
+        async def wait_for_timeout(self, timeout: int) -> None:
+            self.wait_calls.append(timeout)
+            await asyncio.sleep(0.01)
+
+    page = WaitingPage()
+    page.url = "https://music.douyin.com/studio/create"
+    page.context.pages = [page]
+    flow = PageFlow(
+        page=page,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    result = await flow._wait_for_editor_page(
+        page.context,
+        page,
+        deadline=datetime.now().timestamp() + 0.2,
+    )
+
+    assert result is None
+    assert page.wait_calls
+    assert set(page.wait_calls) == {1000}
+
+
+@pytest.mark.asyncio
+async def test_wait_for_editor_ready_waits_until_import_finishes(
+    tmp_path: Path,
+) -> None:
+    class EditorPage(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.body_states = [
+                "正在添加素材到轨道 target-song",
+                "检测中 target-song",
+                "target-song",
+            ]
+
+        async def inner_text(self, selector: str = "body") -> str:
+            return self.body_states.pop(0)
+
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator("")
+
+    page = EditorPage()
+    flow = PageFlow(
+        page=page,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(editor_import_wait_seconds=1),
+        screenshot_dir=tmp_path,
+    )
+
+    await flow._wait_for_editor_ready("target-song")
+
+    assert page.body_states == []
+    assert page.wait_calls == [1000, 1000]
 
 
 def test_noncompliant_upload_song_detection() -> None:
@@ -698,6 +1210,73 @@ def test_noncompliant_upload_song_detection() -> None:
 
     assert flow._is_noncompliant_upload_song(rejected)
     assert not flow._is_noncompliant_upload_song(normal)
+
+
+@pytest.mark.asyncio
+async def test_remove_upload_song_dismisses_blocking_platform_modal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class ModalButtonLocator(FakeLocator):
+        def filter(self, **kwargs) -> "ModalButtonLocator":
+            return self
+
+        @property
+        def first(self) -> "ModalButtonLocator":
+            return self
+
+        async def count(self) -> int:
+            return 1
+
+    class BlockingModalLocator(FakeLocator):
+        def __init__(self) -> None:
+            super().__init__("部分歌曲检测未通过")
+            self.button = ModalButtonLocator("知道了")
+            self.wait_states: list[str] = []
+
+        def filter(self, **kwargs) -> "BlockingModalLocator":
+            return self
+
+        @property
+        def last(self) -> "BlockingModalLocator":
+            return self
+
+        async def count(self) -> int:
+            return 1
+
+        async def inner_text(self) -> str:
+            return self.text
+
+        def locator(self, selector: str) -> ModalButtonLocator:
+            return self.button
+
+        async def wait_for(self, state: str, timeout: int = 0) -> None:
+            self.wait_states.append(state)
+
+    modal = BlockingModalLocator()
+    clicks: list[str] = []
+
+    class ModalPage(FakePage):
+        def locator(self, selector: str) -> object:
+            if selector.startswith(".douyin-music-modal-content"):
+                return modal
+            return FakeLocator("")
+
+    async def click(locator, description: str) -> None:
+        clicks.append(description)
+
+    flow = PageFlow(
+        page=ModalPage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    monkeypatch.setattr(page_flow_module, "dom_click", click)
+
+    await flow._dismiss_blocking_upload_modal()
+
+    assert clicks == ["关闭上传提示弹窗"]
+    assert modal.wait_states == ["hidden"]
 
 
 @pytest.mark.asyncio
@@ -739,7 +1318,7 @@ async def test_remove_noncompliant_upload_songs_removes_rejected_cards_in_revers
 
 
 @pytest.mark.asyncio
-async def test_classify_generated_cards_matches_detail_song_name(
+async def test_classify_generated_cards_matches_detail_lyrics(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -762,7 +1341,7 @@ async def test_classify_generated_cards_matches_detail_song_name(
 
     async def read_detail(card_index: int) -> str:
         assert card_index == 0
-        return "歌曲详情\n歌词\n歌名：《本地歌名》\n[Chorus 1]\n风 把 灯光 吹成 一 条 街"
+        return "歌名：《平台随机标题》\n风 把 灯光 吹成 一 条 街\n我们 把 昨天 放进 口袋"
 
     monkeypatch.setattr(flow, "_read_song_detail_for_card", read_detail)
 
@@ -772,6 +1351,85 @@ async def test_classify_generated_cards_matches_detail_song_name(
     )
 
     assert matches["本地歌名"][0].generated_title == "平台随机标题"
+
+
+@pytest.mark.asyncio
+async def test_read_song_detail_prefers_isolated_lyrics_section(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+
+    class DetailLocator(FakeLocator):
+        def nth(self, index: int) -> "DetailLocator":
+            return self
+
+        def locator(self, selector: str) -> "DetailLocator":
+            assert selector == '[class*="title"]'
+            return self
+
+    class DetailPage(FakePage):
+        def locator(self, selector: str):
+            if "[class*=\"libraryItemWrapper\"]" in selector:
+                return DetailLocator()
+            raise AssertionError(f"Unexpected detail fallback selector: {selector}")
+
+    flow = PageFlow(
+        page=DetailPage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    async def read_lyrics(page):
+        return "[Verse 1]\n戒指从我指缝滚进下水道\n我趴在地上找"
+
+    async def close_detail():
+        return None
+
+    monkeypatch.setattr(
+        page_flow_module,
+        "_read_visible_lyric_detail",
+        read_lyrics,
+    )
+    monkeypatch.setattr(flow, "_close_song_detail", close_detail)
+
+    detail = await flow._read_song_detail_for_card(0)
+
+    assert detail == "[Verse 1]\n戒指从我指缝滚进下水道\n我趴在地上找"
+
+
+@pytest.mark.asyncio
+async def test_classify_generated_cards_rejects_same_title_with_different_lyrics(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+
+    flow = PageFlow(
+        page=FakePage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    lyric = LyricData(
+        song_name="本地歌名",
+        lyrics="[Chorus 1]\n风 把 灯光 吹成 一 条 街\n我们 把 昨天 放进 口袋",
+        style="s" * 60,
+    )
+
+    async def read_detail(card_index: int) -> str:
+        assert card_index == 0
+        return "歌名：《本地歌名》\n完全不同的另一段歌词内容\n与本地素材没有任何重叠"
+
+    monkeypatch.setattr(flow, "_read_song_detail_for_card", read_detail)
+
+    matches = await flow.classify_generated_cards(
+        [{"title": "平台随机标题", "index": 0, "loading": False}],
+        [lyric],
+    )
+
+    assert matches["本地歌名"] == []
 
 
 @pytest.mark.asyncio
@@ -801,8 +1459,8 @@ async def test_export_alternate_version_skips_exported_card(
 
     async def read_detail(card_index: int) -> str:
         if card_index == 1:
-            return "歌词\n歌名：《本地歌名》\n[Chorus 1]\n风"
-        return "歌词\n歌名：《其它歌曲》\n[Chorus 1]\n风"
+            return "歌词\n风 把 灯光 吹成 一 条 街"
+        return "歌词\n完全不同的另一段歌词内容"
 
     async def export_candidate(candidate, lyric_data):
         selected.append(candidate)
@@ -820,6 +1478,261 @@ async def test_export_alternate_version_skips_exported_card(
     assert len(selected) == 1
     assert selected[0].generated_title == "第二版随机标题"
     assert selected[0].card_index == 1
+
+
+@pytest.mark.asyncio
+async def test_find_first_generated_candidate_uses_first_displayed_lyric_match(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+
+    flow = PageFlow(
+        page=FakePage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    lyric = LyricData(
+        song_name="戒指滚远了",
+        lyrics="[Verse 1]\n戒指从我指缝滚进下水道\n我趴在地上找",
+        style="s" * 60,
+    )
+
+    async def asset_states():
+        return [
+            {"index": 0, "title": "别回头找了", "loading": False},
+            {"index": 1, "title": "戒指滚远了", "loading": False},
+        ]
+
+    async def read_detail(card_index: int) -> str:
+        if card_index == 0:
+            return "歌词\n完全不同的另一段歌词内容"
+        return (
+            "歌名：《戒指滚远了》\n"
+            "[Verse 1]\n戒指从我指缝滚进下水道\n我趴在地上找"
+        )
+
+    monkeypatch.setattr(flow, "asset_card_states", asset_states)
+    monkeypatch.setattr(flow, "_read_song_detail_for_card", read_detail)
+
+    candidate = await flow.find_first_generated_candidate(lyric)
+
+    assert candidate is not None
+    assert candidate.generated_title == "戒指滚远了"
+    assert candidate.card_index == 1
+
+
+@pytest.mark.asyncio
+async def test_redownload_song_exports_first_match_without_generating(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+    from backend.models import GeneratedCandidate
+
+    flow = PageFlow(
+        page=FakePage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    lyric = LyricData(
+        song_name="戒指滚远了",
+        lyrics="[Verse 1]\n戒指从我指缝滚进下水道\n我趴在地上找",
+        style="s" * 60,
+    )
+    steps: list[str] = []
+    selected: list[GeneratedCandidate] = []
+
+    async def ensure_ready(): return None
+    async def refresh_tabs(page): return None
+
+    async def no_exported(*args, **kwargs):
+        raise BrowserFlowError("未找到可下载的导出歌曲")
+
+    async def find_candidate(lyric_data):
+        return GeneratedCandidate(
+            song_name=lyric_data.song_name,
+            generated_title="戒指滚远了",
+            card_index=1,
+        )
+
+    async def export_candidate(candidate, lyric_data):
+        selected.append(candidate)
+        return tmp_path / f"{lyric_data.song_name}.mp3"
+
+    monkeypatch.setattr(flow, "ensure_create_page_ready", ensure_ready)
+    monkeypatch.setattr("backend.page_flow.refresh_asset_tabs", refresh_tabs)
+    monkeypatch.setattr("backend.page_flow.find_exported_download_card", no_exported)
+    monkeypatch.setattr(flow, "find_first_generated_candidate", find_candidate)
+    monkeypatch.setattr(flow, "export_candidate", export_candidate)
+
+    result = await flow.redownload_song(lyric, steps.append)
+
+    assert result == tmp_path / "戒指滚远了.mp3"
+    assert selected[0].card_index == 1
+    assert steps == [
+        "open_assets",
+        "find_exported_download",
+        "match_lyrics",
+        "export_song",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_redownload_song_export_failure_skips_existing_download(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+    from backend.models import GeneratedCandidate
+
+    flow = PageFlow(
+        page=FakePage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    lyric = LyricData(
+        song_name="戒指滚远了",
+        lyrics="[Verse 1]\n戒指从我指缝滚进下水道\n我趴在地上找",
+        style="s" * 60,
+    )
+    steps: list[str] = []
+    selected: list[GeneratedCandidate] = []
+
+    async def ensure_ready(): return None
+    async def refresh_tabs(page): return None
+
+    async def find_candidate(lyric_data):
+        return GeneratedCandidate(
+            song_name=lyric_data.song_name,
+            generated_title="别回头找了",
+            card_index=0,
+        )
+
+    async def export_candidate(candidate, lyric_data):
+        selected.append(candidate)
+        return tmp_path / f"{lyric_data.song_name}.mp3"
+
+    monkeypatch.setattr(flow, "ensure_create_page_ready", ensure_ready)
+    monkeypatch.setattr("backend.page_flow.refresh_asset_tabs", refresh_tabs)
+    monkeypatch.setattr(flow, "find_first_generated_candidate", find_candidate)
+    monkeypatch.setattr(flow, "export_candidate", export_candidate)
+    flow.redownload_stage = "导出失败"
+
+    result = await flow.redownload_song(lyric, steps.append)
+
+    assert result == tmp_path / "戒指滚远了.mp3"
+    assert selected[0].card_index == 0
+    assert steps == ["open_assets", "match_lyrics", "export_song"]
+
+
+@pytest.mark.asyncio
+async def test_redownload_song_download_failure_directly_downloads_export(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+
+    flow = PageFlow(
+        page=FakePage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    lyric = LyricData(
+        song_name="戒指滚远了",
+        lyrics="[Verse 1]\n戒指从我指缝滚进下水道\n我趴在地上找",
+        style="s" * 60,
+    )
+    steps: list[str] = []
+    downloaded = tmp_path / "downloads" / "戒指滚远了.mp3"
+
+    async def ensure_ready(): return None
+    async def refresh_tabs(page): return None
+    async def find_exported(*args, **kwargs): return object()
+
+    async def download_song(song_name, lyrics=None):
+        assert song_name == lyric.song_name
+        assert lyrics == lyric.lyrics
+        return downloaded
+
+    def archive(source, output_dir, name, day):
+        return source
+
+    monkeypatch.setattr(flow, "ensure_create_page_ready", ensure_ready)
+    monkeypatch.setattr("backend.page_flow.refresh_asset_tabs", refresh_tabs)
+    monkeypatch.setattr(
+        "backend.page_flow.find_exported_download_card",
+        find_exported,
+    )
+    monkeypatch.setattr(flow, "download_song", download_song)
+    monkeypatch.setattr("backend.page_flow.archive_download", archive)
+    flow.redownload_stage = "下载失败"
+
+    result = await flow.redownload_song(lyric, steps.append)
+
+    assert result == downloaded
+    assert steps == ["open_assets", "find_exported_download", "download_song"]
+
+
+@pytest.mark.asyncio
+async def test_export_alternate_version_reuses_previously_exported_card(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+
+    flow = PageFlow(
+        page=FakePage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+        day="2026-09-17",
+    )
+    downloaded = tmp_path / "downloads" / "空椅子.mp3"
+
+    async def ensure_ready(): return None
+    async def refresh_tabs(page): return None
+    async def asset_states():
+        return [
+            {
+                "index": 0,
+                "title": "空椅子",
+                "source_tag": "编辑器导出",
+                "exported": True,
+                "loading": False,
+            },
+        ]
+
+    async def download_song(song_name, lyrics=None):
+        assert song_name == "空椅子"
+        assert lyrics == "风 把 灯光 吹成 一 条 街"
+        downloaded.parent.mkdir(parents=True)
+        downloaded.write_bytes(b"second-version")
+        return downloaded
+
+    def archive(source, output_dir, name, day):
+        assert output_dir == Path(flow.account.output_dir)
+        assert name == "空椅子"
+        assert day == "2026-09-17"
+        return source
+
+    monkeypatch.setattr(flow, "ensure_create_page_ready", ensure_ready)
+    monkeypatch.setattr("backend.page_flow.refresh_asset_tabs", refresh_tabs)
+    monkeypatch.setattr(flow, "asset_card_states", asset_states)
+    monkeypatch.setattr(flow, "download_song", download_song)
+    monkeypatch.setattr("backend.page_flow.archive_download", archive)
+
+    result = await flow.export_alternate_version(
+        "空椅子",
+        "风 把 灯光 吹成 一 条 街",
+    )
+
+    assert result.read_bytes() == b"second-version"
+    assert result == downloaded
 
 
 @pytest.mark.asyncio
@@ -857,8 +1770,8 @@ async def test_process_batch_marks_unmatched_titles_as_terminal_skip(
 
     assert len(results) == 1
     assert results[0].song_name == "第一首"
-    assert results[0].status == "title_unmatched"
-    assert results[0].error == "歌曲详情歌名与歌词歌名不匹配，已跳过"
+    assert results[0].status == "lyric_unmatched"
+    assert results[0].error == "歌曲详情歌词与本地歌词不匹配，已跳过"
 
 
 def test_archive_download_moves_file_and_overwrites_duplicate(
@@ -1253,6 +2166,54 @@ def test_detail_song_name_is_read_from_explicit_title_line() -> None:
     assert _detail_song_name(detail) == "一只耳机"
 
 
+def test_lyrics_match_uses_opening_anchor_with_interspersed_metadata() -> None:
+    expected = (
+        "[Verse 1]\n"
+        "戒指从我指缝滚进下水道\n"
+        "我趴在地上找 像还能捡回你的好\n"
+        "[Chorus]\n"
+        "戒指滚远了 就别回头找\n"
+        "下水道吞掉的是我最后的讨好"
+    )
+    actual = (
+        "模型：SeedMusic v1.0\n"
+        "戒指从我指缝滚进下水道\n"
+        "标签：伤感摇滚\n"
+        "我趴在地上找 像还能捡回你的好\n"
+        "戒指滚远了 就别回头找\n"
+        "下水道吞掉的是我最后的讨好"
+    )
+
+    assert _lyrics_match(actual, expected)
+
+
+def test_lyrics_match_rejects_same_opening_with_different_body() -> None:
+    expected = (
+        "戒指从我指缝滚进下水道\n"
+        "我趴在地上找 像还能捡回你的好\n"
+        "铁盖下面只有水声 没有你的外套\n"
+        "我忽然笑出来 原来结束不用预告"
+    )
+    actual = (
+        "戒指从我指缝滚进下水道\n"
+        "这个版本讲的是完全不同的故事\n"
+        "城市灯火把远方照得很明亮\n"
+        "我们沿着河岸一直走到天亮"
+    )
+
+    assert not _lyrics_match(actual, expected)
+
+
+def test_asset_card_selection_does_not_depend_on_viewport_geometry() -> None:
+    script = page_flow_module._ASSET_CARD_SELECTION_JS
+
+    assert "innerWidth" not in script
+    assert "0.45" not in script
+    assert "0.55" not in script
+    assert "libraryItemWrapper" in script
+    assert "generatedSongListItem" in script
+
+
 @pytest.mark.asyncio
 async def test_refresh_asset_tabs_switches_lyrics_and_back_to_songs() -> None:
     page = FakeAssetTabsPage()
@@ -1383,6 +2344,8 @@ class FakeDetailPage:
         self.read_counts = {"source_content": 0, "content": 0}
 
     def locator(self, selector: str):
+        if selector == '[aria-label="关闭详情"]':
+            return FakeDetailLocator("missing", self)
         if selector == '[class*="detailLyricsSection"]':
             return FakeDetailLocator("missing", self)
         if selector == '[class*="libraryItemWrapper"], [class*="generatedSongListItem"]':
@@ -1435,8 +2398,8 @@ class FakeDetailLocator:
 
 
 @pytest.mark.asyncio
-async def test_verify_generated_song_matches_asset_list_title() -> None:
-    page = FakeDetailPage("新课本")
+async def test_verify_generated_song_matches_detail_lyrics() -> None:
+    page = FakeDetailPage("平台模型可以改写这些歌词内容")
 
     await verify_generated_song(
         page,
@@ -1444,28 +2407,30 @@ async def test_verify_generated_song_matches_asset_list_title() -> None:
         song_name="新课本",
     )
 
-    assert page.calls == []
-    assert page.filter_calls == [{"visible": True}]
-    assert page.read_counts == {"source_content": 0, "content": 0}
+    assert page.calls == ["click-card", "wait"]
+    assert page.filter_calls
+    assert all(call == {"visible": True} for call in page.filter_calls)
+    assert page.read_counts == {"source_content": 0, "content": 1}
 
 
 @pytest.mark.asyncio
-async def test_verify_generated_song_without_title_remains_compatible() -> None:
+async def test_verify_generated_song_rejects_different_lyrics_without_title() -> None:
     page = FakeDetailPage("任意内容")
 
-    await verify_generated_song(
-        page,
-        "旧调用方未提供歌名时不打开详情",
-    )
+    with pytest.raises(SongVerificationError, match="生成结果歌词不匹配"):
+        await verify_generated_song(
+            page,
+            "旧调用方未提供歌名时仍按歌词校验",
+        )
 
-    assert page.calls == []
+    assert page.calls == ["click-card", "wait"]
 
 
 @pytest.mark.asyncio
-async def test_verify_generated_song_rejects_different_asset_title() -> None:
+async def test_verify_generated_song_rejects_different_detail_lyrics() -> None:
     page = FakeDetailPage("另一首歌")
 
-    with pytest.raises(SongVerificationError, match="生成结果名称不匹配"):
+    with pytest.raises(SongVerificationError, match="生成结果歌词不匹配"):
         await verify_generated_song(
             page,
             "平台模型可以改写这些歌词内容",
@@ -1628,11 +2593,81 @@ async def test_open_download_menu_uses_generated_card_trigger_and_menu_item() ->
     assert "filter-download-item" in page.calls
 
 
+@pytest.mark.asyncio
+async def test_download_song_uses_dom_click_and_rejects_empty_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class Download:
+        suggested_filename = "empty.mp3"
+
+        async def save_as(self, target: Path) -> None:
+            Path(target).write_bytes(b"")
+
+        async def failure(self) -> str:
+            return "network error"
+
+    class DownloadContext:
+        async def __aenter__(self) -> "DownloadContext":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        @property
+        async def value(self) -> Download:
+            return Download()
+
+    class Page(FakePage):
+        def expect_download(self, timeout: int = 0) -> DownloadContext:
+            return DownloadContext()
+
+    flow = PageFlow(
+        page=Page(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+        day="2026-10-01",
+    )
+    item = FakeLocator("下载")
+    clicks: list[str] = []
+
+    async def open_menu(page, song_name, lyrics=None):
+        return item
+
+    async def click(locator, description: str) -> None:
+        clicks.append(description)
+        await locator.click()
+
+    monkeypatch.setattr(page_flow_module, "open_download_menu", open_menu)
+    monkeypatch.setattr(page_flow_module, "dom_click", click)
+    flow._raise_with_screenshot = (
+        lambda step, error, **kwargs: _raise(error)
+    )
+
+    with pytest.raises(BrowserFlowError, match="下载文件为空"):
+        await flow.download_song("本地歌名")
+
+    assert clicks == ["下载菜单"]
+    assert not (tmp_path / "downloads" / "2026-10-01" / "empty.mp3").exists()
+
+
+async def _raise(error: Exception) -> None:
+    raise error
+
+
 class FakeExportCardLocator:
-    def __init__(self, name: str, text: str = "", children: dict[str, "FakeExportCardLocator"] | None = None):
+    def __init__(
+        self,
+        name: str,
+        text: str = "",
+        children: dict[str, "FakeExportCardLocator"] | None = None,
+        page=None,
+    ):
         self.name = name
         self.text = text
         self.children = children or {}
+        self.page = page
         self.clicked = False
 
     @property
@@ -1646,15 +2681,33 @@ class FakeExportCardLocator:
         return 1
 
     def locator(self, selector: str):
+        if (
+            self.page is not None
+            and selector == '[class*="title"]'
+            and selector in self.children
+        ):
+            child = self.children[selector]
+            if child.page is None:
+                child.page = self.page
+            return child
         if selector in self.children:
             return self.children[selector]
+        if selector == '[class*="sourceTag"]':
+            return FakeExportMissingLocator()
         raise AssertionError(f"unexpected selector from {self.name}: {selector}")
 
     async def inner_text(self) -> str:
+        if self.page is not None:
+            return self.page.field_text(self.name)
         return self.text
+
+    async def scroll_into_view_if_needed(self, **kwargs) -> None:
+        return None
 
     async def click(self, **kwargs) -> None:
         self.clicked = True
+        if self.page is not None:
+            self.page.opened_card = self.name
 
 
 class FakeExportCardsLocator:
@@ -1672,12 +2725,32 @@ class FakeExportCardsLocator:
 
 
 class FakeExportDetailPage:
-    def __init__(self, cards, detail_title, detail_lyrics):
+    def __init__(self, cards, detail_title, detail_lyrics, lyrics_by_card=None):
         self.cards_locator = FakeExportCardsLocator(cards)
-        self.detail_title = FakeExportCardLocator("detail-title", detail_title)
-        self.detail_lyrics = FakeExportCardLocator("detail-lyrics", detail_lyrics)
+        self.cards = cards
+        self.detail_title = FakeExportCardLocator("detail-title", detail_title, page=self)
+        self.lyric_section = FakeExportCardLocator(
+            "lyric-title",
+            children={
+                "xpath=following-sibling::*[contains(@class,'sectionContent')][1]": (
+                    FakeExportCardLocator("detail-lyrics", detail_lyrics, page=self)
+                ),
+            },
+            page=self,
+        )
+        self.opened_card: str | None = None
+        self.lyrics_by_card = lyrics_by_card or {}
+        for card in cards:
+            card.page = self
+
+    def field_text(self, name: str) -> str:
+        if name != "detail-lyrics":
+            return self.detail_title.text
+        return self.lyrics_by_card.get(self.opened_card or "", "")
 
     def locator(self, selector: str):
+        if selector == '[aria-label="关闭详情"]':
+            return FakeExportMissingLocator()
         if selector == '[class*="detailLyricsSection"]':
             return FakeExportMissingLocator()
         if selector == '[class*="generatedSongCard"]':
@@ -1685,11 +2758,11 @@ class FakeExportDetailPage:
         if selector == '[class*="detailPanel"] [class*="infoTitle"]':
             return self.detail_title
         if selector == '[class*="detailPanel"] [class*="sectionTitle"]':
-            return FakeExportCardLocator(
-                "lyric-title",
-                children={"xpath=following-sibling::*[contains(@class,'sectionContent')][1]": self.detail_lyrics},
-            )
+            return self.lyric_section
         raise AssertionError(f"unexpected page selector: {selector}")
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        return None
 
 
 class FakeExportMissingLocator:
@@ -1705,7 +2778,7 @@ class FakeExportMissingLocator:
 
 
 @pytest.mark.asyncio
-async def test_find_exported_download_card_uses_title_without_details() -> None:
+async def test_find_exported_download_card_matches_exact_export_title() -> None:
     raw = FakeExportCardLocator(
         "raw",
         children={
@@ -1723,18 +2796,87 @@ async def test_find_exported_download_card_uses_title_without_details() -> None:
     page = FakeExportDetailPage(
         [raw, exported],
         "新课本",
-        "歌名：《新课本》\n平台模型改写后的歌词内容",
+        "",
     )
 
     result = await find_exported_download_card(page, "新课本", "油墨还没散尽，书页白得发亮。第一行名字")
 
     assert result is exported
-    assert exported.clicked is False
-    assert raw.clicked is False
+    assert exported.children['[class*="title"]'].clicked is False
+    assert raw.children['[class*="title"]'].clicked is False
 
 
 @pytest.mark.asyncio
-async def test_process_batch_exports_newest_matching_candidate_per_lyric(
+async def test_find_exported_download_card_skips_cards_without_source_tag() -> None:
+    unexported = FakeExportCardLocator(
+        "unexported",
+        children={
+            '[class*="title"]': FakeExportCardLocator("unexported-title", "新课本"),
+        },
+    )
+    page = FakeExportDetailPage([unexported], "新课本", "")
+
+    with pytest.raises(BrowserFlowError, match="未找到可下载的导出歌曲"):
+        await find_exported_download_card(
+            page,
+            "新课本",
+            "油墨还没散尽，书页白得发亮。第一行名字",
+        )
+
+    assert unexported.children['[class*="title"]'].clicked is False
+
+
+@pytest.mark.asyncio
+async def test_find_exported_download_card_stops_after_twenty_assets() -> None:
+    cards = [
+        FakeExportCardLocator(
+            f"raw-{index}",
+            children={
+                '[class*="sourceTag"]': FakeExportCardLocator(f"raw-source-{index}", "老博"),
+                '[class*="title"]': FakeExportCardLocator(f"raw-title-{index}", f"旧歌 {index}"),
+            },
+        )
+        for index in range(20)
+    ]
+    cards.append(
+        FakeExportCardLocator(
+            "exported",
+            children={
+                '[class*="sourceTag"]': FakeExportCardLocator("export-source", "编辑器导出"),
+                '[class*="title"]': FakeExportCardLocator("export-title", "新课本"),
+            },
+        )
+    )
+    page = FakeExportDetailPage(cards, "新课本", "")
+
+    with pytest.raises(BrowserFlowError, match="未找到可下载的导出歌曲"):
+        await find_exported_download_card(page, "新课本", "油墨还没散尽，书页白得发亮。第一行名字")
+
+
+@pytest.mark.asyncio
+async def test_find_exported_download_card_rejects_different_title_and_lyrics() -> None:
+    exported = FakeExportCardLocator(
+        "exported",
+        children={
+            '[class*="sourceTag"]': FakeExportCardLocator("export-source", "编辑器导出"),
+            '[class*="title"]': FakeExportCardLocator("export-title", "另一首歌曲"),
+        },
+    )
+    page = FakeExportDetailPage(
+        [exported],
+        "另一首歌曲",
+        "",
+        lyrics_by_card={"export-title": "完全不同的另一段歌词内容"},
+    )
+
+    with pytest.raises(BrowserFlowError, match="未找到可下载的导出歌曲"):
+        await find_exported_download_card(page, "新课本", "油墨还没散尽，书页白得发亮。第一行名字")
+
+    assert exported.children['[class*="title"]'].clicked is False
+
+
+@pytest.mark.asyncio
+async def test_process_batch_exports_first_matching_candidate_per_lyric(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1815,8 +2957,8 @@ async def test_process_batch_exports_newest_matching_candidate_per_lyric(
         "page_ready", "ready", "recover_existing_generation",
         "fill_inputs", "generate", "generate", "check_limit", "check-limit",
         "fill_inputs", "generate", "generate", "check_limit", "check-limit",
-        "wait_generation", "match_titles",
-        "export_song", "export:第一首版本二:第一首",
+        "wait_generation", "match_lyrics",
+        "export_song", "export:第一首版本一:第一首",
         "export_song", "export:第二首版本一:第二首",
     ]
     assert [result.status for result in results] == ["success", "success"]
@@ -1826,7 +2968,7 @@ async def test_process_batch_exports_newest_matching_candidate_per_lyric(
 
 
 @pytest.mark.asyncio
-async def test_process_batch_reports_missing_and_export_failures_separately(
+async def test_process_batch_reports_missing_and_download_failures_separately(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1869,10 +3011,84 @@ async def test_process_batch_reports_missing_and_export_failures_separately(
 
     results = await flow.process_batch([first, second], lambda step, song=None: None)
 
-    assert results[0].status == "export_failed"
+    assert results[0].status == "download_failed"
     assert "下载失败" in results[0].error
-    assert results[1].status == "title_unmatched"
-    assert results[1].error == "歌曲详情歌名与歌词歌名不匹配，已跳过"
+    assert results[1].status == "lyric_unmatched"
+    assert results[1].error == "歌曲详情歌词与本地歌词不匹配，已跳过"
+
+
+@pytest.mark.asyncio
+async def test_process_batch_reports_export_failure_separately(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+    from backend.models import GeneratedCandidate
+
+    flow = PageFlow(
+        page=FakePage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    lyric = LyricData(song_name="第一首", lyrics="a" * 120, style="s" * 60)
+
+    async def ensure_ready(): return None
+    async def recover_existing_candidates(lyric_data_list): return {}
+    async def fill_inputs(lyric_data): return None
+    async def generate(): return None
+    async def check_limit(): return None
+
+    async def wait_for_batch_generation(
+        baseline_count,
+        lyric_count,
+        baseline_anchor=None,
+    ):
+        return [{"title": "第一首版本", "loading": False}]
+
+    async def classify_generated_cards(cards, lyric_data_list):
+        return {
+            "第一首": [
+                GeneratedCandidate(
+                    song_name="第一首",
+                    generated_title="第一首版本",
+                    card_index=0,
+                )
+            ]
+        }
+
+    async def export_candidate(candidate, lyric_data):
+        raise SongExportError("编辑器导出失败")
+
+    monkeypatch.setattr(flow, "ensure_create_page_ready", ensure_ready)
+    monkeypatch.setattr(
+        flow,
+        "recover_existing_candidates",
+        recover_existing_candidates,
+    )
+    monkeypatch.setattr(flow, "fill_inputs", fill_inputs)
+    monkeypatch.setattr(flow, "generate", generate)
+    monkeypatch.setattr(flow, "check_generation_limit", check_limit)
+    monkeypatch.setattr(flow, "asset_card_states", lambda: [])
+    monkeypatch.setattr(
+        flow,
+        "wait_for_batch_generation",
+        wait_for_batch_generation,
+    )
+    monkeypatch.setattr(
+        flow,
+        "classify_generated_cards",
+        classify_generated_cards,
+    )
+    monkeypatch.setattr(flow, "export_candidate", export_candidate)
+
+    results = await flow.process_batch(
+        [lyric],
+        lambda step, song=None: None,
+    )
+
+    assert results[0].status == "export_failed"
+    assert "导出失败" in results[0].error
 
 
 @pytest.mark.asyncio
@@ -2380,7 +3596,7 @@ async def test_process_song_runs_all_states_in_order(
         "generate",
         "check_limit",
         "wait_generation",
-        "match_titles",
+        "match_lyrics",
         "enter_editor",
         "export_song",
         "download_song",
@@ -2486,3 +3702,84 @@ async def test_process_song_propagates_generation_limit(tmp_path: Path) -> None:
             LyricData(song_name="夜色引擎", lyrics="x" * 120, style="s" * 60),
             lambda step: None,
         )
+
+
+@pytest.mark.asyncio
+async def test_recover_existing_candidates_checks_newest_twenty_assets(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+    from backend.models import GeneratedCandidate
+
+    flow = PageFlow(
+        page=FakePage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    lyric = LyricData(song_name="target", lyrics="x" * 120, style="s" * 60)
+    cards = [
+        {"index": index, "title": f"old-{index}", "loading": False}
+        for index in range(24)
+    ]
+    cards[19] = {"index": 19, "title": "target-version", "loading": False}
+
+    async def states():
+        return cards
+
+    async def classify(received_cards, lyric_data_list):
+        assert received_cards == cards[:20]
+        return {
+            "target": [
+                GeneratedCandidate(
+                    song_name="target",
+                    generated_title="target-version",
+                    card_index=19,
+                )
+            ]
+        }
+
+    monkeypatch.setattr(flow, "asset_card_states", states)
+    monkeypatch.setattr(flow, "classify_generated_cards", classify)
+
+    result = await flow.recover_existing_candidates([lyric])
+
+    assert result["target"][0].card_index == 19
+
+
+@pytest.mark.asyncio
+async def test_recover_existing_candidates_ignores_assets_after_twenty(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from .test_task_engine import make_account
+
+    flow = PageFlow(
+        page=FakePage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    lyric = LyricData(song_name="target", lyrics="x" * 120, style="s" * 60)
+    cards = [
+        {"index": index, "title": f"old-{index}", "loading": False}
+        for index in range(21)
+    ]
+    cards[20] = {"index": 20, "title": "target-version", "loading": False}
+    received: list[list[dict]] = []
+
+    async def states():
+        return cards
+
+    async def classify(card_states, lyric_data_list):
+        received.append(card_states)
+        return {"target": []}
+
+    monkeypatch.setattr(flow, "asset_card_states", states)
+    monkeypatch.setattr(flow, "classify_generated_cards", classify)
+
+    result = await flow.recover_existing_candidates([lyric])
+
+    assert received == [cards[:20]]
+    assert result == {"target": []}

@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from backend.browser import BrowserManager, ChromeSession, validate_profile_dir
 from backend.ai_lyrics import (
@@ -35,12 +35,16 @@ from backend.lyrics import list_lyric_files, parse_lyrics
 from backend.models import (
     AI_TIMEOUT_SECONDS,
     DEFAULT_AI_SYSTEM_PROMPT,
+    AIApiConfig,
     AccountConfig,
     ConsoleSettings,
     LyricData,
     LyricTemplateConfig,
+    MultiStageItem,
     MusicModelName,
+    normalize_singer_for_model,
 )
+from backend.multi_stage import MultiStageEngine
 from backend.page_flow import (
     MIN_DOWNLOAD_DURATION_SECONDS,
     PageFlow,
@@ -56,25 +60,52 @@ from backend.storage import (
     PipelineStateRepository,
     RunStateRepository,
 )
-from backend.task_engine import TaskEngine
+from backend.task_engine import TaskEngine, classify_repair_action
 from backend.upload_rejections import read_rejected
+from backend.upload_limit import (
+    MAX_DAILY_UPLOADS,
+    daily_upload_remaining,
+    daily_upload_used,
+    ensure_daily_upload_capacity,
+    seed_upload_history,
+)
 
 
 class AccountCopyRequest(BaseModel):
     account_name: str = Field(min_length=1, max_length=64)
 
 
-class RunRequest(BaseModel):
+class ModelSingerRequest(BaseModel):
+    model_name: MusicModelName = Field(default="自动")
+    singer_name: str = Field(default="", max_length=64)
+
+    @model_validator(mode="after")
+    def normalize_model_singer(self) -> "ModelSingerRequest":
+        self.singer_name = normalize_singer_for_model(self.model_name, self.singer_name)
+        return self
+
+
+class RunRequest(ModelSingerRequest):
     account_id: str
     song_files: list[str] = Field(min_length=1)
     day: str | None = None
     fresh_run: bool = False
-    model_name: MusicModelName = Field(default="自动")
-    singer_name: str = Field(default="老岩", max_length=64)
 
 
 class RunControlRequest(BaseModel):
     action: str = Field(pattern="^(pause|resume|stop)$")
+
+
+class RedownloadRequest(BaseModel):
+    account_id: str
+    file_name: str = Field(min_length=1)
+    day: str | None = None
+
+
+class RepairRequest(BaseModel):
+    account_id: str
+    day: str | None = None
+
 
 class UploadCodeRequest(BaseModel):
     code: str = Field(min_length=4, max_length=10)
@@ -87,11 +118,9 @@ class UploadStartRequest(BaseModel):
     auto_replace_noncompliant: bool = False
 
 
-class UploadRetryRejectedRequest(BaseModel):
+class UploadRetryRejectedRequest(ModelSingerRequest):
     ai_created: bool = True
     real_name: str | None = Field(default=None, max_length=64)
-    model_name: MusicModelName = Field(default="自动")
-    singer_name: str = Field(default="老岩", max_length=64)
 
 
 class UploadResetRequest(BaseModel):
@@ -126,6 +155,59 @@ class PipelineQueueStartRequest(BaseModel):
     singer_name: str = Field(default="老岩", max_length=64)
 
 
+class MultiLyricItemRequest(BaseModel):
+    account_id: str
+    template_id: str
+
+
+class MultiLyricStartRequest(BaseModel):
+    items: list[MultiLyricItemRequest] = Field(min_length=1)
+    day: str | None = None
+
+
+class MultiGenerationItemRequest(BaseModel):
+    account_id: str
+    song_files: list[str] = Field(min_length=1)
+    model_name: MusicModelName | None = None
+    singer_name: str | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def normalize_item_model_singer(self) -> "MultiGenerationItemRequest":
+        if self.model_name is not None:
+            self.singer_name = normalize_singer_for_model(
+                self.model_name,
+                self.singer_name or "",
+            )
+        return self
+
+
+class MultiGenerationStartRequest(ModelSingerRequest):
+    items: list[MultiGenerationItemRequest] = Field(min_length=1)
+    day: str | None = None
+    fresh_run: bool = False
+
+    @model_validator(mode="after")
+    def normalize_generation_singers(self) -> "MultiGenerationStartRequest":
+        for item in self.items:
+            item.singer_name = normalize_singer_for_model(
+                item.model_name or self.model_name,
+                item.singer_name or "",
+            )
+        return self
+
+
+class MultiUploadItemRequest(BaseModel):
+    account_id: str
+    file_names: list[str] = Field(min_length=1)
+
+
+class MultiUploadStartRequest(BaseModel):
+    items: list[MultiUploadItemRequest] = Field(min_length=1)
+    day: str | None = None
+    ai_created: bool = True
+    auto_replace_noncompliant: bool = False
+
+
 class FolderOpenRequest(BaseModel):
     kind: str = Field(pattern="^(logs|screenshots|data)$")
 
@@ -141,6 +223,8 @@ class ConsoleSettingsUpdate(BaseModel):
     ai_api_key: str | None = Field(default=None, max_length=4096)
     ai_model: str | None = Field(default=None, max_length=256)
     ai_max_retries: int | None = Field(default=None, ge=0, le=5)
+    ai_api_configs: list[AIApiConfig] | None = None
+    active_ai_api_config_id: str | None = Field(default=None, max_length=64)
     ai_system_prompt: str | None = Field(default=None, min_length=100, max_length=10000)
 
 
@@ -215,6 +299,72 @@ def find_completed_output(directory: Path, song_name: str) -> Path | None:
         if path.is_file() and path.stat().st_size > 0 and duplicate_pattern.fullmatch(path.stem):
             return path
     return None
+
+
+def list_account_song_items(
+    account: AccountConfig,
+    state_repository: RunStateRepository,
+    day_value: str,
+) -> list[dict]:
+    files = list_lyric_files(Path(account.lyric_dir), day=day_value)
+    output_directory = Path(account.output_dir) / day_value
+    result: list[dict] = []
+    for path in files:
+        item = {
+            "file_name": path.name,
+            "path": str(path),
+            "valid": False,
+            "song_name": None,
+            "status": "pending",
+            "current_step": "pending",
+            "attempts": 0,
+            "error": None,
+            "output_path": None,
+        }
+        try:
+            parsed = parse_lyrics(path.read_text(encoding="utf-8"))
+            item.update(valid=True, song_name=parsed.song_name)
+        except Exception as error:
+            item["error"] = str(error)
+            item["status"] = "failed"
+            item["current_step"] = "parse"
+        else:
+            output_path = find_completed_output(output_directory, parsed.song_name)
+            if output_path:
+                item.update(
+                    status="success",
+                    current_step="done",
+                    output_path=str(output_path),
+                )
+            else:
+                previous = state_repository.get(
+                    day_value,
+                    account.account_name,
+                    path.name,
+                )
+                if previous and previous.status != "成功":
+                    previous_status = previous.status
+                    previous_error = previous.error or ""
+                    if (
+                        previous_status == "生成失败"
+                        and ("不匹配" in previous_error or "匹配" in previous_error)
+                    ):
+                        # Older runs marked a successful generation as
+                        # failed when the platform title differed.
+                        previous_status = "下载失败"
+                    item.update(
+                        status=previous_status,
+                        current_step=previous.current_step,
+                        attempts=previous.attempts,
+                        error=previous.error,
+                        output_path=previous.output_path,
+                    )
+        result.append(item)
+    return result
+
+
+def is_repair_candidate(item: dict) -> bool:
+    return item["status"] not in {"pending", "running", "success", "skipped"}
 
 
 def build_upload_lyrics(lyrics: str) -> str:
@@ -296,6 +446,10 @@ def build_upload_items(
     directory = Path(account.output_dir) / day
     manifest = directory / ".uploaded.json"
     uploaded = set(json.loads(manifest.read_text(encoding="utf-8"))) if manifest.is_file() else set()
+    remaining = daily_upload_remaining(account, day)
+    max_items = min(account.upload_batch_size, remaining)
+    if max_items <= 0:
+        return []
     lyric_by_title: dict[str, str] = {}
     for lyric_path in list_lyric_files(Path(account.lyric_dir), day=day):
         try:
@@ -318,7 +472,8 @@ def build_upload_items(
         if path is None or path.name not in selected_files or str(path.resolve()) in uploaded:
             continue
         keywords = "、".join(re.findall(r"[\u4e00-\u9fff]{2,4}", lyrics)[:8]) or title
-        cover_path = directory / "封面.jpg"
+        large_cover = directory / "封面-1440.jpg"
+        cover_path = large_cover if large_cover.is_file() else directory / "封面.jpg"
         items.append({
             "title": title,
             "path": str(path.resolve()),
@@ -328,7 +483,7 @@ def build_upload_items(
             "ai_created": ai_created,
             "real_name": account.upload_real_name if real_name is None else real_name,
         })
-        if len(items) >= account.upload_batch_size:
+        if len(items) >= max_items:
             break
     return items
 
@@ -470,7 +625,7 @@ def create_app(
     lyric_template_repository = LyricTemplateRepository(paths.lyric_templates_file)
     settings_store = JsonStore(paths.settings_file, ConsoleSettings().model_dump(mode="json"))
     settings = ConsoleSettings.model_validate(settings_store.read())
-    prompt_version_marker = "AI 音乐创作 Agent 提示词 v2.1（控制台英文指令 JSON 版）"
+    prompt_version_marker = "AI 音乐创作 Agent 提示词 v2.9（五首批次与跨批去重版）"
     if prompt_version_marker not in settings.ai_system_prompt:
         settings = settings.model_copy(update={"ai_system_prompt": DEFAULT_AI_SYSTEM_PROMPT})
         settings_store.write(settings.model_dump(mode="json"))
@@ -561,6 +716,8 @@ def create_app(
     ) -> dict:
         assert pipeline_engine.current is not None
         actual_account = account_repository.get(pipeline_engine.current.account_id)
+        selected_count = len(set(file_names))
+        remaining = ensure_daily_upload_capacity(actual_account, day, selected_count)
         items = build_upload_items(
             actual_account,
             day,
@@ -570,6 +727,9 @@ def create_app(
         )
         if not items:
             raise ValidationFailed("没有可上传歌曲；请确认成品文件名和歌词歌名一致")
+        if len(items) < selected_count:
+            max_this_run = min(actual_account.upload_batch_size, remaining)
+            raise ValidationFailed(f"一次最多发布 {max_this_run} 首；本次选择了 {selected_count} 首")
         await login_browser.close()
         try:
             engine.start_upload(
@@ -611,12 +771,20 @@ def create_app(
         pipeline_engine=pipeline_engine,
     )
     app.state.pipeline_queue_engine = pipeline_queue_engine
+    multi_stage_engine = MultiStageEngine(events)
+    app.state.multi_stage_engine = multi_stage_engine
 
     def pipeline_queue_busy() -> bool:
         return pipeline_queue_engine.is_running or pipeline_queue_engine.is_waiting_user
 
+    def multi_stage_busy() -> bool:
+        return multi_stage_engine.is_running
+
     async def shutdown_engine() -> None:
         await login_browser.close()
+        if multi_stage_engine.is_running:
+            await multi_stage_engine.stop()
+            return
         await engine.shutdown()
         if pipeline_queue_engine.is_running or pipeline_queue_engine.is_waiting_user:
             await pipeline_queue_engine.stop()
@@ -749,38 +917,7 @@ def create_app(
         account = account_repository.get(account_id)
         day_value = day or date.today().isoformat()
         ensure_workflow_directories(account, day_value)
-        files = list_lyric_files(Path(account.lyric_dir), day=day)
-        output_directory = Path(account.output_dir) / day_value
-        result: list[dict] = []
-        for path in files:
-            item = {
-                "file_name": path.name,
-                "path": str(path),
-                "valid": False,
-                "song_name": None,
-                "status": "pending",
-                "current_step": "pending",
-                "attempts": 0,
-                "error": None,
-                "output_path": None,
-            }
-            try:
-                parsed = parse_lyrics(path.read_text(encoding="utf-8"))
-                item.update(valid=True, song_name=parsed.song_name)
-            except Exception as error:
-                item["error"] = str(error)
-                item["status"] = "failed"
-                item["current_step"] = "parse"
-            else:
-                output_path = find_completed_output(output_directory, parsed.song_name)
-                if output_path:
-                    item.update(
-                        status="success",
-                        current_step="done",
-                        output_path=str(output_path),
-                    )
-            result.append(item)
-        return result
+        return list_account_song_items(account, state_repository, day_value)
 
     @app.get("/api/accounts/{account_id}/lyric/templates")
     async def list_lyric_templates(account_id: str) -> dict:
@@ -807,6 +944,8 @@ def create_app(
     ) -> dict:
         account_repository.get(account_id)
         existing = lyric_template_repository.get(template_id)
+        if existing.account_id != account_id:
+            raise ValidationFailed("歌词模板不属于该账号")
         template = LyricTemplateConfig(
             id=template_id,
             account_id=account_id,
@@ -944,6 +1083,9 @@ def create_app(
         directory = Path(account.output_dir) / day_value
         manifest = directory / ".uploaded.json"
         uploaded = set(json.loads(manifest.read_text(encoding="utf-8"))) if manifest.is_file() else set()
+        daily_used = daily_upload_used(account, day_value)
+        remaining = daily_upload_remaining(account, day_value)
+        selectable_limit = min(account.upload_batch_size, remaining)
         files: list[dict] = []
         uploaded_files: list[dict] = []
         rejected_files = read_rejected(account, day_value)
@@ -961,15 +1103,18 @@ def create_app(
                 else:
                     files.append(item)
         return {
-            "ready": bool(files),
+            "ready": bool(files) and remaining > 0,
             "day": day_value,
             "batch_size": account.upload_batch_size,
+            "daily_limit": MAX_DAILY_UPLOADS,
+            "daily_used": daily_used,
+            "remaining_uploads": remaining,
             "artist_name": account.upload_artist_name,
             "real_name": account.upload_real_name,
             "files": files,
             "uploaded_files": uploaded_files,
             "rejected_files": rejected_files,
-            "overflow": max(len(files) - account.upload_batch_size, 0),
+            "overflow": max(len(files) - selectable_limit, 0),
         }
 
     @app.post("/api/accounts/{account_id}/uploads/reset")
@@ -980,7 +1125,7 @@ def create_app(
     ) -> dict:
         if engine.is_running or engine.upload_is_running:
             raise ConflictError("任务运行中不能重置发布记录")
-        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy():
+        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy() or multi_stage_busy():
             raise ConflictError("完整流水线运行中不能重置发布记录")
 
         account = account_repository.get(account_id)
@@ -988,6 +1133,7 @@ def create_app(
         ensure_workflow_directories(account, day_value)
         directory = Path(account.output_dir) / day_value
         manifest = directory / ".uploaded.json"
+        seed_upload_history(account, day_value)
         uploaded = set(json.loads(manifest.read_text(encoding="utf-8"))) if manifest.is_file() else set()
         requested = set(request.file_names if request else [])
         output_by_name = {
@@ -1011,10 +1157,12 @@ def create_app(
 
     @app.post("/api/uploads/runs", status_code=202)
     async def start_upload(account_id: str, day: str | None = None, request: UploadStartRequest | None = None) -> dict:
-        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy():
+        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy() or multi_stage_busy():
             raise ConflictError("完整流水线正在运行，请先停止后再启动单阶段上传")
         account = account_repository.get(account_id)
         day_value = day or date.today().isoformat()
+        selected_count = len(set(request.file_names)) if request else None
+        remaining = ensure_daily_upload_capacity(account, day_value, selected_count)
         items = build_upload_items(
             account,
             day_value,
@@ -1024,6 +1172,9 @@ def create_app(
         )
         if not items:
             raise ValidationFailed("没有可上传歌曲；请确认成品文件名和歌词歌名一致")
+        if request and selected_count is not None and len(items) < selected_count:
+            max_this_run = min(account.upload_batch_size, remaining)
+            raise ValidationFailed(f"一次最多发布 {max_this_run} 首；本次选择了 {selected_count} 首")
         await login_browser.close()
         if request and request.auto_replace_noncompliant:
             return engine.start_upload(
@@ -1040,10 +1191,11 @@ def create_app(
         day: str | None = None,
         request: UploadRetryRejectedRequest | None = None,
     ) -> dict:
-        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy():
+        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy() or multi_stage_busy():
             raise ConflictError("完整流水线正在运行，请先停止后再启动单阶段上传")
         account = account_repository.get(account_id)
         day_value = day or date.today().isoformat()
+        ensure_daily_upload_capacity(account, day_value)
         items = build_upload_items(
             account,
             day_value,
@@ -1081,7 +1233,7 @@ def create_app(
             lyric_files,
             day_value,
             model_name=request.model_name if request else "自动",
-            singer_name=request.singer_name if request else "老岩",
+            singer_name=request.singer_name if request else "",
             auto_replace_noncompliant=True,
         )
 
@@ -1103,6 +1255,8 @@ def create_app(
     async def start_pipeline(request: PipelineStartRequest) -> dict:
         if engine.is_running or engine.upload_is_running:
             raise ConflictError("已有单阶段任务正在运行，请先停止后再启动完整流水线")
+        if multi_stage_busy():
+            raise ConflictError("多账号任务正在运行，请先停止后再启动完整流水线")
         if pipeline_queue_busy():
             raise ConflictError("多账号流水线队列正在运行")
         account = account_repository.get(request.account_id)
@@ -1152,6 +1306,8 @@ def create_app(
     async def start_pipeline_queue(request: PipelineQueueStartRequest) -> dict:
         if engine.is_running or engine.upload_is_running:
             raise ConflictError("已有单阶段任务正在运行，请先停止后再启动多账号队列")
+        if multi_stage_busy():
+            raise ConflictError("多账号任务正在运行，请先停止后再启动流水线队列")
         if pipeline_engine.is_running or pipeline_engine.is_waiting_user:
             raise ConflictError("单账号流水线正在运行，请先停止后再启动多账号队列")
         if pipeline_queue_busy():
@@ -1202,6 +1358,222 @@ def create_app(
     async def stop_pipeline_queue() -> dict:
         return (await pipeline_queue_engine.stop()).model_dump(mode="json")
 
+    @app.post("/api/multi-stage/lyrics/runs", status_code=202)
+    async def start_multi_lyrics(request: MultiLyricStartRequest) -> dict:
+        if engine.is_running or engine.upload_is_running or multi_stage_busy():
+            raise ConflictError("已有任务正在运行，请先停止后再启动多账号作词")
+        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy() or multi_stage_busy():
+            raise ConflictError("完整流水线正在运行，请先停止后再启动多账号作词")
+
+        entries: list[tuple[AccountConfig, LyricTemplateConfig]] = []
+        seen: set[str] = set()
+        for item in request.items:
+            account = account_repository.get(item.account_id)
+            template = lyric_template_repository.get(item.template_id)
+            if template.account_id != account.id:
+                raise ValidationFailed(f"模板不属于账号 {account.account_name}")
+            if account.id in seen:
+                raise ValidationFailed(f"队列中不能重复选择账号 {account.account_name}")
+            seen.add(account.id)
+            entries.append((account, template))
+
+        day_value = request.day or date.today().isoformat()
+        try:
+            datetime.strptime(day_value, "%Y-%m-%d").date()
+        except ValueError as error:
+            raise ValidationFailed("日期格式必须是 YYYY-MM-DD") from error
+        for account, _ in entries:
+            ensure_workflow_directories(account, day_value)
+
+        async def run_item(item: MultiStageItem) -> dict:
+            account = account_repository.get(item.account_id)
+            template = lyric_template_repository.get(str(item.request.get("template_id") or ""))
+            songs = await generate_lyrics_with_ai(
+                settings,
+                template=template,
+                count=template.generation_count,
+            )
+            saved = await asyncio.to_thread(save_pipeline_lyrics, account, day_value, songs)
+            return {
+                "status": "completed",
+                "generated_count": len(songs),
+                "saved_count": len(saved),
+                "saved": saved,
+            }
+
+        snapshot = multi_stage_engine.start(
+            stage="lyrics",
+            day=day_value,
+            items=[
+                MultiStageItem(
+                    account_id=account.id,
+                    account_name=account.account_name,
+                    request={"template_id": template.id, "template_name": template.name},
+                )
+                for account, template in entries
+            ],
+            runner=run_item,
+            concurrency=20,
+        )
+        return snapshot.model_dump(mode="json")
+
+    @app.post("/api/multi-stage/generation/runs", status_code=202)
+    async def start_multi_generation(request: MultiGenerationStartRequest) -> dict:
+        if engine.is_running or engine.upload_is_running or multi_stage_busy():
+            raise ConflictError("已有任务正在运行，请先停止后再启动多账号生成")
+        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy() or multi_stage_busy():
+            raise ConflictError("完整流水线正在运行，请先停止后再启动多账号生成")
+
+        entries: list[tuple[AccountConfig, list[Path]]] = []
+        seen: set[str] = set()
+        day_value = request.day or date.today().isoformat()
+        try:
+            datetime.strptime(day_value, "%Y-%m-%d").date()
+        except ValueError as error:
+            raise ValidationFailed("日期格式必须是 YYYY-MM-DD") from error
+
+        for item in request.items:
+            account = account_repository.get(item.account_id)
+            if account.id in seen:
+                raise ValidationFailed(f"队列中不能重复选择账号 {account.account_name}")
+            seen.add(account.id)
+            ensure_workflow_directories(account, day_value)
+            root = Path(account.lyric_dir)
+            selected: list[Path] = []
+            for file_name in item.song_files:
+                path = (root / day_value / Path(file_name).name).resolve()
+                if not path.is_file():
+                    raise NotFoundError(f"歌词文件不存在: {account.account_name} / {file_name}")
+                selected.append(path)
+            entries.append((account, selected))
+
+        async def run_item(item: MultiStageItem) -> dict:
+            account = account_repository.get(item.account_id)
+            files = [Path(value) for value in item.request.get("song_files", [])]
+            await login_browser.close()
+            try:
+                engine.start(
+                    account,
+                    files,
+                    day=day_value,
+                    fresh_run=bool(item.request.get("fresh_run")),
+                    model_name=item.request.get("model_name") or "自动",
+                    singer_name=item.request.get("singer_name") if item.request.get("singer_name") is not None else "老岩",
+                )
+                await engine.wait()
+            except asyncio.CancelledError:
+                if engine.is_running:
+                    await engine.stop()
+                    await engine.wait()
+                raise
+            return (engine.current or {"status": "failed", "error": "生成任务没有返回结果"}).model_dump(mode="json")
+
+        snapshot = multi_stage_engine.start(
+            stage="generation",
+            day=day_value,
+            items=[
+                MultiStageItem(
+                    account_id=account.id,
+                    account_name=account.account_name,
+                    request={
+                    "song_files": [str(path) for path in files],
+                    "fresh_run": request.fresh_run,
+                    "model_name": item.model_name if item.model_name is not None else request.model_name,
+                    "singer_name": item.singer_name if item.singer_name is not None else request.singer_name,
+                    },
+                )
+                for (account, files), item in zip(entries, request.items)
+            ],
+            runner=run_item,
+        )
+        return snapshot.model_dump(mode="json")
+
+    @app.post("/api/multi-stage/upload/runs", status_code=202)
+    async def start_multi_upload(request: MultiUploadStartRequest) -> dict:
+        if engine.is_running or engine.upload_is_running or multi_stage_busy():
+            raise ConflictError("已有任务正在运行，请先停止后再启动多账号上传")
+        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy() or multi_stage_busy():
+            raise ConflictError("完整流水线正在运行，请先停止后再启动多账号上传")
+
+        entries: list[tuple[AccountConfig, list[dict]]] = []
+        seen: set[str] = set()
+        day_value = request.day or date.today().isoformat()
+        try:
+            datetime.strptime(day_value, "%Y-%m-%d").date()
+        except ValueError as error:
+            raise ValidationFailed("日期格式必须是 YYYY-MM-DD") from error
+
+        for item in request.items:
+            account = account_repository.get(item.account_id)
+            if account.id in seen:
+                raise ValidationFailed(f"队列中不能重复选择账号 {account.account_name}")
+            seen.add(account.id)
+            ensure_workflow_directories(account, day_value)
+            selected_count = len(set(item.file_names))
+            remaining = ensure_daily_upload_capacity(account, day_value, selected_count)
+            items = build_upload_items(
+                account,
+                day_value,
+                selected_file_names=set(item.file_names),
+                ai_created=request.ai_created,
+                real_name=account.upload_real_name,
+            )
+            if not items:
+                raise ValidationFailed(f"{account.account_name} 没有可上传歌曲")
+            if len(items) < selected_count:
+                max_this_run = min(account.upload_batch_size, remaining)
+                raise ValidationFailed(
+                    f"{account.account_name} 一次最多发布 {max_this_run} 首；本次选择了 {selected_count} 首"
+                )
+            entries.append((account, items))
+
+        async def run_item(item: MultiStageItem) -> dict:
+            account = account_repository.get(item.account_id)
+            await login_browser.close()
+            try:
+                engine.start_upload(
+                    account,
+                    item.request.get("items", []),
+                    day_value,
+                    auto_replace_noncompliant=bool(item.request.get("auto_replace_noncompliant")),
+                )
+                await engine.wait_upload()
+            except asyncio.CancelledError:
+                if engine.upload_is_running:
+                    await engine.stop_upload()
+                    await engine.wait_upload()
+                raise
+            return engine.current_upload or {"status": "failed", "error": "上传任务没有返回结果"}
+
+        snapshot = multi_stage_engine.start(
+            stage="upload",
+            day=day_value,
+            items=[
+                MultiStageItem(
+                    account_id=account.id,
+                    account_name=account.account_name,
+                    request={
+                        "items": items,
+                        "file_names": [str(value.get("title") or "") for value in items],
+                        "auto_replace_noncompliant": request.auto_replace_noncompliant,
+                    },
+                )
+                for account, items in entries
+            ],
+            runner=run_item,
+        )
+        return snapshot.model_dump(mode="json")
+
+    @app.get("/api/multi-stage/runs/current")
+    async def current_multi_stage(stage: str | None = None) -> dict | None:
+        if stage and multi_stage_engine.current and multi_stage_engine.current.stage != stage:
+            return None
+        return multi_stage_engine.current.model_dump(mode="json") if multi_stage_engine.current else None
+
+    @app.post("/api/multi-stage/runs/stop", status_code=202)
+    async def stop_multi_stage() -> dict:
+        return (await multi_stage_engine.stop()).model_dump(mode="json")
+
     @app.get("/api/pipeline/runs/current")
     async def current_pipeline(day: str | None = None, account_id: str | None = None) -> dict | None:
         if day and pipeline_engine.current and pipeline_engine.current.day != day:
@@ -1228,7 +1600,7 @@ def create_app(
 
     @app.post("/api/runs", status_code=202)
     async def start_run(request: RunRequest) -> dict:
-        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy():
+        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy() or multi_stage_busy():
             raise ConflictError("完整流水线正在运行，请先停止后再启动单阶段任务")
         account = account_repository.get(request.account_id)
         day = request.day or date.today().isoformat()
@@ -1261,6 +1633,78 @@ def create_app(
             else:
                 await engine.stop()
         return engine.current.model_dump(mode="json") if engine.current else {}
+
+    @app.post("/api/runs/redownload", status_code=202)
+    async def redownload_run(request: RedownloadRequest) -> dict:
+        if engine.is_running:
+            raise ConflictError("已有任务正在运行，请先停止当前任务")
+        if engine.upload_is_running:
+            raise ConflictError("上传任务正在运行，请先停止后再重新下载")
+        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy() or multi_stage_busy():
+            raise ConflictError("完整流水线正在运行，请先停止后再重新下载")
+
+        account = account_repository.get(request.account_id)
+        day_value = request.day or date.today().isoformat()
+        try:
+            datetime.strptime(day_value, "%Y-%m-%d").date()
+        except ValueError as error:
+            raise ValidationFailed("日期格式必须是 YYYY-MM-DD") from error
+
+        ensure_workflow_directories(account, day_value)
+        lyric_path = (
+            Path(account.lyric_dir) / day_value / Path(request.file_name).name
+        ).resolve()
+        if not lyric_path.is_file():
+            raise NotFoundError(f"歌词文件不存在: {request.file_name}")
+
+        await login_browser.close()
+        snapshot = engine.start_redownload(account, lyric_path, day_value)
+        return snapshot.model_dump(mode="json")
+
+    @app.post("/api/runs/repair", status_code=202)
+    async def repair_run(request: RepairRequest) -> dict:
+        if engine.is_running:
+            raise ConflictError("已有任务正在运行，请先停止当前任务")
+        if engine.upload_is_running:
+            raise ConflictError("上传任务正在运行，请先停止后再处理异常")
+        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy() or multi_stage_busy():
+            raise ConflictError("完整流水线正在运行，请先停止后再处理异常")
+
+        account = account_repository.get(request.account_id)
+        day_value = request.day or date.today().isoformat()
+        try:
+            datetime.strptime(day_value, "%Y-%m-%d").date()
+        except ValueError as error:
+            raise ValidationFailed("日期格式必须是 YYYY-MM-DD") from error
+
+        ensure_workflow_directories(account, day_value)
+        candidates = [
+            item
+            for item in list_account_song_items(account, state_repository, day_value)
+            if is_repair_candidate(item)
+        ]
+        auto_candidates = [
+            item
+            for item in candidates
+            if item["valid"]
+            and classify_repair_action(item["status"], item["error"]) != "manual"
+        ]
+        if not auto_candidates:
+            if candidates:
+                raise ValidationFailed("当前异常均需要手动处理，无法一键修复")
+            raise ValidationFailed("没有需要处理的异常歌曲")
+
+        song_entries = [
+            (
+                (Path(account.lyric_dir) / day_value / Path(item["file_name"]).name).resolve(),
+                item["status"],
+                item["error"],
+            )
+            for item in candidates
+        ]
+        await login_browser.close()
+        snapshot = engine.start_repair(account, song_entries, day_value)
+        return snapshot.model_dump(mode="json")
 
     @app.get("/api/runs/current")
     async def current_run(account_id: str | None = None) -> dict | None:
@@ -1295,7 +1739,7 @@ def create_app(
     async def open_login_browser(account_id: str) -> dict:
         if engine.is_running or engine.upload_is_running:
             raise AppError("任务运行中不能打开登录浏览器")
-        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy():
+        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy() or multi_stage_busy():
             raise AppError("完整流水线运行中不能打开登录浏览器")
         account = account_repository.get(account_id)
         await login_browser.open(account, settings)
@@ -1322,9 +1766,39 @@ def create_app(
         nonlocal settings
         if engine.is_running:
             raise AppError("任务运行中不能修改全局等待配置")
-        updated = ConsoleSettings.model_validate(
-            {**settings.model_dump(mode="json"), **request.model_dump(exclude_unset=True)}
-        )
+        request_data = request.model_dump(mode="json", exclude_unset=True)
+        current_data = settings.model_dump(mode="json")
+        changes_ai_api = "ai_api_configs" in request_data or "active_ai_api_config_id" in request_data
+        if changes_ai_api and (engine.upload_is_running or multi_stage_busy() or pipeline_queue_busy()):
+            raise AppError("任务运行中不能切换或修改 AI 接口")
+        if request_data.get("ai_api_configs") == []:
+            current_data.update({
+                "ai_api_base_url": "",
+                "ai_api_key": "",
+                "ai_model": "",
+                "ai_max_retries": 2,
+                "active_ai_api_config_id": "",
+            })
+
+        legacy_ai_fields = {"ai_api_base_url", "ai_api_key", "ai_model", "ai_max_retries"}
+        if not changes_ai_api and legacy_ai_fields.intersection(request_data):
+            configs = [AIApiConfig.model_validate(item) for item in current_data["ai_api_configs"]]
+            active_id = request_data.get("active_ai_api_config_id", current_data["active_ai_api_config_id"])
+            active_index = next(
+                (index for index, item in enumerate(configs) if item.id == active_id),
+                0,
+            )
+            if configs:
+                active = configs[active_index].model_copy(update={
+                    key: value
+                    for key, value in request_data.items()
+                    if key in legacy_ai_fields
+                })
+                configs[active_index] = active
+                current_data["ai_api_configs"] = [item.model_dump(mode="json") for item in configs]
+                current_data["active_ai_api_config_id"] = active.id
+
+        updated = ConsoleSettings.model_validate({**current_data, **request_data})
         engine.update_settings(updated)
         settings = updated
         settings_store.write(updated.model_dump(mode="json"))

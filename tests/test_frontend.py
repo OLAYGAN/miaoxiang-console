@@ -2,6 +2,7 @@ from pathlib import Path
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 from contextlib import contextmanager
+import json
 import threading
 
 import pytest
@@ -123,6 +124,196 @@ async def test_partial_retry_keeps_previously_successful_song_states() -> None:
 
 
 @pytest.mark.asyncio
+async def test_clicking_song_row_toggles_selection() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#song-table", state="attached")
+                await page.evaluate(
+                    """() => {
+                    state.accountId = "account";
+                    state.view = "task";
+                    state.songs = [{
+                        file_name: "pending.md",
+                        valid: true,
+                        song_name: "待处理歌曲",
+                        status: "pending",
+                    }];
+                    state.selected = new Set();
+                    renderView();
+                    renderSongs();
+                    }""",
+                )
+
+                row = page.locator(".song-row[data-file='pending.md']")
+                await row.locator("span").first.click()
+                selected = await page.evaluate(
+                    "() => ({ checked: state.selected.has('pending.md'), className: document.querySelector('.song-row[data-file=\\'pending.md\\']').className })",
+                )
+                assert selected["checked"] is True
+                assert "is-selected" in selected["className"]
+
+                await row.locator("span").first.click()
+                selected = await page.evaluate(
+                    "() => ({ checked: state.selected.has('pending.md'), className: document.querySelector('.song-row[data-file=\\'pending.md\\']').className })",
+                )
+                assert selected["checked"] is False
+                assert "is-selected" not in selected["className"]
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_download_failure_row_offers_lyrics_redownload() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page()
+            captured: dict = {}
+
+            async def handle_redownload(route) -> None:
+                captured.update(route.request.post_data_json)
+                await route.fulfill(
+                    status=202,
+                    content_type="application/json",
+                    body=(
+                        '{"run_id":"redownload","account_id":"account",'
+                        '"account_name":"账号01","status":"running",'
+                        '"current_step":"opening_browser",'
+                        '"songs":[{"file_name":"failed.md","song_name":"失败歌曲",'
+                        '"status":"running","current_step":"opening_browser",'
+                        '"attempts":0}]}'
+                    ),
+                )
+
+            await page.route("**/api/runs/redownload", handle_redownload)
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#song-table", state="attached")
+                await page.evaluate("state.view = 'task'; renderView();")
+                await page.evaluate(
+                    """() => {
+                    state.accountId = "account";
+                    state.accounts = [{
+                        id: "account",
+                        account_name: "账号01",
+                        lyric_dir: "E:\\\\music\\\\lyrics",
+                    }];
+                    document.getElementById("lyric-dir-input").value = "E:\\\\music\\\\lyrics";
+                    state.songs = [
+                        {
+                            file_name: "failed.md",
+                            valid: true,
+                            song_name: "失败歌曲",
+                            status: "下载失败",
+                        },
+                        {
+                            file_name: "done.md",
+                            valid: true,
+                            song_name: "完成歌曲",
+                            status: "success",
+                        },
+                        {
+                            file_name: "export.md",
+                            valid: true,
+                            song_name: "导出失败歌曲",
+                            status: "导出失败",
+                        },
+                    ];
+                    renderSongs();
+                    }""",
+                )
+
+                button = page.locator('[data-redownload="failed.md"]')
+                assert await button.count() == 1
+                assert await button.inner_text() == "重新下载"
+                assert await page.locator('[data-redownload="done.md"]').count() == 0
+                export_button = page.locator('[data-redownload="export.md"]')
+                assert await export_button.count() == 1
+                assert await export_button.inner_text() == "重新导出"
+                await button.click()
+                await page.wait_for_timeout(50)
+
+                assert captured == {
+                    "account_id": "account",
+                    "file_name": "failed.md",
+                    "day": await page.evaluate("todayValue()"),
+                }
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_repair_all_button_sends_one_batch_request_and_selects_all_failures() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page()
+            captured: dict = {}
+
+            async def handle_repair(route) -> None:
+                captured.update(route.request.post_data_json)
+                await route.fulfill(
+                    status=202,
+                    content_type="application/json",
+                    body=(
+                        '{"run_id":"repair","account_id":"account",'
+                        '"account_name":"账号01","status":"running",'
+                        '"current_step":"starting_repair","songs":[]}'
+                    ),
+                )
+
+            await page.route("**/api/runs/repair", handle_repair)
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#repair-run", state="attached")
+                await page.evaluate("state.view = 'task'; renderView();")
+                selected = await page.evaluate(
+                    """() => {
+                    state.accountId = "account";
+                    state.accounts = [{
+                        id: "account",
+                        account_name: "账号01",
+                        lyric_dir: "E:\\\\music\\\\lyrics",
+                    }];
+                    document.getElementById("lyric-dir-input").value = "E:\\\\music\\\\lyrics";
+                    state.songs = [
+                        { file_name: "download.md", valid: true, song_name: "下载", status: "下载失败" },
+                        { file_name: "export.md", valid: true, song_name: "导出", status: "导出失败" },
+                        { file_name: "generate.md", valid: true, song_name: "生成", status: "生成失败" },
+                        { file_name: "manual.md", valid: true, song_name: "描述", status: "描述不符合" },
+                        { file_name: "success.md", valid: true, song_name: "成功", status: "success" },
+                    ];
+                    renderSongs();
+                    renderControls();
+                    document.getElementById("select-failed").click();
+                    return [...state.selected];
+                    }""",
+                )
+
+                assert selected == ["download.md", "export.md", "generate.md", "manual.md"]
+                assert await page.locator("#repair-run").is_enabled()
+                await page.locator("#repair-run").click()
+                await page.wait_for_timeout(50)
+
+                assert captured == {
+                    "account_id": "account",
+                    "day": await page.evaluate("todayValue()"),
+                }
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
 async def test_upload_table_expands_instead_of_scrolling_internally() -> None:
     try:
         async with async_playwright() as playwright:
@@ -158,6 +349,58 @@ async def test_upload_table_expands_instead_of_scrolling_internally() -> None:
                 assert metrics["maxHeight"] == "none"
                 assert metrics["overflowY"] == "visible"
                 assert metrics["clientHeight"] == metrics["scrollHeight"]
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_upload_page_shows_daily_quota_and_blocks_when_exhausted() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 600})
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#upload-table", state="attached")
+                rendered = await page.evaluate(
+                    """() => {
+                    state.accountId = "account";
+                    state.accounts = [{
+                        id: "account",
+                        account_name: "account",
+                        output_dir: "D:\\\\music\\\\output",
+                    }];
+                    state.uploads = {
+                        day: "2026-10-03",
+                        batch_size: 10,
+                        daily_limit: 10,
+                        daily_used: 10,
+                        remaining_uploads: 0,
+                        files: [
+                            { file_name: "pending.mp3", path: "D:\\\\music\\\\pending.mp3", size: 1024 },
+                        ],
+                        uploaded_files: [],
+                    };
+                    state.selectedUploads = new Set(["pending.mp3"]);
+                    renderUploads();
+                    renderUploadRun();
+                    const checkbox = document.querySelector("[data-upload-file='pending.mp3']");
+                    return {
+                        caption: document.getElementById("upload-caption").textContent,
+                        limit: document.getElementById("upload-limit").textContent,
+                        checkboxDisabled: checkbox.disabled,
+                        startDisabled: document.getElementById("start-upload").disabled,
+                    };
+                    }""",
+                )
+
+                assert "今日已发布 10/10" in rendered["caption"]
+                assert "剩余 0" in rendered["caption"]
+                assert rendered["limit"] == "0"
+                assert rendered["checkboxDisabled"] is True
+                assert rendered["startDisabled"] is True
 
             await browser.close()
     finally:
@@ -244,6 +487,9 @@ async def test_generation_and_upload_pages_use_available_content_width() -> None
                     const layout = document.querySelector('.task-layout');
                     const result = {};
                     for (const stage of ['generation', 'upload']) {
+                    state.view = 'task';
+                    state.stage = stage;
+                    renderView();
                         document.body.dataset.stage = stage;
                         result[stage] = layout.getBoundingClientRect().width;
                     }
@@ -253,6 +499,56 @@ async def test_generation_and_upload_pages_use_available_content_width() -> None
 
                 assert widths["generation"] > 1200
                 assert widths["upload"] > 1200
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_dashboard_keeps_completed_lyrics_when_retrying_another_account() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#dashboard-account-table", state="attached")
+                rendered = await page.evaluate(
+                    """() => {
+                    state.accounts = [
+                        { id: "first", account_name: "已完成一", chrome_debug_port: 9222 },
+                        { id: "second", account_name: "已完成二", chrome_debug_port: 9223 },
+                        { id: "third", account_name: "重跑账号", chrome_debug_port: 9224 },
+                    ];
+                    state.accountId = "first";
+                    state.dashboardSongs = {
+                        first: [{ file_name: "01.md", song_name: "已保存一", valid: true }],
+                        second: [{ file_name: "02.md", song_name: "已保存二", valid: true }],
+                        third: [],
+                    };
+                    state.multiQueue = {
+                        stage: "lyrics",
+                        day: todayValue(),
+                        status: "running",
+                        items: [{ account_id: "third", status: "running", result: null }],
+                    };
+                    renderDashboard();
+                    return {
+                        lyricCount: document.getElementById("dashboard-lyric-count").textContent,
+                        rows: [...document.querySelectorAll("#dashboard-account-table .dashboard-account-row:not(.dashboard-account-head)")]
+                            .map((row) => row.innerText.replace(/\\s+/g, " | ")),
+                    };
+                    }""",
+                )
+
+                assert rendered["lyricCount"] == "2"
+                assert rendered["rows"][0].startswith("已完成一 | 端口 | 9222 | 1 |")
+                assert "已生成" in rendered["rows"][0]
+                assert rendered["rows"][1].startswith("已完成二 | 端口 | 9223 | 1 |")
+                assert "已生成" in rendered["rows"][1]
+                assert rendered["rows"][2].startswith("重跑账号 | 端口 | 9224 | 0 |")
+                assert "处理中" in rendered["rows"][2]
 
             await browser.close()
     finally:
@@ -296,6 +592,712 @@ async def test_pipeline_and_generation_share_one_model_choice() -> None:
                 assert values["fromPipeline"]["pipeline"] == "MiniMax v2.6"
                 assert values["fromPipeline"]["pipelineSingerVisible"] is False
                 assert values["fromPipeline"]["pipelineSingerDisabled"] is True
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_stage_account_lyrics_edit_opens_bound_template() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+
+            async def handle_templates(route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=(
+                        '{"system_prompt":"通用规则",'
+                        '"templates":[{"id":"template","account_id":"target",'
+                        '"name":"账号模板","themes":["都市"],"generation_count":10,'
+                        '"lyric_tone":"第一人称叙事","song_style":"都市流行"}]}'
+                    ),
+                )
+
+            await page.route("**/api/accounts/target/lyric/templates", handle_templates)
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_timeout(300)
+                await page.wait_for_selector("#stage-account-table", state="attached")
+                await page.evaluate(
+                    """() => {
+                    state.accounts = [
+                        { id: "other", account_name: "其它账号", chrome_debug_port: 9222, lyric_dir: "D:\\\\music\\\\other" },
+                        { id: "target", account_name: "目标账号", chrome_debug_port: 9223, lyric_dir: "D:\\\\music\\\\target" },
+                    ];
+                    state.accountId = "other";
+                    state.view = "lyrics";
+                    state.stage = "lyrics";
+                    state.selectedTaskAccounts = new Set(["target"]);
+                    state.accountTemplates = {
+                        other: [],
+                        target: [{
+                            id: "template",
+                            account_id: "target",
+                            name: "账号模板",
+                            themes: ["都市"],
+                            generation_count: 10,
+                            lyric_tone: "第一人称叙事",
+                            song_style: "都市流行",
+                        }],
+                    };
+                    renderView();
+                    renderTaskAccounts();
+                    }""",
+                )
+
+                await page.locator("#stage-account-table [data-edit-stage-account='target']").click()
+                await page.wait_for_timeout(500)
+                await page.wait_for_selector("#lyric-template-form", state="visible")
+                rendered = await page.evaluate(
+                    """() => ({
+                    currentAccount: state.accountId,
+                    view: state.view,
+                    settingsTab: state.settingsTab,
+                    panelOwner: document.querySelector(".lyric-template-panel")?.closest(".view")?.id,
+                    account: document.getElementById("template-account-select").value,
+                    accountLocked: document.getElementById("template-account-select").disabled,
+                    name: document.getElementById("template-name").value,
+                    tone: document.getElementById("template-lyric-tone").value,
+                    style: document.getElementById("template-song-style").value,
+                    caption: document.getElementById("lyric-template-caption").textContent,
+                    })""",
+                )
+
+                assert rendered["currentAccount"] == "target"
+                assert rendered["view"] == "settings"
+                assert rendered["settingsTab"] == "prompt"
+                assert rendered["panelOwner"] == "view-settings"
+                assert rendered["account"] == "target"
+                assert rendered["accountLocked"] is True
+                assert rendered["name"] == "账号模板"
+                assert rendered["tone"] == "第一人称叙事"
+                assert rendered["style"] == "都市流行"
+                assert "目标账号" in rendered["caption"]
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_generation_account_editor_only_shows_sway_singer() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            captured: list[dict] = []
+
+            async def handle_save(route) -> None:
+                captured.append(json.loads(route.request.post_data))
+                payload = captured[-1]
+                payload["model_name"] = "Sway v5.5"
+                payload["singer_name"] = "老岩"
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(payload, ensure_ascii=False),
+                )
+
+            await page.route("**/api/accounts/target", handle_save)
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#generation-account-form", state="attached")
+                await page.evaluate(
+                    """() => {
+                    state.accounts = [{
+                        id: "target",
+                        account_name: "目标账号",
+                        chrome_debug_port: 9223,
+                        model_name: "MiniMax v2.6",
+                        singer_name: "老岩",
+                    }];
+                    state.stage = "generation";
+                    state.view = "task";
+                    state.selectedTaskAccounts = new Set(["target"]);
+                    renderView();
+                    renderTaskAccounts();
+                    openGenerationAccountEditor("target");
+                    }""",
+                )
+
+                singer_field = page.locator(".account-singer-field")
+                assert await singer_field.is_hidden()
+                assert await page.locator("#account-singer-select").is_disabled()
+                assert await page.input_value("#account-singer-select") == ""
+
+                await page.select_option("#account-model-select", "Sway v5.5")
+                assert await singer_field.is_visible()
+                await page.select_option("#account-singer-select", "老岩")
+                await page.click("#generation-account-form button[type='submit']")
+                await page.wait_for_timeout(200)
+
+                assert captured
+                assert captured[-1]["model_name"] == "Sway v5.5"
+                assert captured[-1]["singer_name"] == "老岩"
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_generation_start_is_in_account_scope_and_view_switches_account() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+
+            async def handle_second_songs(route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body="[]",
+                )
+
+            await page.route("**/api/accounts/second/songs**", handle_second_songs)
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#stage-account-table", state="attached")
+                await page.evaluate(
+                    """() => {
+                    state.accounts = [
+                        { id: "first", account_name: "白日逐梦", chrome_debug_port: 9222, model_name: "自动", singer_name: "" },
+                        { id: "second", account_name: "黄振艺", chrome_debug_port: 9223, model_name: "自动", singer_name: "" },
+                    ];
+                    state.accountId = "first";
+                    state.selectedTaskAccounts = new Set(["first", "second"]);
+                    state.view = "task";
+                    state.stage = "generation";
+                    renderAccounts();
+                    renderView();
+                    }""",
+                )
+
+                assert await page.evaluate(
+                    "() => Boolean(document.getElementById('start-run').closest('.task-account-actions'))"
+                )
+                rows = page.locator("#stage-account-table .stage-account-row:not(.stage-account-head)")
+                assert await rows.nth(0).locator("[data-focus-account='first']").is_disabled()
+                await rows.nth(1).locator("[data-focus-account='second']").click()
+                await page.wait_for_function(
+                    "() => state.accountId === 'second' && document.getElementById('queue-caption').textContent.includes('黄振艺')"
+                )
+                assert await rows.nth(1).evaluate("node => node.classList.contains('is-viewing')")
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_generation_view_and_progress_stay_available_while_queue_runs() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+
+            async def handle_second_songs(route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps([
+                        {"file_name": "a.txt", "valid": True, "song_name": "A", "status": "pending"},
+                        {"file_name": "b.txt", "valid": True, "song_name": "B", "status": "pending"},
+                        {"file_name": "c.txt", "valid": True, "song_name": "C", "status": "pending"},
+                    ], ensure_ascii=False),
+                )
+
+            async def handle_current(route) -> None:
+                if "account_id=second" not in route.request.url:
+                    await route.fulfill(status=200, content_type="application/json", body="null")
+                    return
+                run = {
+                    "run_id": "running-run",
+                    "account_id": "second",
+                    "account_name": "黄振艺",
+                    "status": "running",
+                    "current_step": "download_song",
+                    "songs": [
+                        {"file_name": "a.txt", "song_name": "A", "status": "成功", "current_step": "done"},
+                        {"file_name": "b.txt", "song_name": "B", "status": "成功", "current_step": "done"},
+                        {"file_name": "c.txt", "song_name": "C", "status": "running", "current_step": "download_song"},
+                    ],
+                }
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(run, ensure_ascii=False),
+                )
+
+            await page.route("**/api/accounts/second/songs**", handle_second_songs)
+            await page.route("**/api/runs/current**", handle_current)
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#stage-account-table", state="attached")
+                await page.evaluate(
+                    """() => {
+                    state.accounts = [
+                        { id: "first", account_name: "白日逐梦", chrome_debug_port: 9222, model_name: "自动" },
+                        { id: "second", account_name: "黄振艺", chrome_debug_port: 9223, model_name: "自动" },
+                    ];
+                    state.accountId = "first";
+                    state.selectedTaskAccounts = new Set(["first", "second"]);
+                    state.view = "task";
+                    state.stage = "generation";
+                    state.multiQueue = {
+                        stage: "generation",
+                        status: "running",
+                        items: [
+                            { account_id: "first", status: "completed" },
+                            { account_id: "second", status: "running" },
+                        ],
+                    };
+                    state.generationRuns = {
+                        second: {
+                            account_id: "second",
+                            status: "running",
+                            current_step: "download_song",
+                            songs: [
+                                { file_name: "a.txt", status: "成功" },
+                                { file_name: "b.txt", status: "成功" },
+                                { file_name: "c.txt", status: "running", current_step: "download_song" },
+                            ],
+                        },
+                    };
+                    renderAccounts();
+                    renderView();
+                    }""",
+                )
+
+                rows = page.locator("#stage-account-table .stage-account-row:not(.stage-account-head)")
+                second_view = rows.nth(1).locator("[data-focus-account='second']")
+                second_edit = rows.nth(1).locator("[data-edit-stage-account='second']")
+                assert await second_view.is_enabled()
+                assert await second_edit.is_disabled()
+                assert "2 / 3" in await rows.nth(1).inner_text()
+
+                await second_view.click()
+                await page.wait_for_function(
+                    "() => state.accountId === 'second' && state.current?.account_id === 'second'",
+                )
+                assert await page.evaluate("() => multiStageRunning()")
+                assert "2 / 3" in await rows.nth(1).inner_text()
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_upload_start_is_in_account_scope() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#stage-account-table", state="attached")
+                await page.evaluate(
+                    """() => {
+                    state.view = "task";
+                    state.stage = "upload";
+                    renderView();
+                    }""",
+                )
+
+                assert await page.evaluate(
+                    "() => Boolean(document.getElementById('start-upload').closest('.task-account-actions'))",
+                )
+                assert await page.locator("#start-upload").is_visible()
+                assert await page.locator("#start-run").is_hidden()
+                assert await page.locator("#multi-lyrics-start").is_hidden()
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_lyrics_stage_accounts_render_compact_responsive_cards() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#stage-account-table", state="attached")
+                await page.evaluate(
+                    """() => {
+                    const accounts = Array.from({ length: 8 }, (_, index) => ({
+                        id: `account-${index}`,
+                        account_name: `账号${String(index + 1).padStart(2, "0")}`,
+                        chrome_debug_port: 9222 + index,
+                        lyric_dir: `D:\\\\music\\\\account-${index}`,
+                    }));
+                    state.accounts = accounts;
+                    state.accountId = accounts[0].id;
+                    state.view = "lyrics";
+                    state.stage = "lyrics";
+                    state.selectedTaskAccounts = new Set(accounts.map((account) => account.id));
+                    state.accountTemplates = Object.fromEntries(accounts.map((account, index) => [account.id, [{
+                        id: `template-${index}`,
+                        account_id: account.id,
+                        name: `模板${index + 1}`,
+                        generation_count: 5,
+                    }]]));
+                    state.dashboardSongs = {
+                        "account-0": [
+                            { file_name: "01.md", song_name: "晚风来信" },
+                            { file_name: "02.md", song_name: "海面日出" },
+                        ],
+                        "account-2": [{ file_name: "03.md", song_name: "旧城列车" }],
+                    };
+                    state.multiQueue = {
+                        stage: "lyrics",
+                        day: todayValue(),
+                        status: "running",
+                        items: [
+                            {
+                                account_id: "account-0",
+                                status: "completed",
+                                result: {
+                                    saved_count: 2,
+                                    saved: [
+                                        { song_name: "晚风来信" },
+                                        { song_name: "海面日出" },
+                                    ],
+                                },
+                            },
+                            { account_id: "account-1", status: "running", result: null },
+                            { account_id: "account-2", status: "failed", result: null },
+                            { account_id: "account-3", status: "pending", result: null },
+                        ],
+                    };
+                    renderView();
+                    renderTaskAccounts();
+                    }""",
+                )
+
+                wide = await page.evaluate(
+                    """() => {
+                    const grid = document.getElementById("stage-account-table");
+                    const summary = document.getElementById("lyric-summary-list");
+                    const columns = getComputedStyle(grid).gridTemplateColumns.split(" ").filter(Boolean).length;
+                    return {
+                        columns,
+                        cards: grid.querySelectorAll(".lyric-account-card").length,
+                        visibleSections: document.querySelectorAll("#view-lyrics .lyric-layout > section:not([hidden])").length,
+                        startVisible: document.getElementById("multi-lyrics-start").checkVisibility(),
+                        accountCards: grid.innerText,
+                        completed: summary.querySelector("[data-lyric-summary-account='account-0']").innerText,
+                        running: summary.querySelector("[data-lyric-summary-account='account-1']").innerText,
+                        failed: summary.querySelector("[data-lyric-summary-account='account-2']").innerText,
+                        overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+                    };
+                    }""",
+                )
+                await page.set_viewport_size({"width": 1200, "height": 900})
+                narrow = await page.evaluate(
+                    """() => getComputedStyle(document.getElementById("stage-account-table")).gridTemplateColumns
+                        .split(" ")
+                        .filter(Boolean).length""",
+                )
+
+                assert 6 <= wide["columns"] <= 7
+                assert wide["cards"] == 8
+                assert wide["visibleSections"] == 1
+                assert wide["startVisible"] is True
+                assert "晚风来信" not in wide["accountCards"]
+                assert "海面日出" not in wide["accountCards"]
+                assert "已完成" in wide["completed"]
+                assert "晚风来信" in wide["completed"]
+                assert "海面日出" in wide["completed"]
+                assert "正在生成" in wide["running"]
+                assert "生成完成后显示歌名" in wide["running"]
+                assert "生成失败" in wide["failed"]
+                assert "旧城列车" in wide["failed"]
+                assert wide["overflow"] <= 0
+                assert narrow < wide["columns"]
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_ai_lyrics_provider_can_switch_between_configured_apis() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            captured: dict = {}
+            configs = [
+                {
+                    "id": "first",
+                    "name": "接口一",
+                    "api_base_url": "https://api-one.example.com/v1",
+                    "api_key": "key-one",
+                    "model": "model-one",
+                    "max_retries": 1,
+                },
+                {
+                    "id": "second",
+                    "name": "接口二",
+                    "api_base_url": "https://api-two.example.com/v1",
+                    "api_key": "key-two",
+                    "model": "model-two",
+                    "max_retries": 2,
+                },
+            ]
+
+            async def handle_settings(route) -> None:
+                if route.request.method == "PUT":
+                    captured.update(route.request.post_data_json)
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=(
+                            '{"page_load_timeout_seconds":30,'
+                            '"generation_timeout_seconds":300,'
+                            '"editor_import_wait_seconds":8,'
+                            '"export_timeout_seconds":60,'
+                            '"download_timeout_seconds":30,'
+                            '"log_history_limit":1000,'
+                            '"ai_api_base_url":"https://api-two.example.com/v1",'
+                            '"ai_api_key":"key-two",'
+                            '"ai_model":"model-two",'
+                            '"ai_max_retries":2,'
+                            '"ai_api_configs":' + json.dumps(configs) + ","
+                            '"active_ai_api_config_id":"second",'
+                            '"ai_system_prompt":"' + ("X" * 150) + '"}'
+                        ),
+                    )
+                    return
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=(
+                        '{"page_load_timeout_seconds":30,'
+                        '"generation_timeout_seconds":300,'
+                        '"editor_import_wait_seconds":8,'
+                        '"export_timeout_seconds":60,'
+                        '"download_timeout_seconds":30,'
+                        '"log_history_limit":1000,'
+                        '"ai_api_base_url":"https://api-one.example.com/v1",'
+                        '"ai_api_key":"key-one",'
+                        '"ai_model":"model-one",'
+                        '"ai_max_retries":1,'
+                        '"ai_api_configs":' + json.dumps(configs) + ","
+                        '"active_ai_api_config_id":"first",'
+                        '"ai_system_prompt":"' + ("X" * 150) + '"}'
+                    ),
+                )
+
+            await page.route("**/api/settings", handle_settings)
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#ai-provider-select", state="attached")
+                await page.evaluate(
+                    """() => {
+                    state.view = "settings";
+                    state.settingsTab = "ai";
+                    renderView();
+                    state.view = "lyrics";
+                    state.stage = "lyrics";
+                    state.selectedTaskAccounts = new Set(["first"]);
+                    state.accountId = "first";
+                    state.selectedLyricTemplateId = "template";
+                    renderView();
+                    renderControls();
+                    }""",
+                )
+
+                select = page.locator("#ai-provider-select")
+                assert await select.input_value() == "first"
+                assert await page.locator("[data-use-ai-config='second']").count() == 1
+                await select.select_option("second")
+                await page.wait_for_timeout(200)
+
+                assert captured == {"active_ai_api_config_id": "second"}
+                assert await select.input_value() == "second"
+                assert "model-two" in await select.inner_text()
+                assert await page.locator("#multi-lyrics-start").is_enabled()
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_settings_ai_page_can_add_another_provider() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            captured: dict = {}
+            saved = False
+            provider = {
+                "id": "new-provider",
+                "name": "新接口",
+                "api_base_url": "https://api-new.example.com/v1",
+                "api_key": "new-key",
+                "model": "new-model",
+                "max_retries": 2,
+            }
+
+            async def handle_settings(route) -> None:
+                nonlocal saved
+                if route.request.method == "PUT":
+                    captured.update(route.request.post_data_json)
+                    saved = True
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps({
+                            "page_load_timeout_seconds": 30,
+                            "generation_timeout_seconds": 300,
+                            "editor_import_wait_seconds": 8,
+                            "export_timeout_seconds": 60,
+                            "download_timeout_seconds": 30,
+                            "log_history_limit": 1000,
+                            "ai_api_base_url": provider["api_base_url"],
+                            "ai_api_key": provider["api_key"],
+                            "ai_model": provider["model"],
+                            "ai_max_retries": provider["max_retries"],
+                            "ai_api_configs": [provider],
+                            "active_ai_api_config_id": provider["id"],
+                            "ai_system_prompt": "X" * 150,
+                        }),
+                    )
+                    return
+                if saved:
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps({
+                            "page_load_timeout_seconds": 30,
+                            "generation_timeout_seconds": 300,
+                            "editor_import_wait_seconds": 8,
+                            "export_timeout_seconds": 60,
+                            "download_timeout_seconds": 30,
+                            "log_history_limit": 1000,
+                            "ai_api_base_url": provider["api_base_url"],
+                            "ai_api_key": provider["api_key"],
+                            "ai_model": provider["model"],
+                            "ai_max_retries": provider["max_retries"],
+                            "ai_api_configs": [provider],
+                            "active_ai_api_config_id": provider["id"],
+                            "ai_system_prompt": "X" * 150,
+                        }),
+                    )
+                    return
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "page_load_timeout_seconds": 30,
+                        "generation_timeout_seconds": 300,
+                        "editor_import_wait_seconds": 8,
+                        "export_timeout_seconds": 60,
+                        "download_timeout_seconds": 30,
+                        "log_history_limit": 1000,
+                        "ai_api_base_url": "",
+                        "ai_api_key": "",
+                        "ai_model": "",
+                        "ai_max_retries": 2,
+                        "ai_api_configs": [],
+                        "active_ai_api_config_id": "",
+                        "ai_system_prompt": "X" * 150,
+                    }),
+                )
+
+            await page.route("**/api/settings", handle_settings)
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#ai-settings-form", state="attached")
+                await page.wait_for_timeout(300)
+                await page.evaluate(
+                    """() => {
+                    state.view = "settings";
+                    state.settingsTab = "ai";
+                    renderView();
+                    }""",
+                )
+
+                assert await page.locator("#ai-settings-form").is_visible()
+                form = page.locator("#ai-settings-form")
+                await form.locator("[name='ai_provider_name']").fill("新接口")
+                await form.locator("[name='ai_api_base_url']").fill(provider["api_base_url"])
+                await form.locator("[name='ai_api_key']").fill(provider["api_key"])
+                await form.locator("[name='ai_model']").fill(provider["model"])
+                await form.locator("[name='ai_max_retries']").fill("2")
+                await page.locator("#save-settings").click()
+                await page.wait_for_timeout(200)
+
+                assert captured["active_ai_api_config_id"] == captured["ai_api_configs"][0]["id"]
+                assert captured["ai_api_configs"][0]["name"] == provider["name"]
+                assert captured["ai_api_configs"][0]["api_base_url"] == provider["api_base_url"]
+                assert await page.locator("#ai-settings-form").is_hidden()
+                assert "已配置 1 个 AI 接口" in await page.locator("#ai-config-cards").inner_text()
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_ai_api_card_can_run_single_connection_check() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            captured: list[dict] = []
+
+            async def handle_test(route) -> None:
+                captured.append(route.request.post_data_json)
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body='{"ok":true,"model":"model-one","model_count":8}',
+                )
+
+            await page.route("**/api/settings/ai/test", handle_test)
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#ai-config-cards", state="attached")
+                await page.wait_for_timeout(300)
+                await page.evaluate(
+                    """() => {
+                    state.settings = {
+                        ai_api_configs: [
+                            { id: "first", name: "接口一", api_base_url: "https://api-one.example.com/v1", api_key: "key-one", model: "model-one", max_retries: 1 },
+                            { id: "second", name: "接口二", api_base_url: "https://api-two.example.com/v1", api_key: "key-two", model: "model-two", max_retries: 1 },
+                        ],
+                        active_ai_api_config_id: "first",
+                    };
+                    state.view = "settings";
+                    state.settingsTab = "ai";
+                    renderView();
+                    }""",
+                )
+
+                cards = page.locator("#ai-config-cards .settings-card")
+                assert await cards.count() == 2
+                await cards.nth(0).locator("[data-test-ai-config='first']").click()
+                await page.wait_for_timeout(200)
+
+                assert len(captured) == 1
+                assert captured[0] == {
+                    "ai_api_base_url": "https://api-one.example.com/v1",
+                    "ai_api_key": "key-one",
+                    "ai_model": "model-one",
+                }
+                assert "可用" in await cards.nth(0).inner_text()
+                assert "未检测" in await cards.nth(1).inner_text()
 
             await browser.close()
     finally:

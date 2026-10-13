@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from backend.errors import ValidationFailed
-from backend.lyrics import list_lyric_files, parse_lyrics
+from backend.lyrics import list_lyric_files, parse_lyrics, sanitize_lyrics_for_generation
 
 
 def sample_markdown(song_name: str = "夜色引擎") -> str:
@@ -29,8 +29,25 @@ def test_parse_lyrics_with_full_width_title() -> None:
 
     assert parsed.song_name == "夜色引擎"
     assert parsed.lyrics.startswith("夜色像一台缓慢转动的引擎")
-    assert "[End]" in parsed.lyrics
+    assert "[End]" not in parsed.lyrics
     assert parsed.style.startswith("男声摇滚")
+
+
+def test_sanitize_lyrics_separates_structure_from_authoring_notes() -> None:
+    lyrics = (
+        "[Chorus 1][no intro, 4 bars, fuzz bass + 808 + girls' choir hook]\n"
+        "风 把 灯光 吹成 一 条 街\n"
+        "(bright, close-mic)\n"
+        "[Verse 1][4 bars, kick, muted guitar, male rap low]\n"
+        "你 站在 路口 没有 回头"
+    )
+
+    assert sanitize_lyrics_for_generation(lyrics) == (
+        "[Chorus]\n"
+        "风 把 灯光 吹成 一 条 街\n\n"
+        "[Verse 1]\n"
+        "你 站在 路口 没有 回头"
+    )
 
 
 def test_parse_lyrics_with_half_width_title() -> None:

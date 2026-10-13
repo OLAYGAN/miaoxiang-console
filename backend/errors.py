@@ -49,3 +49,11 @@ class SongVerificationError(BrowserFlowError):
 
 class SongGenerationFailureError(BrowserFlowError):
     code = "SONG_GENERATION_FAILED"
+
+
+class SongExportError(BrowserFlowError):
+    code = "SONG_EXPORT_FAILED"
+
+
+class SongDownloadError(BrowserFlowError):
+    code = "SONG_DOWNLOAD_FAILED"

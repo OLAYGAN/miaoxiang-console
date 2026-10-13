@@ -17,6 +17,15 @@ const state = {
   selectedPipelineQueueAccounts: new Set(),
   selectedPipelineDetailAccountId: "",
   pipelineDetailPinned: false,
+  selectedTaskAccounts: new Set(),
+  multiQueue: null,
+  latestLyricQueue: null,
+  dashboardSongs: {},
+  generationRuns: {},
+  accountTemplates: {},
+  stageUploads: {},
+  lyricTemplateAccountLocked: false,
+  editingStageAccountId: "",
   current: null,
   runStatus: "",
   notifiedRunId: "",
@@ -26,15 +35,16 @@ const state = {
   socketTimer: null,
   pollTimer: null,
   formMode: "edit",
-  view: "task",
+  view: "dashboard",
   stage: "generation",
   generationModel: "自动",
   generationSinger: "",
   settingsTab: "runtime",
-  accountMenuOpen: false,
   accountReloadId: 0,
   accountRoot: "",
   aiConfigEditorOpen: false,
+  editingAIProviderId: "",
+  aiApiChecks: {},
   accountEditorOpen: false,
   editingAccountId: "",
   loginBrowser: null,
@@ -55,6 +65,7 @@ const state = {
 
 const THEME_OPTIONS = ["爱情", "友情", "校园", "都市", "治愈", "励志", "古风", "家庭", "旅行", "孤独"];
 const DEFAULT_CREATE_URL = "https://music.douyin.com/studio/create";
+const SWAY_MODEL_NAME = "Sway v5.5";
 const GENERATION_MODEL_STORAGE_KEY = "aimusic.generationModel";
 const GENERATION_SINGER_STORAGE_KEY = "aimusic.generationSinger";
 
@@ -62,17 +73,16 @@ const elements = {};
 
 for (const id of [
   "service-status", "socket-status", "task-status", "account-select", "account-form",
-  "account-new", "account-cancel", "account-copy", "account-cards", "account-switcher",
-  "account-menu-button", "account-menu-value", "account-menu",
+  "account-new", "account-cancel", "account-copy", "account-cards",
   "account-root-field", "account-root-input", "choose-account-root", "account-derived-paths",
   "derived-lyric-path", "derived-output-path", "derived-download-path", "derived-chrome-path",
   "chrome-profile-field", "lyric-dir-field", "output-dir-field", "download-dir-field",
   "queue-caption", "select-all",
   "generation-model", "generation-singer",
-  "select-failed", "refresh-songs", "start-run", "pause-run", "resume-run", "stop-run",
+  "select-failed", "repair-run", "refresh-songs", "start-run", "pause-run", "resume-run", "stop-run",
   "fresh-run", "metric-pending", "metric-success", "metric-skip", "metric-fail",
   "metric-step", "song-table", "queue-empty", "settings-form", "save-settings",
-  "ai-settings-form", "settings-subnav", "settings-tab-runtime", "settings-tab-ai", "test-ai-settings",
+  "ai-settings-form", "settings-subnav", "settings-tab-runtime", "settings-tab-ai", "settings-tab-prompt", "test-ai-settings",
   "ai-config-cards", "ai-config-cancel",
   "lyric-dir-input", "current-lyric-folder", "apply-lyric-dir",
   "pipeline-caption", "pipeline-ai-created",
@@ -93,8 +103,16 @@ for (const id of [
   "external-verification-note", "stop-upload",
   "retry-rejected-upload",
   "workflow-header", "stage-lyrics", "stage-generation", "stage-upload", "stage-pipeline",
+  "task-account-all", "task-account-clear", "task-account-list", "task-account-count",
+  "stage-account-table", "workflow-title", "workflow-caption", "ai-provider-select",
+  "multi-stage-caption", "multi-lyrics-start", "workflow-date",
+  "generation-account-form", "generation-account-title", "generation-account-cancel",
+  "account-model-select", "account-singer-select",
+  "dashboard-date", "dashboard-account-count", "dashboard-lyric-count", "dashboard-download-count",
+  "dashboard-pending-upload-count", "dashboard-published-count", "dashboard-error-count", "dashboard-account-table",
+  "lyric-summary-caption", "lyric-summary-list", "settings-template-slot",
   "lyric-system-prompt", "save-lyric-prompt", "lyric-results", "lyric-empty", "save-lyrics",
-  "lyric-prompt-details",
+  "lyric-prompt-details", "lyric-prompt-panel",
   "lyric-progress-panel", "lyric-progress-message", "lyric-progress-elapsed", "lyric-progress-chars",
   "lyric-progress-count", "lyric-progress-names", "lyric-progress-reasoning",
   "lyric-result-caption",
@@ -115,10 +133,13 @@ function renderView() {
   document.body.classList.toggle("task-view-active", workflowVisible);
   elements["workflow-header"].hidden = !workflowVisible;
   document.querySelectorAll(".nav-item").forEach((item) => {
-    const activeView = state.view === "lyrics" ? "task" : state.view;
-    item.classList.toggle("is-active", item.dataset.view === activeView);
+    const viewMatches = item.dataset.view === state.view;
+    const stageMatches = item.dataset.view !== "task" || item.dataset.stage === state.stage;
+    item.classList.toggle("is-active", viewMatches && stageMatches);
   });
   renderStages();
+  renderTaskAccounts();
+  renderDashboard();
   renderSettingsTabs();
 }
 
@@ -128,6 +149,117 @@ function renderStages() {
     const active = item.dataset.stage === state.stage;
     item.classList.toggle("is-active", active);
     item.setAttribute("aria-selected", active ? "true" : "false");
+  });
+}
+
+function syncLyricQueueSnapshot(queue) {
+  if (queue?.stage === "lyrics" && queue.day === todayValue()) {
+    state.latestLyricQueue = queue;
+  }
+  if (state.latestLyricQueue && state.latestLyricQueue.day !== todayValue()) {
+    state.latestLyricQueue = null;
+  }
+}
+
+function renderDashboard() {
+  const day = todayValue();
+  const lyricQueue = state.multiQueue?.stage === "lyrics" && state.multiQueue.day === day
+    ? state.multiQueue
+    : (state.latestLyricQueue?.day === day ? state.latestLyricQueue : null);
+  const statuses = state.songs.map(songState);
+  const files = state.uploads?.files || [];
+  const uploadedFiles = state.uploads?.uploaded_files || [];
+  const dailyUsed = Number(state.uploads?.daily_used ?? uploadedFiles.length);
+  const successful = statuses.filter((status) => status === "success" || status === "skipped").length;
+  const failed = statuses.filter(isFailureStatus).length;
+  const lyricItems = lyricQueue?.items || [];
+  const savedLyricCount = lyricItems.reduce(
+    (total, item) => total + Number(item.result?.saved_count ?? item.result?.generated_count ?? 0),
+    0,
+  );
+  const failedLyricAccounts = lyricItems.filter((item) => item.status === "failed").length;
+  const dashboardSongsLoaded = state.accounts.every((account) => Object.hasOwn(state.dashboardSongs, account.id));
+  const directoryLyricCount = dashboardSongsLoaded
+    ? state.accounts.reduce((total, account) => total + (state.dashboardSongs[account.id] || []).length, 0)
+    : state.songs.length;
+  const lyricCount = Math.max(directoryLyricCount, lyricQueue ? savedLyricCount : 0);
+  const errorCount = lyricQueue ? failedLyricAccounts : failed;
+
+  elements["dashboard-date"].textContent = `今日 ${day}`;
+  elements["workflow-date"].textContent = `日期 ${day}`;
+  elements["dashboard-account-count"].textContent = String(state.accounts.length);
+  elements["dashboard-lyric-count"].textContent = String(lyricCount);
+  elements["dashboard-download-count"].textContent = String(successful);
+  elements["dashboard-pending-upload-count"].textContent = String(files.length);
+  elements["dashboard-published-count"].textContent = state.uploads ? String(dailyUsed) : "-";
+  elements["dashboard-error-count"].textContent = String(errorCount);
+
+  const table = elements["dashboard-account-table"];
+  table.querySelectorAll(".dashboard-account-row:not(.dashboard-account-head)").forEach((node) => node.remove());
+
+  if (!state.accounts.length) {
+    const empty = document.createElement("div");
+    empty.className = "dashboard-account-row dashboard-account-empty";
+    empty.textContent = "暂无账号";
+    table.append(empty);
+    return;
+  }
+
+  const statusLabels = { pending: "等待", running: "处理中", completed: "成功", failed: "失败", stopped: "停止" };
+  const statusQueue = state.multiQueue?.day === day ? state.multiQueue : lyricQueue;
+  state.accounts.forEach((account) => {
+    const lyricItem = lyricQueue?.items.find((item) => item.account_id === account.id);
+    const queueItem = statusQueue?.items.find((item) => item.account_id === account.id);
+    const isCurrent = account.id === state.accountId;
+    const accountSongs = state.dashboardSongs[account.id] || [];
+    const accountSongsLoaded = Object.hasOwn(state.dashboardSongs, account.id);
+    const accountLyricCount = lyricItem
+      ? Number(lyricItem.result?.saved_count ?? lyricItem.result?.generated_count ?? 0)
+      : accountSongsLoaded ? accountSongs.length : isCurrent ? state.songs.length : 0;
+    const row = document.createElement("div");
+    row.className = `dashboard-account-row${isCurrent ? " is-current" : ""}`;
+    row.dataset.dashboardAccount = account.id;
+
+    const name = document.createElement("span");
+    name.className = "dashboard-account-name";
+    name.textContent = account.account_name;
+    const port = document.createElement("small");
+    port.textContent = `端口 ${account.chrome_debug_port}`;
+    name.append(port);
+    row.append(name);
+
+    const savedSongs = lyricItem?.result?.saved?.length
+      ? lyricItem.result.saved
+      : accountSongs;
+    if (savedSongs.length) {
+      row.title = savedSongs.map((song) => song.song_name).join("、");
+    }
+
+    for (const value of [
+      accountSongsLoaded || lyricItem || isCurrent ? accountLyricCount : "-",
+      isCurrent ? successful : "-",
+      isCurrent && state.uploads ? dailyUsed : "-",
+      lyricItem ? (lyricItem.status === "failed" ? 1 : 0) : isCurrent ? failed : "-",
+    ]) {
+      const cell = document.createElement("span");
+      cell.textContent = String(value);
+      row.append(cell);
+    }
+
+    const status = document.createElement("span");
+    status.className = "dashboard-account-status";
+    if (queueItem) {
+      status.textContent = statusLabels[queueItem.status] || queueItem.status;
+      status.dataset.tone = queueItem.status;
+    } else if (accountLyricCount > 0) {
+      status.textContent = "已生成";
+      status.dataset.tone = "completed";
+    } else {
+      status.textContent = isCurrent ? "当前" : state.selectedTaskAccounts.has(account.id) ? "已选择" : "待选择";
+      status.dataset.tone = isCurrent ? "current" : state.selectedTaskAccounts.has(account.id) ? "selected" : "idle";
+    }
+    row.append(status);
+    table.append(row);
   });
 }
 
@@ -171,6 +303,23 @@ function runningStatuses() {
   return new Set(["running", "paused", "stopping"]);
 }
 
+function successfulSongStatus(value) {
+  return value === "success" || value === "skipped" || value === "成功" || value === "已跳过";
+}
+
+function liveGenerationRun(accountId) {
+  const run = state.generationRuns[accountId];
+  return run && runningStatuses().has(run.status) ? run : null;
+}
+
+function rememberGenerationRun(run) {
+  if (!run?.account_id) return;
+  state.generationRuns[run.account_id] = run;
+  if (runningStatuses().has(run.status)) {
+    state.dashboardSongs[run.account_id] = run.songs || [];
+  }
+}
+
 function runMatchesCurrentAccount(run) {
   return Boolean(run?.account_id) && (!state.accountId || run.account_id === state.accountId);
 }
@@ -185,6 +334,11 @@ function isRunning() {
 
 function renderTaskStatus() {
   const chip = elements["task-status"];
+  if (multiStageRunning()) {
+    chip.textContent = state.multiQueue.status === "stopping" ? "多账号任务停止中" : "多账号任务运行中";
+    chip.className = "status-chip is-active";
+    return;
+  }
   if (!state.current) {
     if (uploadRunning()) {
       const waitingCode = ["waiting_verification_code", "waiting_external_verification_code"]
@@ -206,7 +360,7 @@ function renderTaskStatus() {
     stopped: "已停止",
     generation_limit: "生成上限",
     login_required: "需要登录",
-    verification_failed: "标题校验失败",
+    verification_failed: "歌词校验失败",
   };
   chip.textContent = labels[state.current.status] || state.current.status;
   chip.className = `status-chip ${runningStatuses().has(state.current.status) ? "is-active" : state.current.status === "completed" ? "is-live" : "is-warn"}`;
@@ -215,81 +369,17 @@ function renderTaskStatus() {
 function renderAccounts() {
   const select = elements["account-select"];
   select.innerHTML = "";
-  const option = new Option(state.accounts.length ? "选择账号" : "暂无账号", "");
-  option.disabled = true;
-  select.append(option);
   for (const account of state.accounts) {
     select.append(new Option(`${account.account_name} · ${account.chrome_debug_port}`, account.id));
   }
   select.value = state.accountId || "";
-  renderAccountMenu();
+  const available = new Set(state.accounts.map((account) => account.id));
+  state.selectedTaskAccounts = new Set(
+    [...state.selectedTaskAccounts].filter((accountId) => available.has(accountId)),
+  );
   renderAccountCards();
   renderAccountEditor();
-}
-
-function accountSwitchBlockReason() {
-  if (isRunning()) return "生成任务运行中不能切换账号";
-  if (uploadRunning()) {
-    return ["waiting_verification_code", "waiting_external_verification_code"]
-      .includes(state.uploadRun?.step)
-      ? "上传任务正在等待手机验证码；提交验证码或停止上传后才能切换账号"
-      : "上传任务运行中不能切换账号";
-  }
-  if (pipelineWorkflowBusy()) return "完整流水线运行中不能切换账号";
-  return "";
-}
-
-function accountMenuDisabled() {
-  return Boolean(accountSwitchBlockReason());
-}
-
-function renderAccountMenu() {
-  const selected = state.accounts.find((account) => account.id === state.accountId);
-  elements["account-menu-value"].textContent = selected
-    ? selected.account_name
-    : state.accounts.length
-      ? "选择账号"
-      : "暂无账号";
-  elements["account-menu-button"].disabled = accountMenuDisabled();
-  elements["account-menu-button"].setAttribute("aria-expanded", state.accountMenuOpen ? "true" : "false");
-  elements["account-menu-button"].dataset.tip = accountSwitchBlockReason() || "切换当前妙响账号";
-  elements["account-switcher"].classList.toggle("is-open", state.accountMenuOpen);
-
-  const menu = elements["account-menu"];
-  menu.innerHTML = "";
-  if (!state.accounts.length) {
-    const empty = document.createElement("div");
-    empty.className = "account-menu-empty";
-    empty.textContent = "暂无可切换账号";
-    menu.append(empty);
-    return;
-  }
-
-  for (const account of state.accounts) {
-    const option = document.createElement("button");
-    option.type = "button";
-    option.className = `account-menu-option${account.id === state.accountId ? " is-selected" : ""}`;
-    option.dataset.accountMenuId = account.id;
-    option.setAttribute("role", "option");
-    option.setAttribute("aria-selected", account.id === state.accountId ? "true" : "false");
-    const name = document.createElement("span");
-    name.className = "account-menu-name";
-    name.textContent = account.account_name;
-    const port = document.createElement("small");
-    port.className = "account-menu-port";
-    port.textContent = `端口 ${account.chrome_debug_port}`;
-    option.append(name, port);
-    menu.append(option);
-  }
-}
-
-function setAccountMenuOpen(open) {
-  if (open && accountMenuDisabled()) {
-    toast(accountSwitchBlockReason(), true);
-    return;
-  }
-  state.accountMenuOpen = open;
-  renderAccountMenu();
+  renderTaskAccounts();
 }
 
 function todayValue() {
@@ -321,6 +411,413 @@ function applyGenerationSinger(value) {
     if ([...select.options].some((option) => option.value === value)) select.value = value;
   }
   state.generationSinger = value;
+}
+
+function multiStageRunning() {
+  return Boolean(state.multiQueue && ["running", "stopping"].includes(state.multiQueue.status));
+}
+
+function renderTaskAccounts() {
+  const stageMeta = {
+    lyrics: { title: "AI 作词", caption: "全部账号 · 并联执行" },
+    generation: { title: "生成下载", caption: "全部账号 · 串联执行" },
+    upload: { title: "上传发布", caption: "全部账号 · 串联执行" },
+    pipeline: { title: "完整流水线", caption: "全部账号 · 按队列串联" },
+  }[state.stage] || { title: "任务", caption: "全部账号" };
+  elements["workflow-title"].textContent = stageMeta.title;
+  elements["workflow-caption"].textContent = stageMeta.caption;
+  elements["task-account-count"].textContent = `已选 ${state.selectedTaskAccounts.size} / ${state.accounts.length}`;
+  const busy = multiStageRunning() || isRunning() || uploadRunning() || pipelineWorkflowBusy();
+  elements["task-account-all"].disabled = busy || !state.accounts.length;
+  elements["task-account-clear"].disabled = busy || !state.selectedTaskAccounts.size;
+
+  const table = elements["stage-account-table"];
+  table.innerHTML = "";
+  table.classList.toggle("stage-account-grid", state.stage === "lyrics");
+  if (state.stage === "lyrics") {
+    renderLyricAccountCards(table, busy);
+    renderLyricSongSummary();
+    renderMultiStage();
+    return;
+  }
+
+  const columns = {
+    lyrics: ["选择", "账号", "状态", "歌词", "模板 / 提示词", "位置", "操作"],
+    generation: ["选择", "账号", "状态", "进度", "模型 / 人声", "当前步骤", "操作"],
+    upload: ["选择", "账号", "状态", "额度", "发布配置", "当前步骤", "操作"],
+    pipeline: ["选择", "账号", "状态", "总进度", "队列配置", "当前阶段", "操作"],
+  }[state.stage] || ["选择", "账号", "状态", "进度", "配置", "步骤", "操作"];
+  const head = document.createElement("div");
+  head.className = "stage-account-row stage-account-head";
+  for (const column of columns) {
+    const cell = document.createElement("span");
+    cell.textContent = column;
+    head.append(cell);
+  }
+  table.append(head);
+
+  if (!state.accounts.length) {
+    const empty = document.createElement("div");
+    empty.className = "stage-account-row stage-account-empty";
+    empty.textContent = "账号管理中暂无账号";
+    table.append(empty);
+    renderMultiStage();
+    return;
+  }
+
+  state.accounts.forEach((account) => {
+    const row = document.createElement("div");
+    row.className = `stage-account-row${state.selectedTaskAccounts.has(account.id) ? " is-selected" : ""}${
+      state.stage === "generation" && account.id === state.accountId ? " is-viewing" : ""
+    }`;
+    row.dataset.stageAccount = account.id;
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = state.selectedTaskAccounts.has(account.id);
+    checkbox.disabled = busy;
+    checkbox.dataset.taskAccount = account.id;
+
+    const selectCell = document.createElement("span");
+    selectCell.className = "stage-account-select";
+    selectCell.append(checkbox);
+
+    const accountCell = document.createElement("span");
+    accountCell.className = "stage-account-name";
+    accountCell.innerHTML = "<strong></strong><small></small>";
+    accountCell.querySelector("strong").textContent = account.account_name;
+    accountCell.querySelector("small").textContent = `端口 ${account.chrome_debug_port}`;
+
+    const run = liveGenerationRun(account.id);
+    const songs = run?.songs?.length ? run.songs : state.dashboardSongs[account.id] || [];
+    const successCount = songs.filter((song) => successfulSongStatus(song.status)).length;
+    const failureCount = songs.filter((song) => isFailureStatus(song.status)).length;
+    const upload = state.stageUploads[account.id];
+    const templates = state.accountTemplates[account.id] || [];
+    const template = templates.find((item) => item.id === state.selectedLyricTemplateId && item.account_id === account.id) || templates[0];
+    const queueItem = state.multiQueue?.stage === state.stage
+      ? state.multiQueue?.items.find((item) => item.account_id === account.id)
+      : null;
+
+    const statusLabels = { pending: "等待", running: "处理中", completed: "成功", failed: "失败", stopped: "停止" };
+    let statusText = "等待";
+    let statusTone = "waiting";
+    if (queueItem) {
+      statusText = statusLabels[queueItem.status] || queueItem.status;
+      statusTone = queueItem.status === "completed" ? "completed" : queueItem.status === "running" ? "running" : queueItem.status;
+    } else if (state.stage === "lyrics" && songs.length) {
+      statusText = "已生成";
+      statusTone = "completed";
+    } else if (state.stage === "generation" && failureCount) {
+      statusText = "有异常";
+      statusTone = "failed";
+    } else if (state.stage === "generation" && successCount) {
+      statusText = "已下载";
+      statusTone = "completed";
+    } else if (state.stage === "upload" && upload && Number(upload.daily_used || 0) > 0) {
+      statusText = "已发布";
+      statusTone = "completed";
+    } else if (state.stage === "pipeline" && state.pipelineQueue) {
+      const pipelineItem = state.pipelineQueue.items.find((item) => item.account_id === account.id);
+      if (pipelineItem) {
+        statusText = statusLabels[pipelineItem.status] || pipelineItem.status;
+        statusTone = pipelineItem.status;
+      }
+    }
+
+    const statusCell = document.createElement("span");
+    const statusPill = document.createElement("span");
+    statusPill.className = `state state-${statusTone}`;
+    statusPill.textContent = statusText;
+    statusCell.append(statusPill);
+
+    const progress = {
+      lyrics: `${songs.length} 首`,
+      generation: `${successCount} / ${songs.length}`,
+      upload: upload ? `${upload.daily_used || 0} / ${upload.daily_limit || 10}` : "-",
+      pipeline: `${successCount} / ${songs.length}`,
+    }[state.stage] || "-";
+    const progressCell = document.createElement("span");
+    progressCell.textContent = progress;
+
+    let configText = "-";
+    let configSub = "";
+    let stepText = "-";
+    if (state.stage === "lyrics") {
+      configText = template?.name || "未设置模板";
+      configSub = template ? `生成 ${template.generation_count} 首` : "点击修改创建";
+      stepText = joinDayFolder(account.lyric_dir, todayValue());
+    } else if (state.stage === "generation") {
+      configText = account.model_name || "自动";
+      configSub = account.model_name === SWAY_MODEL_NAME
+        ? (account.singer_name ? `人声：${account.singer_name}` : "人声：平台默认")
+        : "人声：不适用";
+      const runningSong = songs.find((song) => song.status === "running");
+      const failedSong = songs.find((song) => isFailureStatus(song.status));
+      stepText = run
+        ? stepLabel(run.current_step)
+        : queueItem?.status === "running" && runningSong
+        ? stepLabel(runningSong.current_step)
+        : failedSong ? stateLabel(failedSong.status) : successCount === songs.length && songs.length ? "完成" : "等待";
+    } else if (state.stage === "upload") {
+      configText = `艺人：${account.upload_artist_name || "-"}`;
+      configSub = `AI 创作${state.uploadAiCreated ? "是" : "否"} · 上限 ${account.upload_batch_size}`;
+      stepText = upload ? `待发布 ${upload.files?.length || 0} 首` : "-";
+    } else if (state.stage === "pipeline") {
+      configText = template?.name || "未设置模板";
+      configSub = `AI 创作${elements["pipeline-ai-created"].value === "yes" ? "是" : "否"}`;
+      stepText = state.pipelineQueue?.items?.find((item) => item.account_id === account.id)?.stage || "等待";
+    }
+
+    const configCell = document.createElement("span");
+    configCell.className = "stage-account-config";
+    configCell.innerHTML = "<strong></strong><small></small>";
+    configCell.querySelector("strong").textContent = configText;
+    configCell.querySelector("small").textContent = configSub;
+    configCell.title = configSub;
+
+    const stepCell = document.createElement("span");
+    stepCell.className = "stage-account-step";
+    stepCell.textContent = stepText;
+    stepCell.title = stepText;
+
+    const actionCell = document.createElement("span");
+    actionCell.className = "stage-account-actions";
+    if (state.stage === "generation") {
+      const view = document.createElement("button");
+      view.type = "button";
+      view.className = "button stage-account-action";
+      view.textContent = "查看";
+      view.dataset.focusAccount = account.id;
+      view.disabled = account.id === state.accountId;
+      actionCell.append(view);
+    }
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "button stage-account-action";
+    if (state.stage === "lyrics" || state.stage === "generation") {
+      action.textContent = "修改";
+      action.dataset.editStageAccount = account.id;
+      action.disabled = busy;
+    } else {
+      action.textContent = "查看";
+      action.dataset.focusAccount = account.id;
+      action.disabled = account.id === state.accountId;
+    }
+    actionCell.append(action);
+
+    row.append(selectCell, accountCell, statusCell, progressCell, configCell, stepCell, actionCell);
+    table.append(row);
+  });
+  renderMultiStage();
+}
+
+function renderLyricAccountCards(container, busy) {
+  container.innerHTML = "";
+  if (!state.accounts.length) {
+    const empty = document.createElement("div");
+    empty.className = "lyric-account-empty";
+    empty.textContent = "账号管理中暂无账号";
+    container.append(empty);
+    return;
+  }
+
+  const statusLabels = {
+    pending: "排队中",
+    running: "正在生成",
+    completed: "已完成",
+    failed: "生成失败",
+    stopped: "已停止",
+  };
+  const queue = state.multiQueue?.stage === "lyrics" && state.multiQueue.day === todayValue()
+    ? state.multiQueue
+    : null;
+
+  state.accounts.forEach((account) => {
+    const card = document.createElement("article");
+    card.className = `lyric-account-card${state.selectedTaskAccounts.has(account.id) ? " is-selected" : ""}`;
+    card.dataset.stageAccount = account.id;
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = state.selectedTaskAccounts.has(account.id);
+    checkbox.disabled = busy;
+    checkbox.dataset.taskAccount = account.id;
+    checkbox.setAttribute("aria-label", `选择 ${account.account_name}`);
+
+    const identity = document.createElement("div");
+    identity.className = "lyric-account-identity";
+    const name = document.createElement("strong");
+    name.textContent = account.account_name;
+    name.title = account.account_name;
+    const port = document.createElement("small");
+    port.textContent = `端口 ${account.chrome_debug_port}`;
+    identity.append(name, port);
+
+    const selectCell = document.createElement("label");
+    selectCell.className = "lyric-account-select";
+    selectCell.append(checkbox);
+
+    const header = document.createElement("div");
+    header.className = "lyric-account-header";
+    header.append(selectCell, identity);
+
+    const queueItem = queue?.items.find((item) => item.account_id === account.id) || null;
+    const songs = state.dashboardSongs[account.id] || [];
+    const templates = state.accountTemplates[account.id] || [];
+    const template = templates.find((item) => item.id === state.selectedLyricTemplateId) || templates[0];
+    const resultCount = Number(queueItem?.result?.saved_count ?? queueItem?.result?.generated_count ?? 0);
+    const generatedCount = resultCount || songs.length;
+    let statusText = songs.length ? "已生成" : template ? "待执行" : "未配置";
+    let statusTone = songs.length ? "completed" : "waiting";
+    if (queueItem) {
+      statusText = statusLabels[queueItem.status] || queueItem.status;
+      statusTone = queueItem.status === "completed" ? "completed" : queueItem.status;
+    }
+
+    const status = document.createElement("span");
+    status.className = `state state-${statusTone}`;
+    status.textContent = statusText;
+
+    const titleRow = document.createElement("div");
+    titleRow.className = "lyric-account-title-row";
+    titleRow.append(header, status);
+
+    const metrics = document.createElement("dl");
+    metrics.className = "lyric-account-metrics";
+    const metricItems = [
+      ["目标", template ? `${template.generation_count} 首` : "-"],
+      [queueItem?.status === "running" ? "目录已有" : "已生成", `${generatedCount} 首`],
+      ["模板", template?.name || "未设置"],
+    ];
+    metricItems.forEach(([label, value]) => {
+      const term = document.createElement("dt");
+      term.textContent = label;
+      const detail = document.createElement("dd");
+      detail.textContent = value;
+      detail.title = value;
+      metrics.append(term, detail);
+    });
+
+    const actionRow = document.createElement("div");
+    actionRow.className = "lyric-account-actions";
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "button lyric-account-edit";
+    action.textContent = "修改";
+    action.dataset.editStageAccount = account.id;
+    action.disabled = busy;
+    actionRow.append(action);
+
+    card.append(titleRow, metrics, actionRow);
+    container.append(card);
+  });
+}
+
+function renderLyricSongSummary() {
+  const container = elements["lyric-summary-list"];
+  container.innerHTML = "";
+  if (!state.accounts.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state lyric-summary-empty";
+    empty.textContent = "暂无账号";
+    container.append(empty);
+    elements["lyric-summary-caption"].textContent = "按账号显示今日生成状态和歌名";
+    return;
+  }
+
+  const statusLabels = {
+    pending: "排队中",
+    running: "正在生成",
+    completed: "已完成",
+    failed: "生成失败",
+    stopped: "已停止",
+  };
+  const queue = state.multiQueue?.stage === "lyrics" && state.multiQueue.day === todayValue()
+    ? state.multiQueue
+    : null;
+  let generatedTotal = 0;
+
+  state.accounts.forEach((account) => {
+    const queueItem = queue?.items.find((item) => item.account_id === account.id) || null;
+    const songs = queueItem?.result?.saved?.length
+      ? queueItem.result.saved
+      : state.dashboardSongs[account.id] || [];
+    generatedTotal += songs.length;
+
+    const card = document.createElement("article");
+    card.className = "lyric-summary-card";
+    card.dataset.lyricSummaryAccount = account.id;
+    const main = document.createElement("div");
+    main.className = "lyric-summary-main";
+    const identity = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = account.account_name;
+    name.title = account.account_name;
+    const count = document.createElement("small");
+    count.textContent = `${songs.length} 首`;
+    identity.append(name, count);
+
+    let statusText = songs.length ? "已生成" : "待生成";
+    let statusTone = songs.length ? "completed" : "waiting";
+    if (queueItem) {
+      statusText = statusLabels[queueItem.status] || queueItem.status;
+      statusTone = queueItem.status === "completed" ? "completed" : queueItem.status;
+    }
+    const status = document.createElement("span");
+    status.className = `state state-${statusTone}`;
+    status.textContent = statusText;
+    main.append(identity, status);
+
+    const list = document.createElement("ul");
+    list.className = "lyric-summary-songs";
+    if (!songs.length) {
+      const item = document.createElement("li");
+      item.className = "lyric-summary-song-empty";
+      item.textContent = queueItem?.status === "running" ? "生成完成后显示歌名" : "暂无歌词";
+      list.append(item);
+    } else {
+      songs.forEach((song) => {
+        const item = document.createElement("li");
+        const songName = document.createElement("strong");
+        songName.textContent = song.song_name || song.file_name || "未命名歌曲";
+        songName.title = songName.textContent;
+        const detail = document.createElement("small");
+        detail.textContent = song.valid === false ? "歌词解析失败" : song.file_name || "歌词已保存";
+        detail.title = song.path || detail.textContent;
+        item.append(songName, detail);
+        list.append(item);
+      });
+    }
+
+    card.append(main, list);
+    container.append(card);
+  });
+
+  elements["lyric-summary-caption"].textContent = `今日 ${todayValue()} · 共 ${generatedTotal} 首`;
+}
+
+function renderMultiStage() {
+  const queue = state.multiQueue;
+  const caption = elements["multi-stage-caption"];
+  if (!queue) {
+    caption.textContent = "未启动多账号任务";
+    caption.className = "task-account-summary";
+    renderDashboard();
+    return;
+  }
+  const completed = queue.items.filter((item) => item.status === "completed").length;
+  const failed = queue.items.filter((item) => item.status === "failed").length;
+  const current = queue.items[queue.current_index];
+  const stageLabels = { lyrics: "AI 作词", generation: "生成下载", upload: "上传发布" };
+  caption.textContent = `${stageLabels[queue.stage] || queue.stage}：成功 ${completed}，失败 ${failed} / ${queue.items.length}${
+    queue.status === "running" && current ? `；当前 ${current.account_name}` : ""
+  }${queue.status === "stopping" ? "；正在停止" : ""}`;
+  caption.className = `task-account-summary${failed ? " is-failed" : queue.status === "running" ? " is-live" : ""}`;
+  caption.title = queue.items
+    .map((item) => `${item.account_name}: ${item.status}${item.error ? ` (${item.error})` : ""}`)
+    .join("\n");
+  renderDashboard();
 }
 
 function restoreGenerationModel() {
@@ -367,7 +864,7 @@ function saveGenerationSinger(value) {
 }
 
 function renderGenerationModelControls(locked) {
-  const visible = elements["generation-model"].value === "Sway v5.5";
+  const visible = elements["generation-model"].value === SWAY_MODEL_NAME;
   const disabled = Boolean(locked);
   for (const select of generationModelSelects()) select.disabled = disabled;
   for (const select of generationSingerSelects()) {
@@ -375,6 +872,30 @@ function renderGenerationModelControls(locked) {
     if (field) field.hidden = !visible;
     select.disabled = disabled || !visible;
   }
+}
+
+function renderGenerationSingerVisibility() {
+  const visible = elements["generation-model"].value === SWAY_MODEL_NAME;
+  const field = elements["generation-singer"].closest(".singer-field");
+  field.hidden = !visible;
+  const select = elements["generation-singer"];
+  select.disabled = !visible;
+  if (!visible && select.value) {
+    select.value = "";
+    saveGenerationSinger("");
+  }
+}
+
+function renderAccountSingerVisibility() {
+  const visible = elements["account-model-select"].value === SWAY_MODEL_NAME;
+  const select = elements["account-singer-select"];
+  select.closest(".account-singer-field").hidden = !visible;
+  select.disabled = !visible;
+  if (!visible) select.value = "";
+}
+
+function singerNameForModel(modelName, singerName = "") {
+  return modelName === SWAY_MODEL_NAME ? (singerName || "") : "";
 }
 
 function joinDayFolder(root, day) {
@@ -473,21 +994,63 @@ function renderAccountEditor() {
   elements["account-cancel"].hidden = !state.accountEditorOpen;
 }
 
+function aiApiConfigs() {
+  return state.settings?.ai_api_configs || [];
+}
+
+function activeAiApiConfig() {
+  const configs = aiApiConfigs();
+  return configs.find((item) => item.id === state.settings?.active_ai_api_config_id) || configs[0] || null;
+}
+
+function fillAiApiForm(config = null) {
+  const form = elements["ai-settings-form"];
+  form.ai_provider_id.value = config?.id || "";
+  form.ai_provider_name.value = config?.name || "";
+  form.ai_api_base_url.value = config?.api_base_url || "";
+  form.ai_api_key.value = config?.api_key || "";
+  form.ai_model.value = config?.model || "";
+  form.ai_max_retries.value = config?.max_retries ?? 2;
+}
+
+function syncAiProviderSelect() {
+  const select = elements["ai-provider-select"];
+  const configs = aiApiConfigs();
+  const active = activeAiApiConfig();
+  select.innerHTML = "";
+  if (!configs.length) {
+    select.append(new Option("请先配置 AI 接口", ""));
+  } else {
+    for (const config of configs) {
+      select.append(new Option(`${config.name} · ${config.model}`, config.id));
+    }
+  }
+  select.value = active?.id || "";
+  select.disabled = !configs.length || isRunning() || uploadRunning() || multiStageRunning() || pipelineWorkflowBusy();
+}
+
 function renderSettingsTabs() {
   const runtimeActive = state.settingsTab === "runtime";
-  const aiConfigured = Boolean(state.settings?.ai_api_base_url && state.settings?.ai_model);
-  const showAiForm = !runtimeActive && (!aiConfigured || state.aiConfigEditorOpen);
-  const showAiCard = !runtimeActive && aiConfigured && !state.aiConfigEditorOpen;
+  const aiActive = state.settingsTab === "ai";
+  const promptActive = state.settingsTab === "prompt";
+  const aiConfigured = Boolean(activeAiApiConfig());
+  const showAiForm = aiActive && (!aiConfigured || state.aiConfigEditorOpen);
+  const showAiCard = aiActive && aiConfigured && !state.aiConfigEditorOpen;
+  const templatePanel = document.querySelector(".lyric-template-panel");
+  if (templatePanel) templatePanel.hidden = !promptActive;
   elements["settings-subnav"].hidden = state.view !== "settings";
   elements["settings-tab-runtime"].classList.toggle("is-active", runtimeActive);
-  elements["settings-tab-ai"].classList.toggle("is-active", !runtimeActive);
+  elements["settings-tab-ai"].classList.toggle("is-active", aiActive);
+  elements["settings-tab-prompt"].classList.toggle("is-active", promptActive);
   elements["settings-form"].hidden = !runtimeActive;
   elements["ai-config-cards"].hidden = !showAiCard;
   elements["ai-settings-form"].hidden = !showAiForm;
+  elements["lyric-prompt-panel"].hidden = !promptActive;
   elements["ai-config-cancel"].hidden = !state.aiConfigEditorOpen;
-  elements["save-settings"].hidden = !runtimeActive && !showAiForm;
-  elements["save-settings"].textContent = runtimeActive ? "保存参数" : "保存 AI 配置";
-  if (showAiCard) renderAiConfigCard();
+  elements["save-settings"].hidden = promptActive || (aiActive && !showAiForm);
+  elements["save-settings"].textContent = runtimeActive ? "保存参数" : "保存并使用";
+  if (showAiCard) renderAiApiConfigCards();
+  syncAiProviderSelect();
 }
 
 function maskApiKey(key) {
@@ -496,54 +1059,99 @@ function maskApiKey(key) {
   return `${key.slice(0, 4)}****${key.slice(-4)}`;
 }
 
-function renderAiConfigCard() {
+function renderAiApiConfigCards() {
   const container = elements["ai-config-cards"];
-  const settings = state.settings;
-  if (!settings?.ai_api_base_url || !settings?.ai_model) {
-    container.innerHTML = "";
-    return;
-  }
+  const configs = aiApiConfigs();
+  container.innerHTML = "";
+
+  const toolbar = document.createElement("div");
+  toolbar.className = "ai-config-toolbar";
+  const caption = document.createElement("span");
+  caption.textContent = `已配置 ${configs.length} 个 AI 接口`;
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "button";
+  add.textContent = "新增接口";
+  add.dataset.addAiConfig = "true";
+  add.disabled = isRunning() || uploadRunning() || multiStageRunning() || pipelineWorkflowBusy();
+  toolbar.append(caption, add);
+  container.append(toolbar);
+
+  if (!configs.length) return;
+
+  for (const config of configs) {
+    const active = config.id === state.settings?.active_ai_api_config_id;
+    const check = state.aiApiChecks[config.id];
+    const anyChecking = Object.values(state.aiApiChecks).some((item) => item.status === "checking");
 
   const card = document.createElement("article");
   card.className = "settings-card is-ai";
   const main = document.createElement("div");
   main.className = "settings-card-main";
   const title = document.createElement("h3");
-  title.textContent = "AI 作词接口";
+  title.textContent = config.name;
+  title.title = config.name;
   const badge = document.createElement("span");
-  badge.className = "state state-success";
-  badge.textContent = "已配置";
+  badge.className = `state ${active ? "state-success" : "state-pending"}`;
+  badge.textContent = active ? "使用中" : "备用";
   main.append(title, badge);
 
   const details = document.createElement("dl");
   details.className = "settings-card-details";
+  let checkText = "未检测";
+  if (check?.status === "checking") checkText = "检测中...";
+  else if (check?.status === "success") checkText = `可用 · 模型 ${check.model_count} 个 · ${check.elapsed_ms} ms`;
+  else if (check?.status === "failed") checkText = `失败 · ${check.error || "未知错误"}`;
   for (const [label, value] of [
-    ["API Base URL", settings.ai_api_base_url],
-    ["模型", settings.ai_model],
-    ["API Key", maskApiKey(settings.ai_api_key)],
-    ["重试次数", String(settings.ai_max_retries)],
+    ["API Base URL", config.api_base_url],
+    ["模型", config.model],
+    ["API Key", maskApiKey(config.api_key)],
+    ["重试次数", String(config.max_retries)],
+    ["检测", checkText],
   ]) {
     const term = document.createElement("dt");
     term.textContent = label;
     const description = document.createElement("dd");
     description.textContent = value;
     description.title = value;
+    if (label === "检测") {
+      description.className = `ai-check-result is-${check?.status || "idle"}`;
+      description.title = checkText;
+    }
     details.append(term, description);
   }
 
   const actions = document.createElement("div");
   actions.className = "settings-card-actions";
+  const use = document.createElement("button");
+  use.type = "button";
+  use.className = "button";
+  use.textContent = active ? "正在使用" : "使用";
+  use.dataset.useAiConfig = config.id;
+  use.disabled = active || isRunning() || uploadRunning() || multiStageRunning() || pipelineWorkflowBusy();
   const edit = document.createElement("button");
   edit.type = "button";
   edit.className = "button";
-  edit.textContent = "修改配置";
-  edit.dataset.editAiConfig = "true";
-  edit.disabled = isRunning() || uploadRunning();
-  actions.append(edit);
+  edit.textContent = "修改";
+  edit.dataset.editAiConfig = config.id;
+  edit.disabled = isRunning() || uploadRunning() || multiStageRunning() || pipelineWorkflowBusy();
+  const test = document.createElement("button");
+  test.type = "button";
+  test.className = "button";
+  test.textContent = check?.status === "checking" ? "检测中" : "检测";
+  test.dataset.testAiConfig = config.id;
+  test.disabled = anyChecking || isRunning() || uploadRunning() || multiStageRunning() || pipelineWorkflowBusy();
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "button danger";
+  remove.textContent = "删除";
+  remove.dataset.deleteAiConfig = config.id;
+  remove.disabled = isRunning() || uploadRunning() || multiStageRunning() || pipelineWorkflowBusy();
+  actions.append(use, test, edit, remove);
 
   card.append(main, details, actions);
-  container.innerHTML = "";
   container.append(card);
+  }
 }
 
 function renderLyricWorkspace() {
@@ -576,6 +1184,7 @@ function renderLyricProgress() {
     thinking: "AI 正在整理创作思路",
     generating: "AI 正在输出歌词",
     parsing: "校验返回结果",
+    repairing: "仅重写未通过歌曲",
     retrying: "准备重试",
     failed: "生成失败",
     completed: "生成完成",
@@ -657,12 +1266,17 @@ async function generateLyricsStream(accountId, templateId) {
 }
 
 function renderLyricControls() {
-  const disabled = !state.accountId || !state.selectedLyricTemplateId || state.lyricGenerating || isRunning() || uploadRunning() || pipelineWorkflowBusy();
+  const disabled = !state.accountId || !state.selectedLyricTemplateId || state.lyricGenerating || isRunning() || uploadRunning() || multiStageRunning() || pipelineWorkflowBusy();
   document.querySelectorAll("[data-generate-template]").forEach((button) => {
     button.disabled = disabled || button.dataset.generateTemplate !== state.selectedLyricTemplateId;
     button.textContent = state.lyricGenerating ? "生成中" : "生成歌词";
   });
-  elements["save-lyrics"].disabled = !state.accountId || !state.lyricResults.length || state.lyricGenerating || isRunning() || uploadRunning() || pipelineWorkflowBusy();
+  elements["save-lyrics"].disabled = !state.accountId || !state.lyricResults.length || state.lyricGenerating || isRunning() || uploadRunning() || multiStageRunning() || pipelineWorkflowBusy();
+  elements["multi-lyrics-start"].disabled = !state.selectedTaskAccounts.size || !activeAiApiConfig() || state.lyricGenerating || multiStageRunning() || isRunning() || uploadRunning() || pipelineWorkflowBusy();
+  elements["multi-lyrics-start"].textContent = state.multiQueue?.stage === "lyrics" && multiStageRunning() ? "作词中" : "开始作词";
+  elements["multi-lyrics-start"].dataset.tip = activeAiApiConfig()
+    ? `使用 ${activeAiApiConfig().name} 为勾选账号并联生成歌词`
+    : "请先在系统设置中配置 AI 接口";
 }
 
 function renderLyricPromptState() {
@@ -752,15 +1366,6 @@ function renderLyricTemplateCards() {
 
     const actions = document.createElement("div");
     actions.className = "lyric-template-actions";
-    if (template.id === state.selectedLyricTemplateId) {
-      const generate = document.createElement("button");
-      generate.type = "button";
-      generate.className = "button primary";
-      generate.textContent = "生成歌词";
-      generate.dataset.generateTemplate = template.id;
-      generate.disabled = state.lyricGenerating || isRunning() || uploadRunning();
-      actions.append(generate);
-    }
     const use = document.createElement("button");
     use.type = "button";
     use.className = template.id === state.selectedLyricTemplateId ? "button primary" : "button";
@@ -789,6 +1394,7 @@ function renderLyricTemplateEditor() {
   elements["lyric-template-form"].hidden = !state.lyricTemplateEditorOpen;
   elements["cancel-lyric-template"].hidden = !state.lyricTemplateEditorOpen;
   elements["save-lyric-template"].textContent = state.editingLyricTemplateId ? "保存修改" : "保存模板";
+  elements["template-account-select"].disabled = state.editingLyricTemplateId || state.lyricTemplateAccountLocked;
   renderThemeOptions();
 }
 
@@ -1396,7 +2002,14 @@ function renderUploads() {
     ...files.map((file) => ({ ...file, uploaded: false })),
     ...uploadedFiles.map((file) => ({ ...file, uploaded: true })),
   ];
-  const limit = state.uploads?.batch_size || 10;
+  const dailyLimit = Number(state.uploads?.daily_limit || 10);
+  const dailyUsed = Number(
+    state.uploads?.daily_used ?? uploadedFiles.length,
+  );
+  const remaining = Number(
+    state.uploads?.remaining_uploads ?? Math.max(0, dailyLimit - dailyUsed),
+  );
+  const limit = Math.min(Number(state.uploads?.batch_size || dailyLimit), remaining);
   const selectedCount = files.filter((file) => state.selectedUploads.has(file.file_name)).length;
   elements["upload-table"].querySelectorAll(".upload-row:not(.upload-head)").forEach((node) => node.remove());
   elements["upload-empty"].classList.toggle("is-hidden", allFiles.length > 0);
@@ -1409,7 +2022,7 @@ function renderUploads() {
     ? `再次生成发布 ${files.length} 首`
     : "再次生成发布";
   elements["upload-caption"].textContent = state.uploads?.day
-    ? `${state.uploads.day} · 待发布 ${selectedCount}/${files.length} · 已发布 ${uploadedFiles.length}`
+    ? `${state.uploads.day} · 待发布 ${selectedCount}/${files.length} · 今日已发布 ${dailyUsed}/${dailyLimit} · 剩余 ${remaining}`
     : "等待成品下载完成";
 
   for (const file of allFiles) {
@@ -1418,7 +2031,8 @@ function renderUploads() {
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.checked = state.selectedUploads.has(file.file_name);
-    checkbox.disabled = file.uploaded || uploadRunning() || isRunning();
+    checkbox.disabled = file.uploaded || remaining <= 0 || uploadRunning() || isRunning()
+      || (!state.selectedUploads.has(file.file_name) && selectedCount >= limit);
     checkbox.dataset.uploadFile = file.file_name;
     const name = document.createElement("span");
     name.textContent = file.file_name;
@@ -1428,11 +2042,14 @@ function renderUploads() {
     const status = document.createElement("span");
     status.innerHTML = file.uploaded
       ? '<span class="state state-success">已发布</span>'
-      : '<span class="state state-waiting">待发布</span>';
+      : remaining <= 0
+        ? '<span class="state state-failed">额度用完</span>'
+        : '<span class="state state-waiting">待发布</span>';
     row.append(checkbox, name, size, status);
     elements["upload-table"].append(row);
   }
   renderUploadSource();
+  renderDashboard();
 }
 
 function renderUploadSource() {
@@ -1482,12 +2099,17 @@ function renderUploadRun() {
   const uploadedFiles = state.uploads?.uploaded_files || [];
   const uploadDirDirty = Boolean(account) && elements["upload-dir-input"].value.trim() !== account.output_dir;
   const pipelineBusy = pipelineWorkflowBusy();
-  elements["start-upload"].disabled = !state.accountId || !state.uploads?.files?.length || !state.selectedUploads.size || uploadDirDirty || isRunning() || uploadRunning() || pipelineBusy;
+  const dailyLimit = Number(state.uploads?.daily_limit || 10);
+  const dailyUsed = Number(state.uploads?.daily_used ?? uploadedFiles.length);
+  const remaining = Number(
+    state.uploads?.remaining_uploads ?? Math.max(0, dailyLimit - dailyUsed),
+  );
+  elements["start-upload"].disabled = !state.selectedTaskAccounts.size || uploadDirDirty || isRunning() || uploadRunning() || multiStageRunning() || pipelineBusy;
   elements["select-all-uploads"].disabled = isRunning() || uploadRunning() || pipelineBusy;
   elements["clear-upload-selection"].disabled = isRunning() || uploadRunning() || pipelineBusy;
   elements["refresh-uploads"].disabled = uploadDirDirty || isRunning() || uploadRunning() || pipelineBusy;
-  elements["retry-uploads"].disabled = !uploadedFiles.length || uploadDirDirty || isRunning() || uploadRunning() || pipelineBusy;
-  elements["retry-rejected-upload"].disabled = !state.uploads?.files?.length || uploadDirDirty || isRunning() || uploadRunning() || pipelineBusy;
+  elements["retry-uploads"].disabled = remaining <= 0 || !uploadedFiles.length || uploadDirDirty || isRunning() || uploadRunning() || pipelineBusy;
+  elements["retry-rejected-upload"].disabled = remaining <= 0 || !state.uploads?.files?.length || uploadDirDirty || isRunning() || uploadRunning() || pipelineBusy;
   elements["apply-upload-dir"].disabled = !state.accountId || isRunning() || uploadRunning() || pipelineBusy;
   elements["upload-ai-created"].disabled = isRunning() || uploadRunning() || pipelineBusy;
   elements["upload-rejected-action"].disabled = isRunning() || uploadRunning() || pipelineBusy;
@@ -1507,12 +2129,15 @@ function renderUploadRun() {
       regenerating_songs: "按歌词重新生成歌曲",
       replace_noncompliant_songs: "寻找并导出第二版本",
       reupload_replaced_songs: "重新上传替换歌曲",
+      replace_noncompliant_failed: "第二版本发布失败",
     };
     elements["upload-caption"].textContent = labels[run.step] || run.step;
   } else if (run?.status === "completed") {
     elements["upload-caption"].textContent = run.replaced_titles?.length
       ? `发布完成；已自动替换 ${run.replaced_titles.length} 首`
       : "发布完成";
+  } else if (run?.status === "partial_failed") {
+    elements["upload-caption"].textContent = run.error || "部分歌曲第二版本发布失败";
   }
 }
 
@@ -1520,8 +2145,90 @@ function stateLabel(value) {
   const labels = {
     pending: "待处理", running: "处理中", success: "成功", failed: "失败",
     skipped: "已跳过", generation_limit: "生成上限", 解析失败: "解析失败",
+    download_failed: "下载失败", export_failed: "导出失败",
+    lyric_unmatched: "匹配失败", 导出失败: "导出失败",
   };
   return labels[value] || value || "待处理";
+}
+
+function stepLabel(value) {
+  const labels = {
+    pending: "待处理",
+    starting: "准备",
+    page_ready: "页面准备",
+    fill_inputs: "填写歌词",
+    generate: "生成歌曲",
+    batch_generate: "批量生成",
+    check_limit: "检查上限",
+    wait_generation: "等待生成",
+    match_lyrics: "匹配歌词",
+    match_lyrics_settling: "等待结果刷新",
+    enter_editor: "进入编辑器",
+    export_song: "导出歌曲",
+    find_exported_download: "查找导出文件",
+    download_song: "下载歌曲",
+    start_redownload: "准备重新处理",
+    starting_redownload: "准备重新处理",
+    starting_repair: "准备批量修复",
+    repair_pending: "等待修复",
+    repair_generate: "重新生成",
+    manual_required: "需手动处理",
+    open_assets: "打开歌曲列表",
+    done: "完成",
+  };
+  return labels[value] || value || "-";
+}
+
+function isFailureStatus(value) {
+  return [
+    "failed",
+    "generation_limit",
+    "login_required",
+    "verification_failed",
+    "download_failed",
+    "export_failed",
+    "lyric_unmatched",
+    "解析失败",
+    "生成上限",
+    "需要登录",
+    "歌词校验失败",
+    "描述不符合",
+    "下载失败",
+    "导出失败",
+    "生成失败",
+    "匹配失败",
+    "失败",
+  ].includes(value);
+}
+
+function canAutoRepair(value) {
+  return [
+    "failed",
+    "download_failed",
+    "export_failed",
+    "lyric_unmatched",
+    "下载失败",
+    "导出失败",
+    "生成失败",
+    "匹配失败",
+    "失败",
+  ].includes(value);
+}
+
+function canAutoRepairSong(song) {
+  return song.valid && canAutoRepair(songState(song));
+}
+
+function stateTone(value) {
+  return isFailureStatus(value) ? "failed" : value;
+}
+
+function canRedownload(value) {
+  return ["download_failed", "export_failed", "下载失败", "导出失败"].includes(value);
+}
+
+function isExportRetry(value) {
+  return ["export_failed", "导出失败"].includes(value);
 }
 
 function songState(song) {
@@ -1533,6 +2240,30 @@ function songState(song) {
   return song.status || "pending";
 }
 
+async function startRedownload(song) {
+  if (!state.accountId) return toast("请先选择账号", true);
+  if (isRunning() || uploadRunning() || pipelineWorkflowBusy()) {
+    return toast("当前有其它任务正在运行", true);
+  }
+  const action = isExportRetry(songState(song)) ? "重新导出" : "重新下载";
+  try {
+    state.current = await api("/api/runs/redownload", {
+      method: "POST",
+      body: JSON.stringify({
+        account_id: state.accountId,
+        file_name: song.file_name,
+        day: todayValue(),
+      }),
+    });
+    state.runStatus = state.current?.status || "";
+    syncSongRunState(state.current);
+    renderCurrent();
+    toast(`已开始${action}《${song.song_name || song.file_name}》`);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 function renderSongs() {
   const table = elements["song-table"];
   table.querySelectorAll(".song-row:not(.song-head)").forEach((node) => node.remove());
@@ -1540,8 +2271,9 @@ function renderSongs() {
   elements["queue-empty"].querySelector("strong").textContent = state.accounts.length ? "暂无歌词" : "请先创建账号";
 
   for (const song of state.songs) {
-    const row = document.createElement("label");
-    row.className = "song-row";
+    const row = document.createElement("div");
+    row.className = `song-row${state.selected.has(song.file_name) ? " is-selected" : ""}`;
+    row.dataset.file = song.file_name;
     const status = songState(song);
     const progress = state.current?.account_id === state.accountId
       ? state.current.songs.find((item) => item.file_name === song.file_name)
@@ -1558,15 +2290,39 @@ function renderSongs() {
       row.append(span);
     }
     const stateSpan = document.createElement("span");
-    stateSpan.innerHTML = `<span class="state state-${status}">${stateLabel(status)}</span>`;
+    stateSpan.innerHTML = `<span class="state state-${stateTone(status)}">${stateLabel(status)}</span>`;
     row.append(stateSpan);
     const step = document.createElement("span");
-    step.textContent = progress?.current_step || (song.error ? "解析" : "-");
+    step.textContent = stepLabel(
+      progress?.current_step || (song.error ? "解析" : "-")
+    );
     step.title = song.error || progress?.error || "";
     row.append(step);
     const retry = document.createElement("span");
     retry.textContent = progress?.attempts || 0;
     row.append(retry);
+    const actions = document.createElement("span");
+    if (canRedownload(status)) {
+      const redownload = document.createElement("button");
+      redownload.type = "button";
+      redownload.className = "button song-action-button";
+      redownload.textContent = isExportRetry(status) ? "重新导出" : "重新下载";
+      redownload.dataset.redownload = song.file_name;
+      redownload.disabled = isRunning() || uploadRunning() || pipelineWorkflowBusy();
+      redownload.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void startRedownload(song);
+      });
+      actions.append(redownload);
+    }
+    row.append(actions);
+    row.addEventListener("click", (event) => {
+      if (event.target.closest("input, button, a")) return;
+      if (checkbox.disabled) return;
+      checkbox.checked = !checkbox.checked;
+      checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+    });
     table.append(row);
   }
 
@@ -1574,6 +2330,7 @@ function renderSongs() {
     checkbox.addEventListener("change", () => {
       if (checkbox.checked) state.selected.add(checkbox.dataset.file);
       else state.selected.delete(checkbox.dataset.file);
+      checkbox.closest(".song-row")?.classList.toggle("is-selected", checkbox.checked);
       renderMetrics();
     });
   });
@@ -1586,20 +2343,23 @@ function renderMetrics() {
   elements["metric-pending"].textContent = String(running);
   elements["metric-success"].textContent = String(statuses.filter((status) => status === "success" || status === "skipped").length);
   elements["metric-skip"].textContent = String(statuses.filter((status) => status === "skipped").length);
-  elements["metric-fail"].textContent = String(statuses.filter((status) => status === "failed" || status === "generation_limit" || status === "login_required").length);
-  elements["metric-step"].textContent = state.current?.account_id === state.accountId ? state.current.current_step : "-";
+  elements["metric-fail"].textContent = String(statuses.filter(isFailureStatus).length);
+  elements["metric-step"].textContent = state.current?.account_id === state.accountId
+    ? stepLabel(state.current.current_step)
+    : "-";
+  renderDashboard();
 }
 
 function renderControls() {
   const running = isRunning();
   const pipelineBusy = pipelineWorkflowBusy();
-  for (const id of ["account-new", "account-cancel", "account-copy", "select-all", "select-failed", "refresh-songs", "start-run"]) {
-    elements[id].disabled = running || pipelineBusy;
+  for (const id of ["account-new", "account-cancel", "account-copy", "select-all", "select-failed", "repair-run", "refresh-songs", "start-run"]) {
+    elements[id].disabled = running || pipelineBusy || multiStageRunning();
   }
   elements["account-copy"].disabled = running || pipelineBusy || !state.accountId;
   elements["pause-run"].disabled = !running || state.current?.status !== "running";
   elements["resume-run"].disabled = !running || state.current?.status !== "paused";
-  elements["stop-run"].disabled = !running;
+  elements["stop-run"].disabled = !running && !multiStageRunning();
   elements["fresh-run"].disabled = running;
   const modelLocked = running || pipelineBusy;
   renderGenerationModelControls(modelLocked);
@@ -1607,22 +2367,34 @@ function renderControls() {
   const lyricDirDirty = Boolean(account) && elements["lyric-dir-input"].value.trim() !== account.lyric_dir;
   elements["apply-lyric-dir"].disabled = running || pipelineBusy || !state.accountId;
   elements["refresh-songs"].disabled = running || pipelineBusy || lyricDirDirty;
-  if (lyricDirDirty || pipelineBusy) elements["start-run"].disabled = true;
+  elements["repair-run"].disabled = (
+    running
+    || uploadRunning()
+    || pipelineBusy
+    || lyricDirDirty
+    || !state.songs.some(canAutoRepairSong)
+  );
+  if (lyricDirDirty || pipelineBusy || !state.selectedTaskAccounts.size) elements["start-run"].disabled = true;
   elements["account-form"].querySelectorAll("input").forEach((input) => input.disabled = running);
   elements["settings-form"].querySelectorAll("input").forEach((input) => input.disabled = running);
-  elements["ai-settings-form"].querySelectorAll("input").forEach((input) => input.disabled = running);
-  elements["test-ai-settings"].disabled = running;
-  document.querySelectorAll("[data-edit-ai-config]").forEach((button) => button.disabled = running || uploadRunning());
-  elements["ai-config-cancel"].disabled = running;
-  elements["save-settings"].disabled = running;
+  const aiConfigBusy = running || uploadRunning() || multiStageRunning() || pipelineWorkflowBusy();
+  elements["ai-settings-form"].querySelectorAll("input").forEach((input) => input.disabled = aiConfigBusy);
+  elements["test-ai-settings"].disabled = aiConfigBusy;
+  document.querySelectorAll("[data-test-ai-config]").forEach((button) => {
+    button.disabled = aiConfigBusy || Object.values(state.aiApiChecks).some((item) => item.status === "checking");
+  });
+  document.querySelectorAll("[data-edit-ai-config]").forEach((button) => button.disabled = aiConfigBusy);
+  elements["ai-config-cancel"].disabled = aiConfigBusy;
+  elements["save-settings"].disabled = aiConfigBusy;
   document.querySelectorAll("[data-edit-account]").forEach((button) => button.disabled = running);
   document.querySelectorAll("[data-delete-account]").forEach((button) => button.disabled = running || uploadRunning());
   document.querySelectorAll("[data-login-account]").forEach((button) => button.disabled = running || uploadRunning());
   document.querySelectorAll("[data-close-browser-account]").forEach((button) => button.disabled = running || uploadRunning());
-  renderAccountMenu();
+  renderTaskAccounts();
   renderUploadRun();
   renderLyricControls();
   renderPipelinePanel();
+  syncAiProviderSelect();
 }
 
 function appendLog(entry) {
@@ -1666,6 +2438,7 @@ function syncSongRunState(run) {
 
 function applyCurrentRun(run, { immediate = false } = {}) {
   const previousStatus = state.runStatus;
+  rememberGenerationRun(run);
   state.current = run;
   state.runStatus = run?.status || "";
   syncSongRunState(run);
@@ -1705,6 +2478,9 @@ async function loadAccounts(selectId = null) {
   state.accounts = await api("/api/accounts");
   const previous = selectId || state.accountId || state.accounts[0]?.id || "";
   state.accountId = state.accounts.some((account) => account.id === previous) ? previous : "";
+  if (!state.selectedTaskAccounts.size && state.accountId) {
+    state.selectedTaskAccounts = new Set([state.accountId]);
+  }
   if (state.editingAccountId && !state.accounts.some((account) => account.id === state.editingAccountId)) {
     state.editingAccountId = "";
     state.accountEditorOpen = false;
@@ -1713,6 +2489,7 @@ async function loadAccounts(selectId = null) {
   const account = state.accounts.find((item) => item.id === state.accountId);
   fillAccountForm(account);
   await reloadAccountWorkspace();
+  void loadDashboardSongs().catch(() => {});
 }
 
 async function reloadAccountWorkspace() {
@@ -1726,20 +2503,28 @@ async function reloadAccountWorkspace() {
     state.current = null;
     state.runStatus = "";
   }
+  const runningRun = liveGenerationRun(accountId);
+  if (runningRun && !state.current) {
+    state.current = runningRun;
+    state.runStatus = runningRun.status;
+  }
   if (!runMatchesCurrentAccount(state.uploadRun)) state.uploadRun = null;
   renderPipelinePanel();
   renderCurrent();
   renderUploadRun();
 
   const isStale = () => reloadId !== state.accountReloadId;
-  if (accountId) await loadSongs();
+  if (accountId) await loadSongs().catch(() => renderSongs());
   else renderSongs();
   if (isStale()) return;
 
   await loadLyricTemplates().catch(() => {});
   if (isStale()) return;
 
-  await loadUploads();
+  await loadUploads().catch(() => {
+    state.uploads = [];
+    renderUploads();
+  });
   if (isStale()) return;
 
   await loadPipelineRun();
@@ -1751,7 +2536,7 @@ async function reloadAccountWorkspace() {
   await loadPipelineQueue();
   if (isStale()) return;
 
-  await loadCurrent();
+  await loadCurrent().catch(() => {});
   if (isStale()) return;
 
   await loadUploadRun();
@@ -1776,6 +2561,54 @@ async function loadSongs() {
   renderControls();
 }
 
+async function loadDashboardSongs() {
+  if (!state.accounts.length) {
+    state.dashboardSongs = {};
+    renderDashboard();
+    return;
+  }
+
+  const day = todayValue();
+  const entries = await Promise.all(state.accounts.map(async (account) => {
+    const songs = await api(`/api/accounts/${account.id}/songs?day=${encodeURIComponent(day)}`).catch(() => null);
+    return [account.id, songs || []];
+  }));
+  if (day !== todayValue()) return;
+  state.dashboardSongs = Object.fromEntries(entries);
+  renderDashboard();
+  renderTaskAccounts();
+}
+
+async function loadStageAccountData() {
+  if (!state.accounts.length) {
+    state.dashboardSongs = {};
+    state.accountTemplates = {};
+    state.stageUploads = {};
+    renderTaskAccounts();
+    return;
+  }
+
+  const requests = [loadDashboardSongs()];
+  if (state.stage === "lyrics") {
+    requests.push(Promise.all(state.accounts.map(async (account) => {
+      const payload = await api(`/api/accounts/${account.id}/lyric/templates`).catch(() => ({ templates: [] }));
+      return [account.id, payload.templates || []];
+    })).then((entries) => {
+      state.accountTemplates = Object.fromEntries(entries);
+    }));
+  }
+  if (state.stage === "upload" || state.stage === "pipeline") {
+    requests.push(Promise.all(state.accounts.map(async (account) => {
+      const payload = await api(`/api/accounts/${account.id}/uploads?day=${encodeURIComponent(todayValue())}`).catch(() => null);
+      return [account.id, payload];
+    })).then((entries) => {
+      state.stageUploads = Object.fromEntries(entries);
+    }));
+  }
+  await Promise.allSettled(requests);
+  renderTaskAccounts();
+}
+
 async function loadUploads() {
   const reloadId = state.accountReloadId;
   const accountId = state.accountId;
@@ -1791,14 +2624,25 @@ async function loadUploads() {
   }
   if (accountStateIsStale(reloadId, accountId)) return;
   const files = state.uploads?.files || [];
-  const limit = state.uploads?.batch_size || 10;
+  const dailyLimit = Number(state.uploads?.daily_limit || 10);
+  const dailyUsed = Number(
+    state.uploads?.daily_used ?? (state.uploads?.uploaded_files || []).length,
+  );
+  const remaining = Number(
+    state.uploads?.remaining_uploads ?? Math.max(0, dailyLimit - dailyUsed),
+  );
+  const limit = Math.min(Number(state.uploads?.batch_size || dailyLimit), remaining);
   if (state.uploadSelectionAccountId !== state.accountId) {
     state.uploadSelectionAccountId = state.accountId;
     state.uploadSelectionTouched = false;
     state.selectedUploads = new Set(files.slice(0, limit).map((file) => file.file_name));
   } else {
     const available = new Set(files.map((file) => file.file_name));
-    state.selectedUploads = new Set([...state.selectedUploads].filter((name) => available.has(name)));
+    const selected = [...state.selectedUploads].filter((name) => available.has(name));
+    state.selectedUploads = new Set(
+      files.filter((file) => selected.includes(file.file_name)).slice(0, limit)
+        .map((file) => file.file_name),
+    );
     if (!state.uploadSelectionTouched) {
       for (const file of files) {
         if (state.selectedUploads.size >= limit) break;
@@ -1821,15 +2665,88 @@ async function loadUploadRun() {
   renderTaskStatus();
 }
 
+async function loadMultiStage() {
+  state.multiQueue = await api("/api/multi-stage/runs/current").catch(() => null);
+  syncLyricQueueSnapshot(state.multiQueue);
+  renderTaskAccounts();
+  renderTaskStatus();
+  renderControls();
+}
+
+function selectedTaskAccounts() {
+  const selected = state.selectedTaskAccounts;
+  return state.accounts.filter((account) => selected.has(account.id));
+}
+
+async function buildGenerationQueueItems() {
+  const items = [];
+  for (const account of selectedTaskAccounts()) {
+    const songs = await api(`/api/accounts/${account.id}/songs?day=${encodeURIComponent(todayValue())}`);
+    const valid = songs.filter((song) => song.valid);
+    const files = account.id === state.accountId && state.selected.size
+      ? valid.filter((song) => state.selected.has(song.file_name)).map((song) => song.file_name)
+      : valid.map((song) => song.file_name);
+    if (!files.length) {
+      toast(`${account.account_name} 今天没有可处理的歌词，已跳过`, true);
+      continue;
+    }
+    items.push({ account_id: account.id, song_files: files });
+  }
+  return items;
+}
+
+async function buildUploadQueueItems() {
+  const items = [];
+  for (const account of selectedTaskAccounts()) {
+    const batch = await api(`/api/accounts/${account.id}/uploads?day=${encodeURIComponent(todayValue())}`);
+    const remaining = Math.max(0, Number(batch.remaining_uploads || 0));
+    const limit = Math.min(Number(batch.batch_size || 10), remaining);
+    const files = batch.files || [];
+    let names = files.slice(0, limit).map((file) => file.file_name);
+    if (account.id === state.accountId && state.selectedUploads.size) {
+      const selected = new Set(state.selectedUploads);
+      names = files.filter((file) => selected.has(file.file_name)).slice(0, limit)
+        .map((file) => file.file_name);
+    }
+    if (!names.length) {
+      toast(`${account.account_name} 没有可上传成品或额度已用完，已跳过`, true);
+      continue;
+    }
+    items.push({ account_id: account.id, file_names: names });
+  }
+  return items;
+}
+
+async function buildLyricQueueItems() {
+  const items = [];
+  for (const account of selectedTaskAccounts()) {
+    const payload = await api(`/api/accounts/${account.id}/lyric/templates`);
+    const templates = payload.templates || [];
+    const template = account.id === state.accountId
+      ? templates.find((item) => item.id === state.selectedLyricTemplateId) || templates[0]
+      : templates[0];
+    if (!template) {
+      toast(`${account.account_name} 没有作词模板，已跳过`, true);
+      continue;
+    }
+    items.push({ account_id: account.id, template_id: template.id });
+  }
+  return items;
+}
+
 async function loadSettings() {
   state.settings = await api("/api/settings");
   state.lyricSystemPrompt = state.settings.ai_system_prompt;
-  for (const form of [elements["settings-form"], elements["ai-settings-form"]]) {
-    for (const key of Object.keys(state.settings)) {
-      if (form.elements[key]) form.elements[key].value = state.settings[key];
+  for (const key of Object.keys(state.settings)) {
+    if (elements["settings-form"].elements[key]) {
+      elements["settings-form"].elements[key].value = state.settings[key];
     }
   }
-  state.aiConfigEditorOpen = !(state.settings.ai_api_base_url && state.settings.ai_model);
+  if (!aiApiConfigs().length) {
+    state.aiConfigEditorOpen = true;
+    state.editingAIProviderId = "";
+    fillAiApiForm(null);
+  }
   renderSettingsTabs();
 }
 
@@ -1885,6 +2802,24 @@ function connectSocket() {
   socket.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
     if (message.type === "log") appendLog(message.data);
+    if (message.type === "multi_stage_status") {
+      const wasRunning = multiStageRunning();
+      state.multiQueue = message.data;
+      syncLyricQueueSnapshot(state.multiQueue);
+      renderTaskAccounts();
+      renderTaskStatus();
+      renderControls();
+      if (state.multiQueue?.stage === "lyrics") {
+        void loadDashboardSongs().catch(() => {});
+      }
+      if (wasRunning && !multiStageRunning()) {
+        void loadDashboardSongs().catch(() => {});
+        void loadSongs().catch(() => {});
+        void loadUploads().catch(() => {});
+        void loadPipelineQueueOptions().catch(() => {});
+      }
+      return;
+    }
     if (message.type === "upload_status") {
       if (runMatchesCurrentAccount(message.data)) {
         state.uploadRun = message.data;
@@ -1911,9 +2846,12 @@ function connectSocket() {
       }
     }
     if (message.type === "status") {
+      rememberGenerationRun(message.data);
       if (runMatchesCurrentAccount(message.data)) {
         applyCurrentRun(message.data);
         syncPipelineAfterSingleStage(state.current);
+      } else {
+        renderTaskAccounts();
       }
     }
   });
@@ -1928,6 +2866,19 @@ function connectSocket() {
 }
 
 async function runControl(action) {
+  if (multiStageRunning()) {
+    if (action !== "stop") return toast("多账号队列只支持停止", true);
+    try {
+      state.multiQueue = await api("/api/multi-stage/runs/stop", { method: "POST" });
+      renderTaskAccounts();
+      renderTaskStatus();
+      renderControls();
+      toast("已请求停止多账号队列");
+    } catch (error) {
+      toast(error.message, true);
+    }
+    return;
+  }
   try {
     state.current = await api("/api/runs/control", { method: "POST", body: JSON.stringify({ action }) });
     renderCurrent();
@@ -1935,6 +2886,62 @@ async function runControl(action) {
   } catch (error) {
     toast(error.message, true);
   }
+}
+
+function openGenerationAccountEditor(accountId) {
+  const account = state.accounts.find((item) => item.id === accountId);
+  if (!account) return;
+  state.editingStageAccountId = accountId;
+  elements["generation-account-title"].textContent = `修改 · ${account.account_name}`;
+  elements["account-model-select"].value = account.model_name || "自动";
+  elements["account-singer-select"].value = singerNameForModel(account.model_name, account.singer_name);
+  renderAccountSingerVisibility();
+  elements["generation-account-form"].hidden = false;
+  elements["generation-account-form"].scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function fillLyricTemplateFormForStage(template = null) {
+  state.lyricTemplateEditorOpen = true;
+  state.editingLyricTemplateId = template?.id || "";
+  state.lyricTemplateAccountLocked = true;
+  state.selectedTemplateThemes = template ? [...template.themes] : [];
+  elements["template-account-select"].value = template?.account_id || state.accountId || "";
+  elements["template-name"].value = template?.name || "";
+  elements["template-lyric-tone"].value = template?.lyric_tone || "";
+  elements["template-song-style"].value = template?.song_style || "";
+  elements["template-generation-count"].value = template?.generation_count || 1;
+  elements["custom-theme"].value = "";
+  renderTemplateOutputLocation();
+  renderLyricTemplateEditor();
+  elements["lyric-template-form"]?.scrollIntoView({ behavior: "smooth", block: "center" });
+  elements["template-name"].focus();
+}
+
+async function openLyricAccountEditor(accountId) {
+  const account = state.accounts.find((item) => item.id === accountId);
+  if (!account) return;
+  state.accountId = accountId;
+  elements["account-select"].value = accountId;
+  state.lyricTemplates = [];
+  state.lyricResults = [];
+  state.selectedLyricTemplateId = "";
+  state.lyricTemplateEditorOpen = false;
+  state.editingLyricTemplateId = "";
+  state.lyricTemplateAccountLocked = true;
+  renderAccounts();
+  renderControls();
+  state.settingsTab = "prompt";
+  state.view = "settings";
+  renderView();
+  await reloadAccountWorkspace();
+  if (state.accountId !== accountId) return;
+  const template = state.lyricTemplates[0];
+  state.selectedLyricTemplateId = template?.id || "";
+  fillLyricTemplateFormForStage(template || null);
+  renderLyricWorkspace();
+  elements["lyric-template-caption"].textContent = `正在修改 ${account.account_name} 的作词模板`;
+  elements["lyric-template-form"]?.scrollIntoView({ behavior: "smooth", block: "center" });
+  toast(template ? `正在修改 ${account.account_name} 的模板` : `请为 ${account.account_name} 创建模板`);
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
@@ -1947,13 +2954,17 @@ document.addEventListener("DOMContentLoaded", async () => {
   await Promise.allSettled([loadHealth(), loadSettings()]);
   await loadAccounts();
   await loadLoginBrowser();
+  await Promise.allSettled([loadMultiStage(), loadStageAccountData()]);
   const recent = await api("/api/logs/recent").catch(() => []);
   for (const event of recent) if (event.type === "log") appendLog(event.data);
   connectSocket();
   setInterval(loadHealth, 5000);
   setInterval(loadLoginBrowser, 5000);
   setInterval(loadUploads, 10000);
+  setInterval(loadDashboardSongs, 10000);
+  setInterval(loadStageAccountData, 10000);
   setInterval(loadUploadRun, 5000);
+  setInterval(loadMultiStage, 5000);
   setInterval(loadPipelineRun, 5000);
   setInterval(loadPipelineQueue, 5000);
 });
@@ -2018,59 +3029,130 @@ function setupTooltips() {
 }
 
 function bindEvents() {
-  elements["account-menu-button"].addEventListener("click", (event) => {
-    event.stopPropagation();
-    setAccountMenuOpen(!state.accountMenuOpen);
-    if (state.accountMenuOpen) elements["account-menu"].querySelector("button")?.focus();
+  elements["task-account-list"].addEventListener("change", (event) => {
+    const checkbox = event.target.closest("[data-task-account]");
+    if (!checkbox || checkbox.disabled) return;
+    if (checkbox.checked) state.selectedTaskAccounts.add(checkbox.dataset.taskAccount);
+    else state.selectedTaskAccounts.delete(checkbox.dataset.taskAccount);
+    if (!pipelineWorkflowBusy()) {
+      state.selectedPipelineQueueAccounts = new Set(state.selectedTaskAccounts);
+    }
+    renderTaskAccounts();
+    renderControls();
   });
 
-  elements["account-menu"].addEventListener("click", (event) => {
-    event.stopPropagation();
-    const option = event.target.closest("[data-account-menu-id]");
-    if (!option || accountMenuDisabled()) return;
-    elements["account-select"].value = option.dataset.accountMenuId;
-    setAccountMenuOpen(false);
+  elements["task-account-list"].addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-focus-account]");
+    if (!button || button.disabled) return;
+    elements["account-select"].value = button.dataset.focusAccount;
     elements["account-select"].dispatchEvent(new Event("change", { bubbles: true }));
   });
 
-  document.addEventListener("click", () => {
-    if (state.accountMenuOpen) setAccountMenuOpen(false);
+  elements["stage-account-table"].addEventListener("change", (event) => {
+    const checkbox = event.target.closest("[data-task-account]");
+    if (!checkbox || checkbox.disabled) return;
+    if (checkbox.checked) state.selectedTaskAccounts.add(checkbox.dataset.taskAccount);
+    else state.selectedTaskAccounts.delete(checkbox.dataset.taskAccount);
+    if (!pipelineWorkflowBusy()) {
+      state.selectedPipelineQueueAccounts = new Set(state.selectedTaskAccounts);
+    }
+    renderTaskAccounts();
+    renderControls();
   });
 
-  document.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape" || !state.accountMenuOpen) return;
-    setAccountMenuOpen(false);
-    elements["account-menu-button"].focus();
+  elements["stage-account-table"].addEventListener("click", async (event) => {
+    const editButton = event.target.closest("[data-edit-stage-account]");
+    const focusButton = event.target.closest("[data-focus-account]");
+    if (editButton && !editButton.disabled) {
+      const accountId = editButton.dataset.editStageAccount;
+      if (state.stage === "generation") {
+        openGenerationAccountEditor(accountId);
+      } else {
+        await openLyricAccountEditor(accountId);
+      }
+      return;
+    }
+    if (focusButton && !focusButton.disabled) {
+      elements["account-select"].value = focusButton.dataset.focusAccount;
+      elements["account-select"].dispatchEvent(new Event("change", { bubbles: true }));
+    }
   });
 
-  elements["account-menu-button"].addEventListener("keydown", (event) => {
-    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+  elements["generation-account-cancel"].addEventListener("click", () => {
+    state.editingStageAccountId = "";
+    elements["generation-account-form"].hidden = true;
+  });
+
+  elements["account-model-select"].addEventListener("change", renderAccountSingerVisibility);
+
+  elements["generation-account-form"].addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (!state.accountMenuOpen) setAccountMenuOpen(true);
-    const options = [...elements["account-menu"].querySelectorAll("button")];
-    options[event.key === "ArrowDown" ? 0 : options.length - 1]?.focus();
+    const account = state.accounts.find((item) => item.id === state.editingStageAccountId);
+    if (!account) return;
+    try {
+      const updated = await api(`/api/accounts/${account.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          ...account,
+          model_name: elements["account-model-select"].value,
+          singer_name: singerNameForModel(
+            elements["account-model-select"].value,
+            elements["account-singer-select"].value,
+          ),
+        }),
+      });
+      state.accounts = state.accounts.map((item) => item.id === updated.id ? updated : item);
+      if (state.accountId === updated.id) fillAccountForm(updated);
+      state.editingStageAccountId = "";
+      elements["generation-account-form"].hidden = true;
+      renderTaskAccounts();
+      toast("生成配置已保存");
+    } catch (error) {
+      toast(error.message, true);
+    }
   });
 
-  elements["account-menu"].addEventListener("keydown", (event) => {
-    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
-    event.preventDefault();
-    const options = [...elements["account-menu"].querySelectorAll("button")];
-    const currentIndex = options.indexOf(document.activeElement);
-    let nextIndex = 0;
-    if (event.key === "ArrowDown") nextIndex = (currentIndex + 1) % options.length;
-    if (event.key === "ArrowUp") nextIndex = (currentIndex - 1 + options.length) % options.length;
-    if (event.key === "Home") nextIndex = 0;
-    if (event.key === "End") nextIndex = options.length - 1;
-    options[nextIndex]?.focus();
+  elements["task-account-all"].addEventListener("click", () => {
+    state.selectedTaskAccounts = new Set(state.accounts.map((account) => account.id));
+    if (!pipelineWorkflowBusy()) {
+      state.selectedPipelineQueueAccounts = new Set(state.selectedTaskAccounts);
+    }
+    renderTaskAccounts();
+    renderControls();
+  });
+
+  elements["task-account-clear"].addEventListener("click", () => {
+    state.selectedTaskAccounts.clear();
+    if (!pipelineWorkflowBusy()) {
+      state.selectedPipelineQueueAccounts.clear();
+    }
+    renderTaskAccounts();
+    renderControls();
   });
 
   document.querySelectorAll(".nav-item:not(.is-disabled)").forEach((item) => {
     item.addEventListener("click", () => {
       state.view = item.dataset.view;
+      if (item.dataset.stage) state.stage = item.dataset.stage;
       if (state.view === "task" && state.stage === "lyrics") {
         state.stage = "generation";
       }
       renderView();
+      if (state.view === "task" || state.view === "lyrics") {
+        void loadStageAccountData().catch(() => {});
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-dashboard-stage]").forEach((button) => {
+    button.addEventListener("click", () => {
+      document.querySelector(`.stage[data-stage="${button.dataset.dashboardStage}"]`)?.click();
+    });
+  });
+
+  document.querySelectorAll("[data-dashboard-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      document.querySelector(`.nav-item[data-view="${button.dataset.dashboardView}"]`)?.click();
     });
   });
 
@@ -2325,7 +3407,14 @@ function bindEvents() {
   elements["upload-table"].addEventListener("change", (event) => {
     const checkbox = event.target.closest("[data-upload-file]");
     if (!checkbox || checkbox.disabled) return;
-    const limit = state.uploads?.batch_size || 10;
+    const dailyLimit = Number(state.uploads?.daily_limit || 10);
+    const dailyUsed = Number(
+      state.uploads?.daily_used ?? (state.uploads?.uploaded_files || []).length,
+    );
+    const remaining = Number(
+      state.uploads?.remaining_uploads ?? Math.max(0, dailyLimit - dailyUsed),
+    );
+    const limit = Math.min(Number(state.uploads?.batch_size || dailyLimit), remaining);
     if (checkbox.checked && state.selectedUploads.size >= limit) {
       checkbox.checked = false;
       toast(`一次最多发布 ${limit} 首`, true);
@@ -2338,7 +3427,14 @@ function bindEvents() {
     renderUploadRun();
   });
   elements["select-all-uploads"].addEventListener("click", () => {
-    const limit = state.uploads?.batch_size || 10;
+    const dailyLimit = Number(state.uploads?.daily_limit || 10);
+    const dailyUsed = Number(
+      state.uploads?.daily_used ?? (state.uploads?.uploaded_files || []).length,
+    );
+    const remaining = Number(
+      state.uploads?.remaining_uploads ?? Math.max(0, dailyLimit - dailyUsed),
+    );
+    const limit = Math.min(Number(state.uploads?.batch_size || dailyLimit), remaining);
     state.selectedUploads = new Set((state.uploads?.files || []).slice(0, limit).map((file) => file.file_name));
     state.uploadSelectionTouched = true;
     renderUploads();
@@ -2351,26 +3447,29 @@ function bindEvents() {
     renderUploadRun();
   });
   elements["start-upload"].addEventListener("click", async () => {
-    if (!state.accountId) return toast("请先选择账号", true);
+    if (!state.selectedTaskAccounts.size) return toast("请先勾选账号", true);
     try {
-      state.uploadRun = await api(
-        `/api/uploads/runs?account_id=${encodeURIComponent(state.accountId)}&day=${encodeURIComponent(todayValue())}`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            file_names: [...state.selectedUploads],
-            ai_created: state.uploadAiCreated,
-            auto_replace_noncompliant: state.autoReplaceNoncompliant,
-          }),
-        },
-      );
-      renderUploadRun();
-      toast("上传任务已启动");
+      const items = await buildUploadQueueItems();
+      if (!items.length) return toast("所选账号都没有可上传曲目", true);
+      state.multiQueue = await api("/api/multi-stage/upload/runs", {
+        method: "POST",
+        body: JSON.stringify({
+          items,
+          day: todayValue(),
+          ai_created: state.uploadAiCreated,
+          auto_replace_noncompliant: state.autoReplaceNoncompliant,
+        }),
+      });
+      renderTaskAccounts();
+      renderTaskStatus();
+      renderControls();
+      toast(items.length === 1 ? "上传任务已启动" : `已启动 ${items.length} 个账号的串联上传`);
     } catch (error) { toast(error.message, true); }
   });
 
   elements["retry-rejected-upload"].addEventListener("click", async () => {
     if (!state.accountId) return toast("请先选择账号", true);
+    const account = state.accounts.find((item) => item.id === state.accountId);
     const regenerateCount = state.uploads?.files?.length || 0;
     if (!regenerateCount) return toast("没有待发布的歌曲", true);
     try {
@@ -2380,8 +3479,8 @@ function bindEvents() {
           method: "POST",
           body: JSON.stringify({
             ai_created: state.uploadAiCreated,
-            model_name: state.generationModel || "自动",
-            singer_name: elements["generation-singer"].value,
+            model_name: account?.model_name || "自动",
+            singer_name: singerNameForModel(account?.model_name || "自动", account?.singer_name),
           }),
         },
       );
@@ -2431,6 +3530,16 @@ function bindEvents() {
     }
   });
   elements["stop-upload"].addEventListener("click", async () => {
+    if (multiStageRunning()) {
+      try {
+        state.multiQueue = await api("/api/multi-stage/runs/stop", { method: "POST" });
+        renderTaskAccounts();
+        renderTaskStatus();
+        renderControls();
+        toast("已请求停止多账号上传");
+      } catch (error) { toast(error.message, true); }
+      return;
+    }
     try {
       state.uploadRun = await api("/api/uploads/runs/stop", { method: "POST" });
       renderUploadRun(); toast("已请求停止上传");
@@ -2442,6 +3551,8 @@ function bindEvents() {
     if (!checkbox || checkbox.disabled) return;
     if (checkbox.checked) state.selectedPipelineQueueAccounts.add(checkbox.dataset.queueAccount);
     else state.selectedPipelineQueueAccounts.delete(checkbox.dataset.queueAccount);
+    state.selectedTaskAccounts = new Set(state.selectedPipelineQueueAccounts);
+    renderTaskAccounts();
     renderPipelinePanel();
   });
 
@@ -2537,6 +3648,7 @@ function bindEvents() {
 function fillLyricTemplateForm(template = null) {
     state.lyricTemplateEditorOpen = true;
     state.editingLyricTemplateId = template?.id || "";
+    state.lyricTemplateAccountLocked = Boolean(template);
     state.selectedTemplateThemes = template ? [...template.themes] : [];
     elements["template-account-select"].value = template?.account_id || state.accountId || "";
     elements["template-name"].value = template?.name || "";
@@ -2552,6 +3664,25 @@ function fillLyricTemplateForm(template = null) {
   elements["new-lyric-template"].addEventListener("click", () => {
     if (!state.accounts.length) return toast("请先创建妙响账号", true);
     fillLyricTemplateForm();
+  });
+
+  elements["multi-lyrics-start"].addEventListener("click", async () => {
+    if (!state.selectedTaskAccounts.size) return toast("请先勾选账号", true);
+    try {
+      const items = await buildLyricQueueItems();
+      if (!items.length) return toast("所选账号都没有作词模板", true);
+      state.multiQueue = await api("/api/multi-stage/lyrics/runs", {
+        method: "POST",
+        body: JSON.stringify({ items, day: todayValue() }),
+      });
+      syncLyricQueueSnapshot(state.multiQueue);
+      renderTaskAccounts();
+      renderTaskStatus();
+      renderControls();
+      toast(items.length === 1 ? "AI 作词已启动" : `已并联启动 ${items.length} 个账号的 AI 作词`);
+    } catch (error) {
+      toast(error.message, true);
+    }
   });
 
   elements["lyric-template-cards"].addEventListener("click", async (event) => {
@@ -2671,6 +3802,7 @@ function fillLyricTemplateForm(template = null) {
   elements["cancel-lyric-template"].addEventListener("click", () => {
     state.lyricTemplateEditorOpen = false;
     state.editingLyricTemplateId = "";
+    state.lyricTemplateAccountLocked = false;
     state.selectedTemplateThemes = [];
     renderLyricTemplateEditor();
   });
@@ -2712,6 +3844,7 @@ function fillLyricTemplateForm(template = null) {
       }
       state.lyricTemplateEditorOpen = false;
       state.editingLyricTemplateId = "";
+      state.lyricTemplateAccountLocked = false;
       state.accountId = accountId;
       renderAccounts();
       await loadSongs();
@@ -2795,8 +3928,33 @@ function fillLyricTemplateForm(template = null) {
     renderSongs();
   });
   elements["select-failed"].addEventListener("click", () => {
-    state.selected = new Set(state.songs.filter((song) => !song.valid || songState(song) === "failed").map((song) => song.file_name));
+    state.selected = new Set(
+      state.songs
+        .filter((song) => !song.valid || isFailureStatus(songState(song)))
+        .map((song) => song.file_name),
+    );
     renderSongs();
+  });
+  elements["repair-run"].addEventListener("click", async () => {
+    if (!state.accountId) return toast("请先选择账号", true);
+    if (!state.songs.some(canAutoRepairSong)) {
+      return toast("当前没有可自动修复的异常歌曲", true);
+    }
+    try {
+      state.current = await api("/api/runs/repair", {
+        method: "POST",
+        body: JSON.stringify({
+          account_id: state.accountId,
+          day: todayValue(),
+        }),
+      });
+      applyCurrentRun(state.current, { immediate: true });
+      if (!["completed", "failed", "stopped", "generation_limit"].includes(state.current.status)) {
+        toast("已开始一键修复异常");
+      }
+    } catch (error) {
+      toast(error.message, true);
+    }
   });
 
   elements["generation-model"].addEventListener("change", () => {
@@ -2814,24 +3972,32 @@ function fillLyricTemplateForm(template = null) {
   });
 
   elements["start-run"].addEventListener("click", async () => {
-    if (!state.accountId) return toast("请先选择账号", true);
-    if (!state.selected.size) return toast("请选择歌词文件", true);
+    if (!state.selectedTaskAccounts.size) return toast("请先勾选账号", true);
     try {
-      state.current = await api("/api/runs", {
+      const items = await buildGenerationQueueItems();
+      if (!items.length) return toast("所选账号都没有可生成歌词", true);
+      const itemRequests = items.map((item) => {
+        const account = state.accounts.find((entry) => entry.id === item.account_id);
+        return {
+          ...item,
+          model_name: account?.model_name || "自动",
+          singer_name: singerNameForModel(account?.model_name || "自动", account?.singer_name),
+        };
+      });
+      state.multiQueue = await api("/api/multi-stage/generation/runs", {
         method: "POST",
         body: JSON.stringify({
-          account_id: state.accountId,
-          song_files: [...state.selected],
+          items: itemRequests,
           day: todayValue(),
           fresh_run: elements["fresh-run"].checked,
-          model_name: state.generationModel || elements["generation-model"].value,
-          singer_name: elements["generation-singer"].value,
+          model_name: "自动",
+          singer_name: "",
         }),
       });
-      applyCurrentRun(state.current, { immediate: true });
-      if (!["completed", "failed", "stopped", "generation_limit"].includes(state.current.status)) {
-        toast("任务已启动");
-      }
+      renderTaskAccounts();
+      renderTaskStatus();
+      renderControls();
+      toast(items.length === 1 ? "生成任务已启动" : `已启动 ${items.length} 个账号的串联生成`);
     } catch (error) {
       toast(error.message, true);
     }
@@ -2844,20 +4010,36 @@ function fillLyricTemplateForm(template = null) {
   elements["settings-form"].addEventListener("submit", (event) => event.preventDefault());
   elements["save-settings"].addEventListener("click", async () => {
     const runtimeActive = state.settingsTab === "runtime";
-    const form = runtimeActive ? elements["settings-form"] : elements["ai-settings-form"];
-    const payload = {};
-    const numberFields = new Set([
-      "ai_max_retries",
-    ]);
-    for (const input of form.elements) {
-      if (!input.name) continue;
-      payload[input.name] = runtimeActive || numberFields.has(input.name)
-        ? Number(input.value)
-        : input.value.trim();
-    }
     try {
+      let payload = {};
+      if (runtimeActive) {
+        const form = elements["settings-form"];
+        for (const input of form.elements) {
+          if (!input.name) continue;
+          payload[input.name] = Number(input.value);
+        }
+      } else {
+        const form = elements["ai-settings-form"];
+        const provider = {
+          id: form.ai_provider_id.value.trim() || `local-${Date.now().toString(36)}`,
+          name: form.ai_provider_name.value.trim(),
+          api_base_url: form.ai_api_base_url.value.trim(),
+          api_key: form.ai_api_key.value.trim(),
+          model: form.ai_model.value.trim(),
+          max_retries: Math.min(5, Math.max(0, Number(form.ai_max_retries.value || 2))),
+        };
+        if (!provider.name) return toast("请填写接口名称", true);
+        if (!provider.api_base_url || !provider.model) return toast("请填写 API 地址和模型", true);
+        const configs = aiApiConfigs().filter((item) => item.id !== provider.id);
+        configs.push(provider);
+        payload = {
+          ai_api_configs: configs,
+          active_ai_api_config_id: provider.id,
+        };
+      }
       state.settings = await api("/api/settings", { method: "PUT", body: JSON.stringify(payload) });
       if (!runtimeActive) state.aiConfigEditorOpen = false;
+      state.aiApiChecks = {};
       await loadSettings();
       toast(runtimeActive ? "运行参数已保存" : "AI API 配置已保存");
     } catch (error) {
@@ -2873,21 +4055,142 @@ function fillLyricTemplateForm(template = null) {
     state.settingsTab = "ai";
     renderSettingsTabs();
   });
-
-  elements["ai-config-cards"].addEventListener("click", (event) => {
-    const button = event.target.closest("[data-edit-ai-config]");
-    if (!button || button.disabled) return;
-    state.aiConfigEditorOpen = true;
+  elements["settings-tab-prompt"].addEventListener("click", () => {
+    state.settingsTab = "prompt";
     renderSettingsTabs();
-    elements["ai-settings-form"].ai_api_base_url.focus();
+    renderLyricPromptState();
+  });
+
+  elements["ai-provider-select"].addEventListener("change", async () => {
+    const config = aiApiConfigs().find((item) => item.id === elements["ai-provider-select"].value);
+    if (!config || config.id === state.settings?.active_ai_api_config_id) return;
+    try {
+      state.settings = await api("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify({ active_ai_api_config_id: config.id }),
+      });
+      renderSettingsTabs();
+      renderControls();
+      toast(`AI 作词已切换到 ${config.name}`);
+    } catch (error) {
+      toast(error.message, true);
+      syncAiProviderSelect();
+    }
+  });
+
+  elements["ai-config-cards"].addEventListener("click", async (event) => {
+    const button = event.target.closest(
+      "[data-add-ai-config], [data-test-ai-config], [data-edit-ai-config], [data-use-ai-config], [data-delete-ai-config]"
+    );
+    if (!button || button.disabled) return;
+    if (button.dataset.addAiConfig) {
+      state.aiConfigEditorOpen = true;
+      state.editingAIProviderId = "";
+      fillAiApiForm(null);
+      renderSettingsTabs();
+      elements["ai-settings-form"].ai_provider_name.focus();
+      return;
+    }
+    if (button.dataset.testAiConfig) {
+      const config = aiApiConfigs().find((item) => item.id === button.dataset.testAiConfig);
+      if (!config) return;
+      if (Object.values(state.aiApiChecks).some((item) => item.status === "checking")) {
+        return toast("已有接口正在检测，请稍候", true);
+      }
+      const startedAt = Date.now();
+      state.aiApiChecks = {
+        ...state.aiApiChecks,
+        [config.id]: { status: "checking" },
+      };
+      renderAiApiConfigCards();
+      try {
+        const result = await api("/api/settings/ai/test", {
+          method: "POST",
+          body: JSON.stringify({
+            ai_api_base_url: config.api_base_url,
+            ai_api_key: config.api_key,
+            ai_model: config.model,
+          }),
+        });
+        state.aiApiChecks[config.id] = {
+          status: "success",
+          model_count: result.model_count,
+          elapsed_ms: Date.now() - startedAt,
+        };
+        toast(`${config.name} 连接成功`);
+      } catch (error) {
+        state.aiApiChecks[config.id] = {
+          status: "failed",
+          error: error.message,
+          elapsed_ms: Date.now() - startedAt,
+        };
+        toast(`${config.name} 检测失败：${error.message}`, true);
+      } finally {
+        renderAiApiConfigCards();
+      }
+      return;
+    }
+    if (button.dataset.editAiConfig) {
+      const config = aiApiConfigs().find((item) => item.id === button.dataset.editAiConfig);
+      if (!config) return;
+      state.aiConfigEditorOpen = true;
+      state.editingAIProviderId = config.id;
+      fillAiApiForm(config);
+      renderSettingsTabs();
+      elements["ai-settings-form"].ai_provider_name.focus();
+      return;
+    }
+    if (button.dataset.useAiConfig) {
+      const config = aiApiConfigs().find((item) => item.id === button.dataset.useAiConfig);
+      if (!config) return;
+      try {
+        state.settings = await api("/api/settings", {
+          method: "PUT",
+          body: JSON.stringify({ active_ai_api_config_id: config.id }),
+        });
+        renderSettingsTabs();
+        renderControls();
+        toast(`已切换到 ${config.name}`);
+      } catch (error) {
+        toast(error.message, true);
+      }
+      return;
+    }
+    if (button.dataset.deleteAiConfig) {
+      const config = aiApiConfigs().find((item) => item.id === button.dataset.deleteAiConfig);
+      if (!config || !confirm(`确定删除 AI 接口“${config.name}”？`)) return;
+      const configs = aiApiConfigs().filter((item) => item.id !== config.id);
+      const payload = {
+        ai_api_configs: configs,
+        active_ai_api_config_id: configs[0]?.id || "",
+      };
+      if (!configs.length) {
+        Object.assign(payload, {
+          ai_api_base_url: "",
+          ai_api_key: "",
+          ai_model: "",
+          ai_max_retries: 2,
+        });
+      }
+      try {
+        state.settings = await api("/api/settings", { method: "PUT", body: JSON.stringify(payload) });
+        if (state.editingAIProviderId === config.id) {
+          state.aiConfigEditorOpen = false;
+          state.editingAIProviderId = "";
+        }
+        await loadSettings();
+        renderControls();
+        toast("AI 接口已删除");
+      } catch (error) {
+        toast(error.message, true);
+      }
+    }
   });
 
   elements["ai-config-cancel"].addEventListener("click", () => {
-    if (!state.settings?.ai_api_base_url || !state.settings?.ai_model) return;
+    if (!aiApiConfigs().length) return;
     state.aiConfigEditorOpen = false;
-    for (const [key, value] of Object.entries(state.settings)) {
-      if (elements["ai-settings-form"].elements[key]) elements["ai-settings-form"].elements[key].value = value;
-    }
+    state.editingAIProviderId = "";
     renderSettingsTabs();
   });
 
@@ -2898,8 +4201,9 @@ function fillLyricTemplateForm(template = null) {
       ai_api_key: form.ai_api_key.value.trim(),
       ai_model: form.ai_model.value.trim(),
     };
-    if (!payload.ai_api_base_url || !payload.ai_model) {
-      return toast("请先填写 API 地址和模型", true);
+    const name = form.ai_provider_name.value.trim();
+    if (!name || !payload.ai_api_base_url || !payload.ai_model) {
+      return toast("请先填写接口名称、API 地址和模型", true);
     }
     elements["test-ai-settings"].disabled = true;
     elements["test-ai-settings"].textContent = "测试中";

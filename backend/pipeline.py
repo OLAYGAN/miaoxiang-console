@@ -229,6 +229,10 @@ class PipelineEngine:
 
     async def stop(self) -> PipelineSnapshot:
         if not self.is_running and not self.is_waiting_user:
+            # Stop is idempotent: a run can finish while the stop request is
+            # travelling from the browser. Return its final state in that case.
+            if self.current is not None:
+                return self.current
             raise ConflictError("当前没有可停止的完整流水线")
         if self.current:
             self.current.status = "stopped"
@@ -393,7 +397,7 @@ class PipelineEngine:
         confirmed_count = 0
         for song in self.current.songs:
             if song.generation_status == "completed":
-                if upload_status != "completed":
+                if upload_status not in {"completed", "partial_failed"}:
                     song.upload_status = upload_status
                     continue
                 output_path = str(Path(song.output_path or "").resolve()) if song.output_path else ""
@@ -407,6 +411,9 @@ class PipelineEngine:
                     song.error = None
         if upload_status == "completed":
             self.current.status = "completed" if confirmed_count or uploaded is None else "failed"
+        elif upload_status == "partial_failed":
+            self.current.status = "partial_failed"
+            self.current.error = str(result.get("error") or "部分歌曲替换发布失败")
         else:
             self.current.status = upload_status
             self.current.error = str(result.get("error") or "上传发布失败")

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>妙响自动化控制台</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="/assets/styles.css?v=41">
+  <link rel="stylesheet" href="/assets/styles.css?v=52">
 </head>
 <body>
 <div class="app-shell">
@@ -15,14 +15,7 @@
       <h1>妙响控制台</h1>
     </div>
 
-    <div class="account-switcher" id="account-switcher" data-tip="切换当前妙响账号；任务运行时不能切换。">
-      <span>当前妙响账号</span>
-      <button type="button" id="account-menu-button" class="account-menu-button" aria-haspopup="listbox" aria-expanded="false">
-        <span id="account-menu-value">选择账号</span>
-      </button>
-      <div id="account-menu" class="account-menu" role="listbox" aria-label="妙响账号"></div>
-      <select id="account-select" aria-hidden="true" tabindex="-1"></select>
-    </div>
+    <select id="account-select" aria-hidden="true" tabindex="-1" hidden></select>
 
     <div class="sidebar-status">
       <span id="service-status" class="status-chip is-offline">服务未连接</span>
@@ -31,42 +24,164 @@
     </div>
 
     <nav class="nav-list" aria-label="主导航">
-      <button type="button" class="nav-item is-active" data-view="task">
-        <span>任务管理</span>
+      <button type="button" class="nav-item is-active" data-view="dashboard">
+        <span>工作台</span>
       </button>
-     <button type="button" class="nav-item" data-view="account">
-        <span>妙响账号</span>
+      <button type="button" class="nav-item" data-view="lyrics" data-stage="lyrics">
+        <span>AI 作词</span>
+      </button>
+      <button type="button" class="nav-item" data-view="task" data-stage="generation">
+        <span>生成下载</span>
+      </button>
+      <button type="button" class="nav-item" data-view="task" data-stage="upload">
+        <span>上传发布</span>
+      </button>
+      <button type="button" class="nav-item" data-view="task" data-stage="pipeline">
+        <span>完整流水线</span>
+      </button>
+      <button type="button" class="nav-item" data-view="account">
+        <span>账号中心</span>
       </button>
       <button type="button" class="nav-item" data-view="log">
-        <span>运行日志</span>
+        <span>运行记录</span>
       </button>
       <button type="button" class="nav-item" data-view="settings">
         <span>系统设置</span>
       </button>
     </nav>
 
-    <div id="settings-subnav" class="sidebar-subnav" aria-label="系统设置子导航" hidden>
-      <button type="button" id="settings-tab-runtime" class="subnav-item">运行参数</button>
-      <button type="button" id="settings-tab-ai" class="subnav-item">AI API</button>
-    </div>
   </aside>
 
   <main class="content">
-    <div class="task-frame">
-      <section id="workflow-header" class="task-sidebar" aria-label="任务管理导航" hidden>
+    <section id="view-dashboard" class="view is-active">
+      <div class="view-header">
         <div>
-          <h2>任务管理</h2>
-          <p class="caption">选择阶段后按顺序执行</p>
+          <h2>工作台</h2>
+          <p class="caption">账号、任务和当日产出的总览</p>
         </div>
-        <div class="stage-strip task-stage-strip" aria-label="任务阶段">
-          <button type="button" id="stage-lyrics" class="stage" data-stage="lyrics">AI 作词</button>
-          <button type="button" id="stage-generation" class="stage is-active" data-stage="generation">生成 / 导出 / 下载</button>
-          <button type="button" id="stage-upload" class="stage" data-stage="upload">上传作品</button>
-          <button type="button" id="stage-pipeline" class="stage" data-stage="pipeline">完整流水线</button>
+        <div class="dashboard-date" id="dashboard-date">-</div>
+      </div>
+
+      <div class="dashboard-metrics">
+        <div><span>账号</span><strong id="dashboard-account-count">0</strong></div>
+        <div><span>歌词</span><strong id="dashboard-lyric-count">0</strong></div>
+        <div><span>成品</span><strong id="dashboard-download-count">0</strong></div>
+        <div><span>待发布</span><strong id="dashboard-pending-upload-count">0</strong></div>
+        <div><span>已发布</span><strong id="dashboard-published-count">0</strong></div>
+        <div><span>异常</span><strong id="dashboard-error-count">0</strong></div>
+      </div>
+
+      <section class="panel dashboard-account-panel">
+        <div class="panel-header">
+          <div>
+            <h3>账号概览</h3>
+            <p class="caption">当前账号显示当日明细，其他账号显示队列状态</p>
+          </div>
+          <div class="dashboard-actions">
+            <button type="button" class="button" data-dashboard-stage="lyrics">AI 作词</button>
+            <button type="button" class="button" data-dashboard-stage="generation">生成下载</button>
+            <button type="button" class="button" data-dashboard-stage="upload">上传发布</button>
+            <button type="button" class="button" data-dashboard-stage="pipeline">完整流水线</button>
+            <button type="button" class="button" data-dashboard-view="account">账号中心</button>
+          </div>
+        </div>
+        <div class="dashboard-account-table" id="dashboard-account-table">
+          <div class="dashboard-account-row dashboard-account-head">
+            <span>账号</span><span>歌词</span><span>成品</span><span>已发布</span><span>异常</span><span>状态</span>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <div class="task-frame">
+      <section id="workflow-header" class="task-workflow-header" aria-label="任务中心导航" hidden>
+        <div class="workflow-title-row">
+          <div>
+            <h2 id="workflow-title">生成下载</h2>
+            <p id="workflow-caption" class="caption">全部账号 · 串联执行</p>
+          </div>
+          <span id="workflow-date" class="workflow-date">-</span>
+        </div>
+
+        <div class="task-account-panel">
+          <div class="task-account-header">
+            <div class="task-account-title">
+              <span>账号范围</span>
+              <strong id="task-account-count">已选 0 / 0</strong>
+            </div>
+          </div>
+          <label class="task-ai-provider" for="ai-provider-select">
+            <span>AI 接口</span>
+            <select id="ai-provider-select"></select>
+          </label>
+          <div class="task-account-actions">
+            <button type="button" id="task-account-all" class="button">全选</button>
+            <button type="button" id="task-account-clear" class="button">清空</button>
+            <button type="button" id="start-run" class="button primary run-button" data-tip="按勾选顺序批量生成，并逐首导出下载。">开始生成</button>
+            <button type="button" id="multi-lyrics-start" class="button primary" data-tip="为勾选账号并联生成并保存歌词；每个账号使用自己的模板。">开始作词</button>
+            <button type="button" id="start-upload" class="button primary" data-tip="发布选中账号的曲目到平台。">发布全曲</button>
+          </div>
+          <div class="stage-account-table" id="stage-account-table">
+            <div class="stage-account-row stage-account-head">
+              <span>选择</span><span>账号</span><span>状态</span><span>进度</span><span>账号配置</span><span>当前步骤</span><span>操作</span>
+            </div>
+          </div>
+          <div id="task-account-list" class="is-hidden" aria-hidden="true"></div>
+          <div id="multi-stage-caption" class="task-account-summary">未启动多账号任务</div>
+        </div>
+        <div class="workflow-mode-row" aria-hidden="true" hidden>
+          <div class="workflow-mode-group">
+            <span>阶段任务</span>
+            <div class="stage-strip task-stage-strip" aria-label="阶段任务">
+              <button type="button" id="stage-lyrics" class="stage" data-stage="lyrics">AI 作词</button>
+              <button type="button" id="stage-generation" class="stage is-active" data-stage="generation">生成下载</button>
+              <button type="button" id="stage-upload" class="stage" data-stage="upload">上传发布</button>
+            </div>
+          </div>
+          <div class="workflow-mode-divider" aria-hidden="true"></div>
+          <div class="workflow-mode-group">
+            <span>完整流程</span>
+            <div class="stage-strip task-stage-strip" aria-label="完整流水线">
+              <button type="button" id="stage-pipeline" class="stage" data-stage="pipeline">完整流水线</button>
+            </div>
+          </div>
         </div>
       </section>
 
-    <section id="view-task" class="view is-active">
+      <form id="generation-account-form" class="panel stage-config-panel" hidden>
+        <div class="panel-header">
+          <div>
+            <h3 id="generation-account-title">修改生成配置</h3>
+            <p class="caption">模型和人声保存在账号配置中</p>
+          </div>
+          <button type="button" id="generation-account-cancel" class="button">取消</button>
+        </div>
+        <div class="stage-config-grid">
+          <label class="field">
+            <span>模型</span>
+            <select id="account-model-select" required>
+              <option value="自动" selected>自动（平台默认）</option>
+              <option value="Sodance v2.0">Sodance v2.0 · 限时免费</option>
+              <option value="MiniMax v2.6">MiniMax v2.6</option>
+              <option value="TemPolor v4.1a">TemPolor v4.1a</option>
+              <option value="音潮 v3.0">音潮 v3.0</option>
+              <option value="SeedMusic v1.0 preview">SeedMusic v1.0 preview</option>
+              <option value="TemPolor v4.0">TemPolor v4.0</option>
+              <option value="Sway v5.5">Sway v5.5</option>
+            </select>
+          </label>
+          <label class="field account-singer-field">
+            <span>人声选择</span>
+            <select id="account-singer-select">
+              <option value="" selected>不选择（平台默认）</option>
+              <option value="老岩">老岩</option>
+            </select>
+          </label>
+          <button type="submit" class="button primary">保存账号配置</button>
+        </div>
+      </form>
+
+    <section id="view-task" class="view">
       <div class="task-layout">
         <section class="panel pipeline-panel">
           <div class="panel-header">
@@ -160,12 +275,13 @@
         <section class="panel queue-panel">
           <div class="panel-header">
             <div>
-              <h3>生成任务</h3>
-              <p id="queue-caption" class="caption">选择账号后读取歌词</p>
+              <h3>任务明细</h3>
+              <p id="queue-caption" class="caption">点击上方账号的“查看”切换明细</p>
             </div>
             <div class="queue-actions">
               <button type="button" id="select-all" class="button" data-tip="选中当前账号今天所有可解析的歌词。">全选</button>
               <button type="button" id="select-failed" class="button" data-tip="只选择解析失败或处理失败的歌词。">仅失败</button>
+              <button type="button" id="repair-run" class="button" data-tip="自动重试所有可恢复异常：下载失败直接重下，导出或匹配失败重新导出，生成失败才重新生成。">一键修复异常</button>
               <button type="button" id="refresh-songs" class="button" data-tip="重新读取已保存的歌词目录和解析结果。">重新读取</button>
             </div>
           </div>
@@ -203,7 +319,6 @@
                 <option value="老岩">老岩</option>
               </select>
             </label>
-            <button type="button" id="start-run" class="button primary run-button" data-tip="按勾选顺序批量生成，并逐首导出下载。">开始生成</button>
             <button type="button" id="pause-run" class="button" data-tip="当前步骤完成后暂停。">暂停</button>
             <button type="button" id="resume-run" class="button">继续</button>
             <button type="button" id="stop-run" class="button danger" data-tip="停止新步骤并释放 Chrome。">停止</button>
@@ -223,7 +338,7 @@
 
           <div class="song-table" id="song-table">
             <div class="song-row song-head">
-              <span>选择</span><span>文件</span><span>歌名</span><span>状态</span><span>步骤</span><span>重试</span>
+              <span>选择</span><span>文件</span><span>歌名</span><span>状态</span><span>步骤</span><span>重试</span><span>操作</span>
             </div>
           </div>
           <div id="queue-empty" class="empty-state">
@@ -239,7 +354,7 @@
               <p id="upload-caption" class="caption">等待成品下载完成</p>
             </div>
             <div class="queue-actions">
-              <button type="button" id="select-all-uploads" class="button" data-tip="按歌词顺序选择最多批次上限的曲目。">全选</button>
+              <button type="button" id="select-all-uploads" class="button" data-tip="按歌词顺序选择不超过今日剩余额度的曲目。">全选</button>
               <button type="button" id="clear-upload-selection" class="button" data-tip="清空本次发布选择。">清空</button>
               <button type="button" id="refresh-uploads" class="button">刷新</button>
               <button type="button" id="retry-uploads" class="button" data-tip="清除本地已发布标记，并把已发布歌曲重新提交为一批专辑。">重新发布</button>
@@ -273,7 +388,7 @@
           </div>
           <div class="upload-summary">
             <div><span>已选择</span><strong id="upload-count">0</strong></div>
-            <div><span>批次上限</span><strong id="upload-limit">10</strong></div>
+            <div><span>剩余额度</span><strong id="upload-limit">10</strong></div>
           </div>
           <div class="upload-table" id="upload-table">
             <div class="upload-row upload-head">
@@ -289,7 +404,6 @@
               等待在平台窗口输入短信验证码；检测到“已完成作品上传，审核中”后任务自动完成
             </div>
             <button type="button" id="stop-upload" class="button danger" disabled>停止上传</button>
-            <button type="button" id="start-upload" class="button primary" data-tip="上传当前账号当天未发布的成品，发布到汽水音乐。">发布全曲</button>
             <button type="button" id="retry-rejected-upload" class="button" disabled data-tip="将待发布歌曲按对应歌词重新生成、下载，然后自动重新发布。">再次生成发布</button>
           </div>
         </section>
@@ -299,8 +413,8 @@
     <section id="view-account" class="view">
       <div class="view-header">
         <div>
-          <h2>妙响账号</h2>
-          <p class="caption">平台账号的本地运行配置</p>
+          <h2>账号中心</h2>
+          <p class="caption">平台账号、目录和登录状态</p>
         </div>
         <div class="segmented">
           <button type="button" id="account-new" class="segment">新建</button>
@@ -309,8 +423,8 @@
         </div>
       </div>
 
-      <section class="account-rules panel">
-        <strong>账号使用规则</strong>
+      <details class="account-rules panel">
+        <summary>账号使用规则</summary>
         <ol>
           <li>填写账号名称并选择一个总文件夹；系统自动创建歌词、歌曲、下载和 Chrome 分类目录。</li>
           <li>点击“保存账号”，回到账号卡片。</li>
@@ -318,7 +432,7 @@
           <li>看到账号头像后等待 10 秒，再点击“关闭窗口”释放 Chrome 用户目录。</li>
           <li>只需要填写项目根目录；系统会自动创建“根目录\当天日期\”文件夹，并把歌词放在该日期文件夹中。</li>
         </ol>
-      </section>
+      </details>
 
       <div id="account-cards" class="account-card-list"></div>
 
@@ -397,7 +511,10 @@
     <section id="view-log" class="view">
       <section class="panel log-panel">
         <div class="panel-header">
-          <h2>运行日志</h2>
+          <div>
+            <h2>运行记录</h2>
+            <p class="caption">任务事件、异常提示和浏览器操作记录</p>
+          </div>
           <div class="queue-actions">
             <button type="button" id="copy-logs" class="button" data-tip="复制当前界面显示的日志文本。">复制</button>
             <button type="button" id="open-logs" class="button" data-tip="打开本地日志文件夹。">日志目录</button>
@@ -410,52 +527,17 @@
 
     <section id="view-lyrics" class="view">
       <div class="lyric-layout">
-        <section class="panel lyric-template-panel">
+        <section class="panel lyric-summary-panel">
           <div class="panel-header">
             <div>
-              <h3>作词模板</h3>
-              <p id="lyric-template-caption" class="caption">当前账号暂无模板</p>
+              <h3>所有账号生成歌词</h3>
+              <p id="lyric-summary-caption" class="caption">按账号显示今日生成状态和歌名</p>
             </div>
-            <button type="button" id="new-lyric-template" class="button">新建模板</button>
           </div>
-          <div id="lyric-template-cards" class="lyric-template-cards"></div>
-          <form id="lyric-template-form" class="lyric-form" hidden>
-            <div class="field" data-tip="模板保存到该账号；生成结果也会保存到该账号的歌词目录。">
-              <span>生成位置 / 绑定账号</span>
-              <select id="template-account-select" required></select>
-              <input id="template-output-location" readonly>
-            </div>
-            <label class="field">
-              <span>模板名称</span>
-              <input id="template-name" maxlength="64" required placeholder="例如：校园爱情模板">
-            </label>
-            <label class="field lyric-count-field" data-tip="该模板每次点击生成时产生的歌词数量。">
-              <span>生成数量</span>
-              <input id="template-generation-count" type="number" min="1" max="10" step="1" value="1" required>
-            </label>
-            <label class="field" data-tip="控制叙事视角、语言质感、段落结构和情绪表达。">
-              <span>歌词格调</span>
-              <textarea id="template-lyric-tone" rows="6" placeholder="第一人称叙事，语言青涩自然，主歌用校园细节铺垫，副歌表达暗恋和遗憾。"></textarea>
-            </label>
-            <label class="field" data-tip="控制流派、节奏、人声、编曲和情绪推进。">
-              <span>歌曲风格</span>
-              <textarea id="template-song-style" rows="6" placeholder="青春流行，中速，木吉他与钢琴开场，副歌加入鼓点，人声清澈温暖。"></textarea>
-            </label>
-            <div class="field" data-tip="主题可多选，会一起传给 AI。">
-              <span>主题（可多选）</span>
-              <div id="template-theme-options" class="theme-options"></div>
-              <div class="theme-custom-row">
-                <input id="custom-theme" placeholder="自定义主题">
-                <button type="button" id="add-custom-theme" class="button">添加</button>
-              </div>
-            </div>
-            <div class="form-actions">
-              <button type="submit" id="save-lyric-template" class="button primary">保存模板</button>
-              <button type="button" id="cancel-lyric-template" class="button" hidden>取消</button>
-            </div>
-          </form>
+          <div id="lyric-summary-list" class="lyric-summary-list"></div>
         </section>
 
+        <div id="lyric-draft-workspace" hidden aria-hidden="true">
         <section id="lyric-progress-panel" class="panel lyric-progress-panel" hidden>
           <div class="panel-header">
             <div>
@@ -481,26 +563,7 @@
           <div id="lyric-progress-reasoning" class="lyric-progress-reasoning"></div>
         </section>
 
-        <section class="panel lyric-generator">
-          <div class="panel-header">
-            <div>
-              <h3>通用规则提示词</h3>
-              <p class="caption">所有模板共用的输出格式和内容规则</p>
-            </div>
-          </div>
-          <div class="lyric-form">
-            <details id="lyric-prompt-details" class="prompt-details">
-              <summary>规则内容</summary>
-              <label class="field">
-                <span>通用规则</span>
-                <textarea id="lyric-system-prompt" rows="16" minlength="100" maxlength="10000"></textarea>
-              </label>
-              <button type="button" id="save-lyric-prompt" class="button primary" disabled>已保存</button>
-            </details>
-          </div>
-        </section>
-
-        <section class="panel lyric-result-panel">
+        <section class="panel lyric-result-panel" hidden>
           <div class="panel-header">
             <div>
               <h3>歌词草稿</h3>
@@ -514,11 +577,17 @@
             <p>选择账号模板后生成。</p>
           </div>
         </section>
+        </div>
       </div>
     </section>
     </div>
 
     <section id="view-settings" class="view">
+      <div id="settings-subnav" class="settings-subnav" aria-label="系统设置子导航" hidden>
+        <button type="button" id="settings-tab-runtime" class="subnav-item">运行参数</button>
+        <button type="button" id="settings-tab-ai" class="subnav-item">AI API</button>
+        <button type="button" id="settings-tab-prompt" class="subnav-item">AI 提示词</button>
+      </div>
       <section class="panel settings-panel">
         <div class="panel-header">
           <h2>系统设置</h2>
@@ -532,8 +601,75 @@
           <label data-tip="点击下载后等待浏览器下载事件。"><span>下载等待</span><input name="download_timeout_seconds" type="number" min="1" max="600"></label>
           <label data-tip="控制台保留的最近日志条数。"><span>日志容量</span><input name="log_history_limit" type="number" min="100" max="10000"></label>
         </form>
+        <section id="lyric-prompt-panel" class="settings-prompt-panel" hidden>
+          <div class="panel-header">
+            <div>
+              <h3>AI 提示词</h3>
+              <p class="caption">通用规则全局共享；账号模板负责各自的主题、格调和曲风</p>
+            </div>
+          </div>
+          <div id="lyric-prompt-details" class="prompt-details">
+            <strong>通用规则</strong>
+            <label class="field">
+              <span>通用规则</span>
+              <textarea id="lyric-system-prompt" rows="16" minlength="100" maxlength="10000"></textarea>
+            </label>
+            <button type="button" id="save-lyric-prompt" class="button primary" disabled>已保存</button>
+          </div>
+          <section class="panel lyric-template-panel">
+            <div class="panel-header">
+              <div>
+                <h3>账号作词模板</h3>
+                <p id="lyric-template-caption" class="caption">当前账号暂无模板</p>
+              </div>
+              <button type="button" id="new-lyric-template" class="button">新建模板</button>
+            </div>
+            <div id="lyric-template-cards" class="lyric-template-cards"></div>
+            <form id="lyric-template-form" class="lyric-form" hidden>
+              <div class="field" data-tip="模板保存到该账号；编辑已有模板时绑定账号不可更改。">
+                <span>生成位置 / 绑定账号</span>
+                <select id="template-account-select" required></select>
+                <input id="template-output-location" readonly>
+              </div>
+              <label class="field">
+                <span>模板名称</span>
+                <input id="template-name" maxlength="64" required placeholder="例如：校园爱情模板">
+              </label>
+              <label class="field lyric-count-field" data-tip="该模板每次点击生成时产生的歌词数量。">
+                <span>生成数量</span>
+                <input id="template-generation-count" type="number" min="1" max="10" step="1" value="1" required>
+              </label>
+              <label class="field" data-tip="控制叙事视角、语言质感、段落结构和情绪表达。">
+                <span>歌词格调</span>
+                <textarea id="template-lyric-tone" rows="6" placeholder="第一人称叙事，语言青涩自然，主歌用校园细节铺垫，副歌表达暗恋和遗憾。"></textarea>
+              </label>
+              <label class="field" data-tip="控制流派、节奏、人声、编曲和情绪推进。">
+                <span>歌曲风格</span>
+                <textarea id="template-song-style" rows="6" placeholder="青春流行，中速，木吉他与钢琴开场，副歌加入鼓点，人声清澈温暖。"></textarea>
+              </label>
+              <div class="field" data-tip="主题可多选，会一起传给 AI。">
+                <span>主题（可多选）</span>
+                <div id="template-theme-options" class="theme-options"></div>
+                <div class="theme-custom-row">
+                  <input id="custom-theme" placeholder="自定义主题">
+                  <button type="button" id="add-custom-theme" class="button">添加</button>
+                </div>
+              </div>
+              <div class="form-actions">
+                <button type="submit" id="save-lyric-template" class="button primary">保存模板</button>
+                <button type="button" id="cancel-lyric-template" class="button" hidden>取消</button>
+              </div>
+            </form>
+          </section>
+          <div id="settings-template-slot" class="settings-template-slot"></div>
+        </section>
         <div id="ai-config-cards" class="settings-card-list" hidden></div>
         <form id="ai-settings-form" class="settings-grid" hidden>
+          <input type="hidden" name="ai_provider_id">
+          <label data-tip="用于在 AI 作词页快速识别和切换接口。">
+            <span>接口名称</span>
+            <input name="ai_provider_name" placeholder="例如：DeepSeek / 硅基流动" required>
+          </label>
           <label data-tip="OpenAI 兼容 API 地址，通常以 /v1 结尾。">
             <span>API Base URL</span>
             <input name="ai_api_base_url" placeholder="https://api.example.com/v1" required>
@@ -560,6 +696,6 @@
 
 <div id="toast" class="toast" role="status"></div>
 <div id="floating-tooltip" class="floating-tooltip" role="tooltip" aria-hidden="true"></div>
-<script src="/assets/app.js?v=63"></script>
+<script src="/assets/app.js?v=83"></script>
 </body>
 </html>
