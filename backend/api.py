@@ -196,6 +196,15 @@ class MultiGenerationStartRequest(ModelSingerRequest):
         return self
 
 
+class MultiRepairItemRequest(BaseModel):
+    account_id: str
+
+
+class MultiRepairStartRequest(BaseModel):
+    items: list[MultiRepairItemRequest] = Field(min_length=1)
+    day: str | None = None
+
+
 class MultiUploadItemRequest(BaseModel):
     account_id: str
     file_names: list[str] = Field(min_length=1)
@@ -1483,6 +1492,94 @@ def create_app(
                     },
                 )
                 for (account, files), item in zip(entries, request.items)
+            ],
+            runner=run_item,
+        )
+        return snapshot.model_dump(mode="json")
+
+    @app.post("/api/multi-stage/repair/runs", status_code=202)
+    async def start_multi_repair(request: MultiRepairStartRequest) -> dict:
+        if engine.is_running or engine.upload_is_running or multi_stage_busy():
+            raise ConflictError("已有任务正在运行，请先停止后再启动多账号修复")
+        if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy() or multi_stage_busy():
+            raise ConflictError("完整流水线正在运行，请先停止后再启动多账号修复")
+
+        entries: list[tuple[AccountConfig, list[tuple[Path, str, str | None]]]] = []
+        seen: set[str] = set()
+        day_value = request.day or date.today().isoformat()
+        try:
+            datetime.strptime(day_value, "%Y-%m-%d").date()
+        except ValueError as error:
+            raise ValidationFailed("日期格式必须是 YYYY-MM-DD") from error
+
+        for item in request.items:
+            account = account_repository.get(item.account_id)
+            if account.id in seen:
+                raise ValidationFailed(f"队列中不能重复选择账号 {account.account_name}")
+            seen.add(account.id)
+            ensure_workflow_directories(account, day_value)
+            candidates = [
+                song
+                for song in list_account_song_items(account, state_repository, day_value)
+                if is_repair_candidate(song)
+                and song["valid"]
+                and classify_repair_action(song["status"], song["error"]) != "manual"
+            ]
+            if not candidates:
+                continue
+            song_entries = [
+                (
+                    (Path(account.lyric_dir) / day_value / Path(song["file_name"]).name).resolve(),
+                    song["status"],
+                    song["error"],
+                )
+                for song in candidates
+            ]
+            entries.append((account, song_entries))
+
+        if not entries:
+            raise ValidationFailed("所选账号都没有可自动修复的异常歌曲")
+
+        async def run_item(item: MultiStageItem) -> dict:
+            account = account_repository.get(item.account_id)
+            song_entries = [
+                (
+                    Path(song["path"]),
+                    str(song["status"]),
+                    song.get("error"),
+                )
+                for song in item.request.get("songs", [])
+            ]
+            await login_browser.close()
+            try:
+                engine.start_repair(account, song_entries, day=day_value)
+                await engine.wait()
+            except asyncio.CancelledError:
+                if engine.is_running:
+                    await engine.stop()
+                    await engine.wait()
+                raise
+            return (engine.current or {"status": "failed", "error": "修复任务没有返回结果"}).model_dump(mode="json")
+
+        snapshot = multi_stage_engine.start(
+            stage="repair",
+            day=day_value,
+            items=[
+                MultiStageItem(
+                    account_id=account.id,
+                    account_name=account.account_name,
+                    request={
+                        "songs": [
+                            {
+                                "path": str(path),
+                                "status": status,
+                                "error": error,
+                            }
+                            for path, status, error in song_entries
+                        ]
+                    },
+                )
+                for account, song_entries in entries
             ],
             runner=run_item,
         )

@@ -251,7 +251,7 @@ async def test_download_failure_row_offers_lyrics_redownload() -> None:
 
 
 @pytest.mark.asyncio
-async def test_repair_all_button_sends_one_batch_request_and_selects_all_failures() -> None:
+async def test_repair_all_button_sends_selected_accounts_serially() -> None:
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(channel="chrome", headless=True)
@@ -264,13 +264,14 @@ async def test_repair_all_button_sends_one_batch_request_and_selects_all_failure
                     status=202,
                     content_type="application/json",
                     body=(
-                        '{"run_id":"repair","account_id":"account",'
-                        '"account_name":"账号01","status":"running",'
-                        '"current_step":"starting_repair","songs":[]}'
+                        '{"queue_id":"repair-queue","stage":"repair","day":"2026-10-15",'
+                        '"status":"running","current_index":0,"concurrency":1,'
+                        '"items":[{"account_id":"account","account_name":"账号01",'
+                        '"status":"running","request":{},"result":null}]}'
                     ),
                 )
 
-            await page.route("**/api/runs/repair", handle_repair)
+            await page.route("**/api/multi-stage/repair/runs", handle_repair)
             with serve_frontend() as base_url:
                 await page.goto(base_url)
                 await page.wait_for_selector("#repair-run", state="attached")
@@ -282,7 +283,22 @@ async def test_repair_all_button_sends_one_batch_request_and_selects_all_failure
                         id: "account",
                         account_name: "账号01",
                         lyric_dir: "E:\\\\music\\\\lyrics",
+                    }, {
+                        id: "other",
+                        account_name: "账号02",
+                        lyric_dir: "E:\\\\music\\\\other",
                     }];
+                    state.selectedTaskAccounts = new Set(["account", "other"]);
+                    state.dashboardSongs = {
+                        account: [
+                            { file_name: "download.md", valid: true, song_name: "下载", status: "下载失败" },
+                            { file_name: "export.md", valid: true, song_name: "导出", status: "导出失败" },
+                            { file_name: "generate.md", valid: true, song_name: "生成", status: "生成失败" },
+                        ],
+                        other: [
+                            { file_name: "success.md", valid: true, song_name: "成功", status: "success" },
+                        ],
+                    };
                     document.getElementById("lyric-dir-input").value = "E:\\\\music\\\\lyrics";
                     state.songs = [
                         { file_name: "download.md", valid: true, song_name: "下载", status: "下载失败" },
@@ -304,7 +320,10 @@ async def test_repair_all_button_sends_one_batch_request_and_selects_all_failure
                 await page.wait_for_timeout(50)
 
                 assert captured == {
-                    "account_id": "account",
+                    "items": [
+                        {"account_id": "account"},
+                        {"account_id": "other"},
+                    ],
                     "day": await page.evaluate("todayValue()"),
                 }
 

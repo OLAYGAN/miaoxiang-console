@@ -90,7 +90,7 @@ def write_duration_mp3(path: Path, seconds: float) -> Path:
 
 
 def make_client(tmp_path: Path, stop_after: int | None = None):
-    holder: dict = {"models": [], "singers": []}
+    holder: dict = {"models": [], "singers": [], "browsers": []}
 
     def factory(account, settings):
         holder["models"].append(account.model_name)
@@ -98,6 +98,7 @@ def make_client(tmp_path: Path, stop_after: int | None = None):
         flow = FakeFlow(holder["engine"], stop_after=stop_after)
         browser = FakeBrowser(flow)
         holder["browser"] = browser
+        holder["browsers"].append(browser)
         return browser
 
     paths = RuntimePaths(
@@ -1396,6 +1397,52 @@ def test_multi_generation_runs_accounts_serially(tmp_path: Path) -> None:
         assert all(item["status"] == "completed" for item in queue["items"])
         assert holder["models"] == ["Sway v5.5", "MiniMax v2.6"]
         assert holder["singers"] == ["", ""]
+
+
+def test_multi_repair_runs_selected_accounts_serially(tmp_path: Path) -> None:
+    app, holder = make_client(tmp_path)
+    write_song(tmp_path, "01_first")
+    with TestClient(app) as client:
+        first = client.post("/api/accounts", json=account_payload(tmp_path, "账号01", 19222)).json()
+        second = client.post("/api/accounts", json=account_payload(tmp_path, "账号02", 19223)).json()
+        clean = client.post("/api/accounts", json=account_payload(tmp_path, "账号03", 19224)).json()
+        for account in (first, second):
+            app.state.run_state.mark(
+                "2026-09-17",
+                account["account_name"],
+                SongRecord(
+                    file_name="01_first.md",
+                    status="导出失败",
+                    current_step="export_song",
+                    attempts=1,
+                    error="编辑器导出失败",
+                ),
+            )
+
+        response = client.post(
+            "/api/multi-stage/repair/runs",
+            json={
+                "day": "2026-09-17",
+                "items": [
+                    {"account_id": first["id"]},
+                    {"account_id": clean["id"]},
+                    {"account_id": second["id"]},
+                ],
+            },
+        )
+        assert response.status_code == 202
+        for _ in range(100):
+            queue = client.get("/api/multi-stage/runs/current").json()
+            if queue["status"] in {"completed", "failed", "stopped"}:
+                break
+
+        assert queue["stage"] == "repair"
+        assert queue["concurrency"] == 1
+        assert queue["status"] == "completed"
+        assert [item["account_name"] for item in queue["items"]] == ["账号01", "账号02"]
+        assert all(item["status"] == "completed" for item in queue["items"])
+        assert [browser.entered for browser in holder["browsers"]] == [1, 1]
+        assert [browser.flow.redownloaded for browser in holder["browsers"]] == [["01_first"], ["01_first"]]
 
 
 def test_multi_lyrics_runs_accounts_in_parallel_and_saves(tmp_path: Path, monkeypatch) -> None:

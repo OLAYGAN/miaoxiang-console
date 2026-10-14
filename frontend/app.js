@@ -495,7 +495,10 @@ function renderTaskAccounts() {
     const upload = state.stageUploads[account.id];
     const templates = state.accountTemplates[account.id] || [];
     const template = templates.find((item) => item.id === state.selectedLyricTemplateId && item.account_id === account.id) || templates[0];
-    const queueItem = state.multiQueue?.stage === state.stage
+    const queueItem = state.multiQueue && (
+      state.multiQueue.stage === state.stage
+      || (state.stage === "generation" && state.multiQueue.stage === "repair")
+    )
       ? state.multiQueue?.items.find((item) => item.account_id === account.id)
       : null;
 
@@ -809,7 +812,7 @@ function renderMultiStage() {
   const completed = queue.items.filter((item) => item.status === "completed").length;
   const failed = queue.items.filter((item) => item.status === "failed").length;
   const current = queue.items[queue.current_index];
-  const stageLabels = { lyrics: "AI 作词", generation: "生成下载", upload: "上传发布" };
+  const stageLabels = { lyrics: "AI 作词", generation: "生成下载", repair: "一键修复", upload: "上传发布" };
   caption.textContent = `${stageLabels[queue.stage] || queue.stage}：成功 ${completed}，失败 ${failed} / ${queue.items.length}${
     queue.status === "running" && current ? `；当前 ${current.account_name}` : ""
   }${queue.status === "stopping" ? "；正在停止" : ""}`;
@@ -2219,6 +2222,14 @@ function canAutoRepairSong(song) {
   return song.valid && canAutoRepair(songState(song));
 }
 
+function selectedAccountsHaveRepairSongs() {
+  return selectedTaskAccounts().some((account) => {
+    const songs = state.dashboardSongs[account.id]
+      || (account.id === state.accountId ? state.songs : []);
+    return songs.some(canAutoRepairSong);
+  });
+}
+
 function stateTone(value) {
   return isFailureStatus(value) ? "failed" : value;
 }
@@ -2372,7 +2383,7 @@ function renderControls() {
     || uploadRunning()
     || pipelineBusy
     || lyricDirDirty
-    || !state.songs.some(canAutoRepairSong)
+    || !selectedAccountsHaveRepairSongs()
   );
   if (lyricDirDirty || pipelineBusy || !state.selectedTaskAccounts.size) elements["start-run"].disabled = true;
   elements["account-form"].querySelectorAll("input").forEach((input) => input.disabled = running);
@@ -3936,22 +3947,22 @@ function fillLyricTemplateForm(template = null) {
     renderSongs();
   });
   elements["repair-run"].addEventListener("click", async () => {
-    if (!state.accountId) return toast("请先选择账号", true);
-    if (!state.songs.some(canAutoRepairSong)) {
+    if (!state.selectedTaskAccounts.size) return toast("请先勾选账号", true);
+    if (!selectedAccountsHaveRepairSongs()) {
       return toast("当前没有可自动修复的异常歌曲", true);
     }
     try {
-      state.current = await api("/api/runs/repair", {
+      state.multiQueue = await api("/api/multi-stage/repair/runs", {
         method: "POST",
         body: JSON.stringify({
-          account_id: state.accountId,
+          items: selectedTaskAccounts().map((account) => ({ account_id: account.id })),
           day: todayValue(),
         }),
       });
-      applyCurrentRun(state.current, { immediate: true });
-      if (!["completed", "failed", "stopped", "generation_limit"].includes(state.current.status)) {
-        toast("已开始一键修复异常");
-      }
+      renderTaskAccounts();
+      renderTaskStatus();
+      renderControls();
+      toast(`已开始修复 ${state.multiQueue.items.length} 个账号的异常`);
     } catch (error) {
       toast(error.message, true);
     }
