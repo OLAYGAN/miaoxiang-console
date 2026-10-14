@@ -4,6 +4,7 @@ import asyncio
 import json
 import traceback
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
 from uuid import uuid4
@@ -106,6 +107,36 @@ class TaskEngine:
     @property
     def settings(self) -> ConsoleSettings:
         return self._settings
+
+    @asynccontextmanager
+    async def _generation_browser(self, account: AccountConfig):
+        """Retry account startup separately from per-song generation retries."""
+        last_error: Exception | None = None
+        for attempt in range(2):
+            browser = self._browser_factory(account, self._settings)
+            try:
+                flow = await browser.__aenter__()
+            except Exception as error:
+                last_error = error
+                try:
+                    await browser.__aexit__(type(error), error, error.__traceback__)
+                except Exception:
+                    pass
+                if attempt == 0:
+                    self._log("warning", "opening_browser", f"浏览器启动失败，准备重试: {error}")
+                    await asyncio.sleep(self._poll_interval)
+                    continue
+            else:
+                try:
+                    yield flow
+                except BaseException as error:
+                    await browser.__aexit__(type(error), error, error.__traceback__)
+                    raise
+                else:
+                    await browser.__aexit__(None, None, None)
+                return
+        assert last_error is not None
+        raise last_error
 
     def update_settings(self, settings: ConsoleSettings) -> None:
         if self.is_running:
@@ -448,7 +479,7 @@ class TaskEngine:
                 "model_name": model_name,
                 "singer_name": singer_name,
             })
-            async with self._browser_factory(run_account, self._settings) as flow:
+            async with self._generation_browser(run_account) as flow:
                 if hasattr(flow, "day"):
                     flow.day = day
                 if hasattr(flow, "force_new_generation"):

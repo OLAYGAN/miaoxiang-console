@@ -511,6 +511,43 @@ async def test_all_completed_songs_finish_without_opening_browser(tmp_path: Path
     assert browser.entered == browser.exited == 0
 
 
+async def test_generation_retries_transient_browser_startup_failure(tmp_path: Path) -> None:
+    class StartupRetryBrowser:
+        def __init__(self, flow: FakeFlow) -> None:
+            self.flow = flow
+            self.entered = 0
+            self.exited = 0
+
+        async def __aenter__(self):
+            self.entered += 1
+            if self.entered == 1:
+                raise TimeoutError("Page.goto: Timeout 30000ms exceeded")
+            return self.flow
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.exited += 1
+            return False
+
+    account = make_account(tmp_path)
+    song = make_song(account.lyric_dir, "01_first")
+    flow = FakeFlow()
+    browser = StartupRetryBrowser(flow)
+    engine = TaskEngine(
+        state_repository=RunStateRepository(tmp_path / "state.json"),
+        event_bus=EventBus(),
+        settings=ConsoleSettings(),
+        browser_factory=lambda account, settings: browser,
+        poll_interval=0,
+    )
+
+    engine.start(account, [song], day="2026-09-17")
+    await engine.wait()
+
+    assert browser.entered == browser.exited == 2
+    assert flow.processed == ["01_first"]
+    assert engine.current.status == "completed"
+
+
 async def test_stop_upload_cancels_waiting_upload_task(tmp_path: Path) -> None:
     class WaitingUploadFlow:
         async def upload_album(self, items, on_step, on_verification_requested):
