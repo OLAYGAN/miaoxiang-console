@@ -426,7 +426,12 @@ function renderTaskAccounts() {
   }[state.stage] || { title: "任务", caption: "全部账号" };
   elements["workflow-title"].textContent = stageMeta.title;
   elements["workflow-caption"].textContent = stageMeta.caption;
-  elements["task-account-count"].textContent = `已选 ${state.selectedTaskAccounts.size} / ${state.accounts.length}`;
+  const selectedAccounts = selectedTaskAccounts();
+  const selectedAccountText = selectedAccounts.map((account) => account.account_name).join("、");
+  elements["task-account-count"].textContent = selectedAccountText
+    ? `已选 ${selectedAccounts.length} / ${state.accounts.length}：${selectedAccountText}`
+    : `已选 0 / ${state.accounts.length}`;
+  elements["task-account-count"].title = selectedAccountText;
   const busy = multiStageRunning() || isRunning() || uploadRunning() || pipelineWorkflowBusy();
   elements["task-account-all"].disabled = busy || !state.accounts.length;
   elements["task-account-clear"].disabled = busy || !state.selectedTaskAccounts.size;
@@ -495,10 +500,11 @@ function renderTaskAccounts() {
     const upload = state.stageUploads[account.id];
     const templates = state.accountTemplates[account.id] || [];
     const template = templates.find((item) => item.id === state.selectedLyricTemplateId && item.account_id === account.id) || templates[0];
-    const queueItem = state.multiQueue && (
+    const queueActive = Boolean(state.multiQueue && state.multiQueue.day === todayValue() && (
       state.multiQueue.stage === state.stage
       || (state.stage === "generation" && state.multiQueue.stage === "repair")
-    )
+    ));
+    const queueItem = queueActive
       ? state.multiQueue?.items.find((item) => item.account_id === account.id)
       : null;
 
@@ -508,6 +514,9 @@ function renderTaskAccounts() {
     if (queueItem) {
       statusText = statusLabels[queueItem.status] || queueItem.status;
       statusTone = queueItem.status === "completed" ? "completed" : queueItem.status === "running" ? "running" : queueItem.status;
+    } else if (queueActive) {
+      statusText = "未入队";
+      statusTone = "idle";
     } else if (state.stage === "lyrics" && songs.length) {
       statusText = "已生成";
       statusTone = "completed";
@@ -2691,6 +2700,7 @@ function selectedTaskAccounts() {
 
 async function buildGenerationQueueItems() {
   const items = [];
+  const skipped = [];
   for (const account of selectedTaskAccounts()) {
     const songs = await api(`/api/accounts/${account.id}/songs?day=${encodeURIComponent(todayValue())}`);
     const valid = songs.filter((song) => song.valid);
@@ -2698,12 +2708,12 @@ async function buildGenerationQueueItems() {
       ? valid.filter((song) => state.selected.has(song.file_name)).map((song) => song.file_name)
       : valid.map((song) => song.file_name);
     if (!files.length) {
-      toast(`${account.account_name} 今天没有可处理的歌词，已跳过`, true);
+      skipped.push(account.account_name);
       continue;
     }
     items.push({ account_id: account.id, song_files: files });
   }
-  return items;
+  return { items, skipped };
 }
 
 async function buildUploadQueueItems() {
@@ -2978,6 +2988,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setInterval(loadMultiStage, 5000);
   setInterval(loadPipelineRun, 5000);
   setInterval(loadPipelineQueue, 5000);
+  window.appReady = true;
 });
 
 function setupTooltips() {
@@ -3985,8 +3996,14 @@ function fillLyricTemplateForm(template = null) {
   elements["start-run"].addEventListener("click", async () => {
     if (!state.selectedTaskAccounts.size) return toast("请先勾选账号", true);
     try {
-      const items = await buildGenerationQueueItems();
+      const selectedAccounts = selectedTaskAccounts();
+      const { items, skipped } = await buildGenerationQueueItems();
       if (!items.length) return toast("所选账号都没有可生成歌词", true);
+      const skippedIds = new Set(
+        selectedAccounts
+          .filter((account) => skipped.includes(account.account_name))
+          .map((account) => account.id),
+      );
       const itemRequests = items.map((item) => {
         const account = state.accounts.find((entry) => entry.id === item.account_id);
         return {
@@ -4005,10 +4022,19 @@ function fillLyricTemplateForm(template = null) {
           singer_name: "",
         }),
       });
+      const queuedIds = new Set(state.multiQueue.items.map((item) => item.account_id));
+      const missingAccounts = selectedAccounts.filter((account) => !skippedIds.has(account.id) && !queuedIds.has(account.id));
+      if (missingAccounts.length) {
+        toast(`队列缺少账号：${missingAccounts.map((account) => account.account_name).join("、")}`, true);
+      } else if (skipped.length) {
+        toast(`已跳过 ${skipped.join("、")}：今天没有可处理歌词`, true);
+      } else {
+        const queueNames = state.multiQueue.items.map((item) => item.account_name).join(" → ");
+        toast(items.length === 1 ? `生成任务已启动：${queueNames}` : `已按顺序启动 ${items.length} 个账号：${queueNames}`);
+      }
       renderTaskAccounts();
       renderTaskStatus();
       renderControls();
-      toast(items.length === 1 ? "生成任务已启动" : `已启动 ${items.length} 个账号的串联生成`);
     } catch (error) {
       toast(error.message, true);
     }

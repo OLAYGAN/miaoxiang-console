@@ -813,6 +813,92 @@ async def test_generation_start_is_in_account_scope_and_view_switches_account() 
 
 
 @pytest.mark.asyncio
+async def test_generation_start_uses_real_checked_account_order() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            captured = {}
+
+            async def handle_songs(route) -> None:
+                account_id = route.request.url.split("/api/accounts/", 1)[1].split("/", 1)[0]
+                song_name = {"first": "一", "second": "二", "third": "三"}[account_id]
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps([
+                        {"file_name": f"{account_id}.md", "valid": True, "song_name": song_name, "status": "pending"},
+                    ], ensure_ascii=False),
+                )
+
+            async def handle_start(route) -> None:
+                captured.update(route.request.post_data_json)
+                payload = captured["items"]
+                await route.fulfill(
+                    status=202,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "queue_id": "generation-queue",
+                        "stage": "generation",
+                        "day": "2026-10-16",
+                        "status": "running",
+                        "current_index": 0,
+                        "concurrency": 1,
+                        "items": [
+                            {
+                                "account_id": item["account_id"],
+                                "account_name": {"first": "白日逐梦", "second": "蹦儿波", "third": "黄振艺"}[item["account_id"]],
+                                "status": "pending",
+                            }
+                            for item in payload
+                        ],
+                    }, ensure_ascii=False),
+                )
+
+            async def handle_accounts(route) -> None:
+                await route.fulfill(status=200, content_type="application/json", body="[]")
+
+            await page.route("**/api/accounts", handle_accounts)
+            await page.route("**/api/accounts/*/songs**", handle_songs)
+            await page.route("**/api/multi-stage/generation/runs", handle_start)
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_function("window.appReady === true")
+                await page.wait_for_selector("#stage-account-table", state="attached")
+                await page.evaluate(
+                    """() => {
+                    state.accounts = [
+                        { id: "first", account_name: "白日逐梦", chrome_debug_port: 9222, model_name: "自动", singer_name: "", lyric_dir: "E:\\\\music\\\\first" },
+                        { id: "second", account_name: "蹦儿波", chrome_debug_port: 9223, model_name: "自动", singer_name: "", lyric_dir: "E:\\\\music\\\\second" },
+                        { id: "third", account_name: "黄振艺", chrome_debug_port: 9224, model_name: "自动", singer_name: "", lyric_dir: "E:\\\\music\\\\third" },
+                    ];
+                    state.accountId = "first";
+                    state.selectedTaskAccounts = new Set();
+                    state.view = "task";
+                    state.stage = "generation";
+                    document.getElementById("lyric-dir-input").value = "E:\\\\music\\\\first";
+                    renderAccounts();
+                    renderView();
+                    }""",
+                )
+
+                checkboxes = page.locator("#stage-account-table [data-task-account]")
+                await checkboxes.nth(0).check()
+                await checkboxes.nth(1).check()
+                await checkboxes.nth(2).check()
+                assert "白日逐梦、蹦儿波、黄振艺" in await page.locator("#task-account-count").inner_text()
+                await page.locator("#start-run").click()
+                await page.wait_for_timeout(500)
+
+                assert [item["account_id"] for item in captured["items"]] == ["first", "second", "third"]
+                assert "白日逐梦 → 蹦儿波 → 黄振艺" in await page.locator("#toast").inner_text()
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
 async def test_generation_view_and_progress_stay_available_while_queue_runs() -> None:
     try:
         async with async_playwright() as playwright:

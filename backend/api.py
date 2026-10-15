@@ -1495,6 +1495,17 @@ def create_app(
             ],
             runner=run_item,
         )
+        await events.publish({
+            "type": "log",
+            "data": {
+                "timestamp": datetime.now().isoformat(),
+                "level": "info",
+                "step": "multi_stage",
+                "song": None,
+                "message": "生成下载队列已启动: " + " → ".join(item.account_name for item in snapshot.items),
+                "screenshot_path": None,
+            },
+        })
         return snapshot.model_dump(mode="json")
 
     @app.post("/api/multi-stage/repair/runs", status_code=202)
