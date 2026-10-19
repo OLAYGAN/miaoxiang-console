@@ -1893,6 +1893,9 @@ class FakeModelLocator:
         if self.name == "option":
             self.page.dropdown_text = "Sway v5.5"
 
+    async def wait_for(self, **kwargs) -> None:
+        return None
+
     async def scroll_into_view_if_needed(self, **kwargs) -> None:
         self.page.calls.append(f"scroll-{self.name}")
 
@@ -1911,6 +1914,28 @@ async def test_select_model_closes_auto_switches_and_clicks_custom_option() -> N
         "scroll-model-list",
         "scroll-option",
         "click-option",
+        "wait",
+    ]
+    assert page.dropdown_text == "Sway v5.5"
+
+
+@pytest.mark.asyncio
+async def test_select_model_accepts_platform_default_after_disabling_auto() -> None:
+    page = FakeModelPage(initial_text="自动", switch_checked=True)
+    original_click = page.switch.click
+
+    async def click_switch(**kwargs) -> None:
+        await original_click(**kwargs)
+        page.dropdown_text = "Sway v5.5"
+
+    page.switch.click = click_switch
+
+    await select_model(page, "Sway v5.5")
+
+    assert page.calls == [
+        "click-dropdown",
+        "wait",
+        "click-switch",
         "wait",
     ]
     assert page.dropdown_text == "Sway v5.5"

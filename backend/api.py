@@ -13,7 +13,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,6 +41,7 @@ from backend.models import (
     LyricData,
     LyricTemplateConfig,
     MultiStageItem,
+    MonitoringSnapshot,
     MusicModelName,
     normalize_singer_for_model,
 )
@@ -59,6 +60,7 @@ from backend.storage import (
     PipelineQueueStateRepository,
     PipelineStateRepository,
     RunStateRepository,
+    MonitoringRepository,
 )
 from backend.task_engine import TaskEngine, classify_repair_action
 from backend.upload_rejections import read_rejected
@@ -632,6 +634,7 @@ def create_app(
     account_repository = AccountRepository(paths.accounts_file)
     state_repository = RunStateRepository(paths.run_state_file)
     lyric_template_repository = LyricTemplateRepository(paths.lyric_templates_file)
+    monitoring_repository = MonitoringRepository(paths.monitoring_statistics_file)
     settings_store = JsonStore(paths.settings_file, ConsoleSettings().model_dump(mode="json"))
     settings = ConsoleSettings.model_validate(settings_store.read())
     prompt_version_marker = "AI 音乐创作 Agent 提示词 v2.9（五首批次与跨批去重版）"
@@ -759,6 +762,7 @@ def create_app(
     app.state.accounts = account_repository
     app.state.run_state = state_repository
     app.state.lyric_templates = lyric_template_repository
+    app.state.monitoring = monitoring_repository
     app.state.settings_store = settings_store
     app.state.settings = settings
     app.state.events = events
@@ -782,6 +786,40 @@ def create_app(
     app.state.pipeline_queue_engine = pipeline_queue_engine
     multi_stage_engine = MultiStageEngine(events)
     app.state.multi_stage_engine = multi_stage_engine
+
+    async def collect_monitoring(account: AccountConfig) -> MonitoringSnapshot:
+        try:
+            async with browser_factory(account, settings) as flow:
+                collector = getattr(flow, "collect_statistics", None)
+                if not callable(collector):
+                    snapshot = MonitoringSnapshot(
+                        account_id=account.id,
+                        account_name=account.account_name,
+                        status="skipped",
+                        error="当前浏览器流程不支持统计数据采集",
+                    )
+                    monitoring_repository.save(snapshot)
+                    return snapshot
+                records = await collector()
+                snapshot = MonitoringSnapshot(
+                    account_id=account.id,
+                    account_name=account.account_name,
+                    status="completed",
+                    records=records,
+                )
+                monitoring_repository.save(snapshot)
+                return snapshot
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            snapshot = MonitoringSnapshot(
+                account_id=account.id,
+                account_name=account.account_name,
+                status="failed",
+                error=str(error),
+            )
+            monitoring_repository.save(snapshot)
+            return snapshot
 
     def pipeline_queue_busy() -> bool:
         return pipeline_queue_engine.is_running or pipeline_queue_engine.is_waiting_user
@@ -1651,7 +1689,18 @@ def create_app(
                     await engine.stop_upload()
                     await engine.wait_upload()
                 raise
-            return engine.current_upload or {"status": "failed", "error": "上传任务没有返回结果"}
+            upload_result = engine.current_upload or {
+                "status": "failed",
+                "error": "上传任务没有返回结果",
+            }
+            monitoring_snapshot: MonitoringSnapshot | None = None
+            if upload_result.get("status") in {"completed", "partial_failed"}:
+                monitoring_snapshot = await collect_monitoring(account)
+            return {
+                "status": upload_result.get("status", "failed"),
+                "upload": upload_result,
+                "monitoring": monitoring_snapshot.model_dump(mode="json") if monitoring_snapshot else None,
+            }
 
         snapshot = multi_stage_engine.start(
             stage="upload",
@@ -1671,6 +1720,48 @@ def create_app(
             runner=run_item,
         )
         return snapshot.model_dump(mode="json")
+
+    @app.get("/api/monitoring/statistics")
+    async def monitoring_statistics(
+        days: int = Query(default=7, ge=1, le=90),
+        account_id: str | None = None,
+    ) -> dict:
+        snapshots = monitoring_repository.list_snapshots(account_id=account_id)
+        latest_by_account: dict[str, MonitoringSnapshot] = {}
+        for snapshot in snapshots:
+            previous = latest_by_account.get(snapshot.account_id)
+            if previous is None or snapshot.collected_at > previous.collected_at:
+                latest_by_account[snapshot.account_id] = snapshot
+        records = monitoring_repository.list_records(account_id=account_id)
+        snapshots = [
+            {
+                "snapshot_id": snapshot.snapshot_id,
+                "account_id": snapshot.account_id,
+                "account_name": snapshot.account_name,
+                "status": snapshot.status,
+                "collected_at": snapshot.collected_at,
+                "data_end_date": snapshot.data_end_date,
+                "error": snapshot.error,
+                "record_count": len(snapshot.records),
+            }
+            for snapshot in monitoring_repository.list_snapshots(account_id=account_id)
+        ]
+        accounts = [
+            {
+                "account_id": snapshot.account_id,
+                "account_name": snapshot.account_name,
+                "status": snapshot.status,
+                "collected_at": snapshot.collected_at,
+                "error": snapshot.error,
+            }
+            for snapshot in sorted(latest_by_account.values(), key=lambda item: item.account_name)
+        ]
+        return {
+            "days": days,
+            "records": records,
+            "accounts": accounts,
+            "snapshots": snapshots,
+        }
 
     @app.get("/api/multi-stage/runs/current")
     async def current_multi_stage(stage: str | None = None) -> dict | None:

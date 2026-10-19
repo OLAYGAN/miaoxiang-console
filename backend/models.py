@@ -469,3 +469,31 @@ class MultiStageSnapshot(BaseModel):
     error: str | None = None
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
+
+
+class MonitoringDailyRecord(BaseModel):
+    date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    account_id: str = Field(min_length=1)
+    account_name: str = Field(min_length=1, max_length=64)
+    qishui_heat_index: float | None = Field(default=None, ge=0)
+    qishui_play_count: float | None = Field(default=None, ge=0)
+    qishui_paid_user_play_index: float | None = Field(default=None, ge=0)
+
+
+class MonitoringSnapshot(BaseModel):
+    snapshot_id: str = Field(default_factory=lambda: uuid4().hex)
+    trigger: Literal["multi_upload"] = "multi_upload"
+    account_id: str = Field(min_length=1)
+    account_name: str = Field(min_length=1, max_length=64)
+    status: Literal["completed", "failed", "skipped"] = "completed"
+    collected_at: datetime = Field(default_factory=datetime.now)
+    data_end_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    source_url: str = "https://music.douyin.com/console/statistics?enter_from=menu_data_center"
+    error: str | None = None
+    records: list[MonitoringDailyRecord] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def set_data_end_date(self) -> "MonitoringSnapshot":
+        if self.records:
+            self.data_end_date = max(record.date for record in self.records)
+        return self

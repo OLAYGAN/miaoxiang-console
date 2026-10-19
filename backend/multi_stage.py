@@ -56,6 +56,8 @@ class MultiStageEngine:
             # this request arriving. Treat that stop as successful and return
             # the terminal snapshot instead of surfacing a race as an error.
             if self.current is not None:
+                if self.current.status == "stopping":
+                    self._finalize_stopped()
                 return self.current
             raise RuntimeError("multi-stage queue is not running")
         self._stop_requested = True
@@ -68,6 +70,8 @@ class MultiStageEngine:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            if self._stop_requested and self.current.status == "stopping":
+                self._finalize_stopped()
         return self.current or MultiStageSnapshot(stage="", day="")
 
     async def _run(self, runner: ItemRunner, *, serial: bool) -> None:
@@ -90,7 +94,9 @@ class MultiStageEngine:
 
                 await asyncio.gather(*(worker(item) for item in self.current.items))
 
-            if self.current.status not in {"stopping", "stopped"}:
+            if self._stop_requested:
+                self._finalize_stopped()
+            elif self.current.status != "stopped":
                 self.current.status = (
                     "failed" if all(item.status == "failed" for item in self.current.items) else "completed"
                 )
@@ -118,7 +124,12 @@ class MultiStageEngine:
         self._publish()
         try:
             item.result = await runner(item)
-            item.status = "completed" if self._result_ok(item.result) else "failed"
+            result_status = str((item.result or {}).get("status") or "")
+            item.status = (
+                "stopped"
+                if result_status == "stopped"
+                else "completed" if self._result_ok(item.result) else "failed"
+            )
             if item.status == "failed":
                 item.error = self._result_error(item.result)
         except asyncio.CancelledError:
@@ -144,6 +155,15 @@ class MultiStageEngine:
         if not result:
             return "任务没有返回结果"
         return result.get("error") or None
+
+    def _finalize_stopped(self) -> None:
+        assert self.current is not None
+        self.current.status = "stopped"
+        for item in self.current.items:
+            if item.status in {"pending", "running"}:
+                item.status = "stopped"
+        self._touch()
+        self._publish()
 
     def _touch(self) -> None:
         if self.current is not None:

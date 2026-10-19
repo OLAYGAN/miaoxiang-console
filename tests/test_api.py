@@ -16,6 +16,7 @@ from backend.models import (
     AccountConfig,
     ConsoleSettings,
     MultiStageSnapshot,
+    MonitoringDailyRecord,
     PipelineSnapshot,
     SongRecord,
 )
@@ -26,6 +27,7 @@ class FakeFlow:
     def __init__(self, engine, stop_after: int | None = None) -> None:
         self.engine = engine
         self.stop_after = stop_after
+        self.account = None
         self.processed = 0
         self.redownloaded: list[str] = []
 
@@ -40,6 +42,9 @@ class FakeFlow:
         self.redownloaded.append(lyric_data.song_name)
         on_step("download_song")
         return Path("output") / f"{lyric_data.song_name}.mp3"
+
+    async def collect_statistics(self):
+        raise NotImplementedError("测试流程未提供统计数据")
 
 
 class FakeBrowser:
@@ -96,6 +101,7 @@ def make_client(tmp_path: Path, stop_after: int | None = None):
         holder["models"].append(account.model_name)
         holder["singers"].append(account.singer_name)
         flow = FakeFlow(holder["engine"], stop_after=stop_after)
+        flow.account = account
         browser = FakeBrowser(flow)
         holder["browser"] = browser
         holder["browsers"].append(browser)
@@ -112,6 +118,7 @@ def make_client(tmp_path: Path, stop_after: int | None = None):
         lyric_templates_file=tmp_path / "data" / "lyric_templates.json",
         pipeline_state_file=tmp_path / "data" / "pipeline_state.json",
         pipeline_queue_state_file=tmp_path / "data" / "pipeline_queue_state.json",
+        monitoring_statistics_file=tmp_path / "data" / "monitoring_statistics.json",
     )
     app = create_app(runtime_paths=paths, browser_factory=factory, poll_interval=0.01)
     holder["engine"] = app.state.engine
@@ -1480,6 +1487,98 @@ def test_multi_lyrics_runs_accounts_in_parallel_and_saves(tmp_path: Path, monkey
         assert queue["status"] == "completed"
         assert queue["items"][0]["result"]["saved_count"] == 1
         assert list((Path(account["lyric_dir"]) / "2026-09-17").glob("*.md"))
+
+
+def test_multi_upload_collects_statistics_for_each_account(tmp_path: Path, monkeypatch) -> None:
+    app, holder = make_client(tmp_path)
+    write_song(tmp_path, "01_song")
+
+    async def collect_statistics(self):
+        assert self.account is not None
+        if self.account.account_name == "账号02":
+            raise RuntimeError("统计接口登录失效")
+        return [
+            MonitoringDailyRecord(
+                date="2026-10-16",
+                account_id=self.account.id,
+                account_name=self.account.account_name,
+                qishui_heat_index=18,
+                qishui_play_count=1,
+                qishui_paid_user_play_index=0,
+            ),
+            MonitoringDailyRecord(
+                date="2026-10-17",
+                account_id=self.account.id,
+                account_name=self.account.account_name,
+                qishui_heat_index=0,
+                qishui_play_count=0,
+                qishui_paid_user_play_index=0,
+            ),
+        ]
+
+    monkeypatch.setattr(FakeFlow, "collect_statistics", collect_statistics)
+
+    def fake_start_upload(account, items, day, **kwargs):
+        app.state.engine.current_upload = {
+            "status": "completed",
+            "step": "done",
+            "day": day,
+            "account_id": account.id,
+            "account_name": account.account_name,
+        }
+
+    async def fake_wait_upload():
+        return
+
+    monkeypatch.setattr(app.state.engine, "start_upload", fake_start_upload)
+    monkeypatch.setattr(app.state.engine, "wait_upload", fake_wait_upload)
+
+    with TestClient(app) as client:
+        first = client.post("/api/accounts", json=account_payload(tmp_path, "账号01", 19222)).json()
+        second = client.post("/api/accounts", json=account_payload(tmp_path, "账号02", 19223)).json()
+        day = "2026-09-17"
+        output = Path(first["output_dir"]) / day
+        output.mkdir(parents=True, exist_ok=True)
+        write_duration_mp3(output / "01_song.mp3", 61.0)
+
+        response = client.post(
+            "/api/multi-stage/upload/runs",
+            json={
+                "day": day,
+                "items": [
+                    {"account_id": first["id"], "file_names": ["01_song.mp3"]},
+                    {"account_id": second["id"], "file_names": ["01_song.mp3"]},
+                ],
+            },
+        )
+        assert response.status_code == 202, response.json()
+        for _ in range(100):
+            queue = client.get("/api/multi-stage/runs/current").json()
+            if queue["status"] in {"completed", "failed", "stopped"}:
+                break
+
+        assert queue["stage"] == "upload"
+        assert queue["status"] == "completed"
+        assert all(item["status"] == "completed" for item in queue["items"])
+        assert all(item["result"]["upload"]["status"] == "completed" for item in queue["items"])
+        assert queue["items"][0]["result"]["monitoring"]["status"] == "completed"
+        assert queue["items"][1]["result"]["monitoring"]["status"] == "failed"
+        assert "统计接口登录失效" in queue["items"][1]["result"]["monitoring"]["error"]
+
+        statistics = client.get("/api/monitoring/statistics?days=7").json()
+        assert statistics["days"] == 7
+        assert [account["account_name"] for account in statistics["accounts"]] == ["账号01", "账号02"]
+        assert [account["status"] for account in statistics["accounts"]] == ["completed", "failed"]
+        assert len(statistics["snapshots"]) == 2
+        assert statistics["snapshots"][0]["status"] == "failed"
+        assert statistics["snapshots"][0]["data_end_date"] is None
+        assert statistics["snapshots"][1]["status"] == "completed"
+        assert statistics["snapshots"][1]["data_end_date"] == "2026-10-17"
+        assert len(statistics["records"]) == 2
+        assert statistics["records"][0]["date"] == "2026-10-17"
+        assert statistics["records"][0]["data_end_date"] == "2026-10-17"
+        assert statistics["records"][0]["qishui_heat_index"] == 0
+        assert [browser.entered for browser in holder["browsers"]] == [1, 1]
 
 
 def test_start_uses_today_when_day_is_omitted(tmp_path: Path) -> None:

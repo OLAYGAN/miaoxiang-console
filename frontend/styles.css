@@ -1538,6 +1538,92 @@ body[data-stage="pipeline"] .task-layout {
   overflow-wrap: anywhere;
 }
 
+.monitoring-panel { overflow: hidden; }
+
+.monitoring-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(110px, 1fr));
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+}
+
+.monitoring-summary div {
+  min-height: 67px;
+  padding: 10px;
+  border-right: 1px solid var(--line);
+}
+
+.monitoring-summary div:last-child { border-right: 0; }
+.monitoring-summary span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.monitoring-summary strong {
+  font-size: 19px;
+  font-variant-numeric: tabular-nums;
+}
+
+.monitoring-table {
+  max-height: min(62vh, 720px);
+  overflow: auto;
+}
+
+.monitoring-row {
+  display: grid;
+  grid-template-columns: 124px 112px 112px minmax(120px, 1fr) minmax(130px, 1fr) minmax(120px, 1fr) minmax(170px, 1.15fr);
+  align-items: center;
+  min-height: 44px;
+  border-bottom: 1px solid var(--line);
+}
+
+.monitoring-row:last-child { border-bottom: 0; }
+.monitoring-row > span {
+  min-width: 0;
+  padding: 8px 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.monitoring-row > span:nth-child(n+5) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.monitoring-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #eff2f5;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.monitoring-row:not(.monitoring-head):hover { background: #f7f9fb; }
+
+.monitoring-status-list {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--surface-muted);
+}
+
+.monitoring-status-item {
+  display: grid;
+  gap: 2px;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.monitoring-status-item span {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 .song-table { max-height: min(55vh, 660px); overflow: auto; }
 
 .song-row {
@@ -2285,6 +2371,11 @@ input:focus, select:focus, button:focus-visible {
   .dashboard-account-table { overflow-x: auto; }
   .dashboard-account-row { min-width: 620px; }
   .dashboard-actions { justify-content: flex-start; }
+  .monitoring-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .monitoring-summary div:nth-child(2n) { border-right: 0; }
+  .monitoring-summary div:not(:nth-child(n+3)) { border-bottom: 1px solid var(--line); }
+  .monitoring-table { overflow-x: auto; }
+  .monitoring-row { min-width: 1000px; }
   .workflow-title-row { align-items: flex-start; flex-direction: column; }
   .workflow-mode-row { flex-direction: column; }
   .workflow-mode-divider { width: 100%; height: 1px; }

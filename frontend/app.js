@@ -61,6 +61,8 @@ const state = {
   editingLyricTemplateId: "",
   selectedTemplateThemes: [],
   selectedLyricTemplateId: "",
+  monitoringStatistics: null,
+  monitoringLoading: false,
 };
 
 const THEME_OPTIONS = ["爱情", "友情", "校园", "都市", "治愈", "励志", "古风", "家庭", "旅行", "孤独"];
@@ -121,6 +123,9 @@ for (const id of [
   "template-generation-count", "template-output-location",
   "template-theme-options", "custom-theme", "add-custom-theme", "save-lyric-template",
   "cancel-lyric-template",
+  "monitoring-caption", "refresh-monitoring", "monitoring-account-count",
+  "monitoring-collection-count", "monitoring-success-count", "monitoring-failed-count", "monitoring-table",
+  "monitoring-empty", "monitoring-status-list",
 ]) {
   elements[id] = document.getElementById(id);
 }
@@ -141,6 +146,7 @@ function renderView() {
   renderTaskAccounts();
   renderDashboard();
   renderSettingsTabs();
+  renderMonitoring();
 }
 
 function renderStages() {
@@ -2693,6 +2699,95 @@ async function loadMultiStage() {
   renderControls();
 }
 
+function formatMonitoringValue(value) {
+  if (value === null || value === undefined || value === "") return "-";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return Number.isInteger(number) ? number.toLocaleString("zh-CN") : number.toLocaleString("zh-CN", {
+    maximumFractionDigits: 2,
+  });
+}
+
+function formatMonitoringDate(value) {
+  const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return match ? `${match[1]}/${match[2]}/${match[3]}` : String(value || "-");
+}
+
+function formatMonitoringDateTime(value) {
+  const raw = String(value || "");
+  const match = raw.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
+  return match ? `${formatMonitoringDate(match[1])} ${match[2]}` : raw || "-";
+}
+
+function renderMonitoring() {
+  const payload = state.monitoringStatistics;
+  const accounts = payload?.accounts || [];
+  const records = payload?.records || [];
+  const snapshots = payload?.snapshots || [];
+  const accountIds = new Set(snapshots.map((snapshot) => snapshot.account_id).filter(Boolean));
+  const completed = snapshots.filter((snapshot) => snapshot.status === "completed").length;
+  const abnormal = snapshots.filter((snapshot) => snapshot.status !== "completed").length;
+  const dates = snapshots.map((snapshot) => snapshot.data_end_date).filter(Boolean);
+  const range = dates.length
+    ? `${formatMonitoringDate([...dates].sort().at(0))} - ${formatMonitoringDate([...dates].sort().at(-1))}`
+    : "-";
+
+  elements["monitoring-caption"].textContent = `近 ${payload?.days || 7} 天 · 数据截止 ${range} · ${accountIds.size} 个账号 · ${snapshots.length} 次采集`;
+  elements["monitoring-account-count"].textContent = String(accounts.length);
+  elements["monitoring-collection-count"].textContent = String(snapshots.length);
+  elements["monitoring-success-count"].textContent = String(completed);
+  elements["monitoring-failed-count"].textContent = String(abnormal);
+
+  const table = elements["monitoring-table"];
+  table.querySelectorAll(".monitoring-row:not(.monitoring-head)").forEach((node) => node.remove());
+  records.forEach((record) => {
+    const row = document.createElement("div");
+    row.className = "monitoring-row";
+    const cells = [
+      formatMonitoringDateTime(record.collected_at),
+      formatMonitoringDate(record.data_end_date || record.date),
+      formatMonitoringDate(record.date),
+      record.account_name || "-",
+      formatMonitoringValue(record.qishui_heat_index),
+      formatMonitoringValue(record.qishui_play_count),
+      formatMonitoringValue(record.qishui_paid_user_play_index),
+    ];
+    cells.forEach((value) => {
+      const cell = document.createElement("span");
+      cell.textContent = value;
+      row.append(cell);
+    });
+    table.append(row);
+  });
+  elements["monitoring-empty"].hidden = records.length > 0;
+
+  const statusList = elements["monitoring-status-list"];
+  statusList.innerHTML = "";
+  const abnormalSnapshots = snapshots.filter((snapshot) => snapshot.status !== "completed");
+  statusList.hidden = abnormalSnapshots.length === 0;
+  abnormalSnapshots.forEach((snapshot) => {
+    const item = document.createElement("div");
+    item.className = "monitoring-status-item";
+    const label = document.createElement("strong");
+    label.textContent = `${snapshot.account_name} · ${formatMonitoringDateTime(snapshot.collected_at)} · ${snapshot.status === "failed" ? "采集失败" : "未采集"}`;
+    const detail = document.createElement("span");
+    detail.textContent = snapshot.error || "";
+    item.append(label, detail);
+    statusList.append(item);
+  });
+}
+
+async function loadMonitoringStatistics() {
+  if (state.monitoringLoading) return;
+  state.monitoringLoading = true;
+  try {
+    state.monitoringStatistics = await api("/api/monitoring/statistics?days=7");
+  } finally {
+    state.monitoringLoading = false;
+  }
+  renderMonitoring();
+}
+
 function selectedTaskAccounts() {
   const selected = state.selectedTaskAccounts;
   return state.accounts.filter((account) => selected.has(account.id));
@@ -2833,11 +2928,17 @@ function connectSocket() {
       if (state.multiQueue?.stage === "lyrics") {
         void loadDashboardSongs().catch(() => {});
       }
+      if (state.multiQueue?.stage === "upload") {
+        void loadMonitoringStatistics().catch(() => {});
+      }
       if (wasRunning && !multiStageRunning()) {
         void loadDashboardSongs().catch(() => {});
         void loadSongs().catch(() => {});
         void loadUploads().catch(() => {});
         void loadPipelineQueueOptions().catch(() => {});
+        if (state.multiQueue?.stage === "upload") {
+          void loadMonitoringStatistics().catch(() => {});
+        }
       }
       return;
     }
@@ -2975,7 +3076,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   await Promise.allSettled([loadHealth(), loadSettings()]);
   await loadAccounts();
   await loadLoginBrowser();
-  await Promise.allSettled([loadMultiStage(), loadStageAccountData()]);
+  await Promise.allSettled([loadMultiStage(), loadStageAccountData(), loadMonitoringStatistics()]);
   const recent = await api("/api/logs/recent").catch(() => []);
   for (const event of recent) if (event.type === "log") appendLog(event.data);
   connectSocket();
@@ -2986,6 +3087,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setInterval(loadStageAccountData, 10000);
   setInterval(loadUploadRun, 5000);
   setInterval(loadMultiStage, 5000);
+  setInterval(loadMonitoringStatistics, 10000);
   setInterval(loadPipelineRun, 5000);
   setInterval(loadPipelineQueue, 5000);
   window.appReady = true;
@@ -3162,6 +3264,9 @@ function bindEvents() {
       renderView();
       if (state.view === "task" || state.view === "lyrics") {
         void loadStageAccountData().catch(() => {});
+      }
+      if (state.view === "monitoring") {
+        void loadMonitoringStatistics().catch(() => {});
       }
     });
   });
@@ -3566,6 +3671,15 @@ function bindEvents() {
       state.uploadRun = await api("/api/uploads/runs/stop", { method: "POST" });
       renderUploadRun(); toast("已请求停止上传");
     } catch (error) { toast(error.message, true); }
+  });
+
+  elements["refresh-monitoring"].addEventListener("click", async () => {
+    try {
+      await loadMonitoringStatistics();
+      toast("监控数据已刷新");
+    } catch (error) {
+      toast(error.message, true);
+    }
   });
 
   elements["pipeline-queue-list"].addEventListener("change", (event) => {

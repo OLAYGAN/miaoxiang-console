@@ -16,6 +16,7 @@ from backend.models import (
     PipelineSnapshot,
     PipelineQueueSnapshot,
     SongRecord,
+    MonitoringSnapshot,
 )
 
 
@@ -177,6 +178,64 @@ class PipelineQueueStateRepository:
 
     def save(self, snapshot: PipelineQueueSnapshot) -> None:
         self._store.write(snapshot.model_dump(mode="json"))
+
+
+class MonitoringRepository:
+    def __init__(self, path: Path) -> None:
+        self._store = JsonStore(path, default={"snapshots": []})
+
+    def save(self, snapshot: MonitoringSnapshot) -> MonitoringSnapshot:
+        value = self._value()
+        snapshots = value.setdefault("snapshots", [])
+        if not isinstance(snapshots, list):
+            snapshots = []
+            value["snapshots"] = snapshots
+        snapshots.append(snapshot.model_dump(mode="json"))
+        snapshots.sort(key=lambda item: str(item.get("collected_at") or ""), reverse=True)
+        value["snapshots"] = snapshots
+        self._store.write(value)
+        return snapshot
+
+    def list_snapshots(self, account_id: str | None = None) -> list[MonitoringSnapshot]:
+        snapshots = [
+            MonitoringSnapshot.model_validate(item)
+            for item in self._value().get("snapshots", [])
+            if isinstance(item, dict)
+        ]
+        return [snapshot for snapshot in snapshots if account_id is None or snapshot.account_id == account_id]
+
+    def list_records(
+        self,
+        *,
+        account_id: str | None = None,
+    ) -> list[dict]:
+        records: list[dict] = []
+        for snapshot in self.list_snapshots(account_id=account_id):
+            if snapshot.status != "completed":
+                continue
+            for record in snapshot.records:
+                item = record.model_dump(mode="json")
+                item.update({
+                    "snapshot_id": snapshot.snapshot_id,
+                    "collected_at": snapshot.collected_at,
+                    "data_end_date": snapshot.data_end_date or max(
+                        snapshot_record.date for snapshot_record in snapshot.records
+                    ),
+                })
+                records.append(item)
+        records.sort(
+            key=lambda item: (
+                item["collected_at"],
+                item["date"],
+                item["account_name"],
+            ),
+            reverse=True,
+        )
+        return records
+
+    def _value(self) -> dict:
+        value = self._store.read()
+        return value if isinstance(value, dict) else {"snapshots": []}
 
 
 class LyricTemplateRepository:

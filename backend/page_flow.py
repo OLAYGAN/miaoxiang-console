@@ -20,7 +20,13 @@ from backend.errors import (
     SongVerificationError,
 )
 from backend.lyrics import sanitize_lyrics_for_generation
-from backend.models import AccountConfig, ConsoleSettings, LyricData
+from backend.monitoring import (
+    STATISTICS_METRIC_TYPES,
+    STATISTICS_PERIOD_LAST_7_DAYS,
+    STATISTICS_URL,
+    parse_statistics_trends,
+)
+from backend.models import AccountConfig, ConsoleSettings, LyricData, MonitoringDailyRecord
 from backend.models import BatchSongResult, GeneratedCandidate
 
 
@@ -309,6 +315,10 @@ async def select_model(page: Any, model_name: str) -> None:
     if "semi-switch-checked" in switch_class:
         await switch.click(timeout=5000)
         await page.wait_for_timeout(1000)
+        # Disabling auto can make the platform select its default custom
+        # model and detach every option that existed before the rerender.
+        if model_name in await dropdown.inner_text():
+            return
 
     await page.evaluate(
         """() => {
@@ -319,18 +329,29 @@ async def select_model(page: Any, model_name: str) -> None:
             });
         }"""
     )
+    last_error: Exception | None = None
     for _ in range(3):
         # Turning off "auto" rerenders the option list and can select a default
         # model. Re-resolve the option node before every click.
         option = page.locator(
             ".semi-select-option-custom, .semi-select-option"
         ).filter(has_text=model_name).first
-        await option.scroll_into_view_if_needed(timeout=5000)
-        await option.click(timeout=5000)
+        try:
+            await option.wait_for(state="visible", timeout=3000)
+            await option.scroll_into_view_if_needed(timeout=5000)
+            await option.click(timeout=5000)
+        except Exception as error:
+            last_error = error
+            await page.wait_for_timeout(500)
+            if model_name in await dropdown.inner_text():
+                return
+            continue
         await page.wait_for_timeout(1000)
         if model_name in await dropdown.inner_text():
             return
 
+    if last_error is not None:
+        raise BrowserFlowError(f"模型选择失败: {model_name}: {last_error}")
     raise BrowserFlowError(f"模型选择验证失败: {model_name}")
 
 
@@ -930,6 +951,49 @@ class PageFlow:
             lyric_data.song_name,
             self.day,
         )
+
+    async def collect_statistics(self) -> list[MonitoringDailyRecord]:
+        await self.page.goto(
+            STATISTICS_URL,
+            wait_until="domcontentloaded",
+            timeout=self.settings.page_load_timeout_seconds * 1000,
+        )
+
+        # The statistics API accepts the period directly; clicking the visible
+        # control keeps the page state consistent when the platform defaults to
+        # another range.
+        try:
+            await self.page.get_by_text("近7天", exact=False).first.click(timeout=3000)
+        except Exception:
+            pass
+
+        try:
+            await self.page.get_by_text("汽水热度指数", exact=False).first.wait_for(
+                timeout=self.settings.page_load_timeout_seconds * 1000,
+            )
+        except Exception as error:
+            path = await self._screenshot("statistics-page-timeout")
+            raise BrowserFlowError(f"统计页未就绪；截图: {path}: {error}") from error
+
+        metric_types = ",".join(str(value) for value in STATISTICS_METRIC_TYPES.values())
+        payload = await self.page.evaluate(
+            """async ([period, metricTypes]) => {
+                const result = {};
+                for (const type of metricTypes.split(',')) {
+                    const response = await fetch(
+                        `/api/statistics/disclosure/trend?scope=1&period=${period}&metricType=${type}`,
+                        { credentials: 'include' },
+                    );
+                    result[type] = await response.json();
+                }
+                return result;
+            }""",
+            [STATISTICS_PERIOD_LAST_7_DAYS, metric_types],
+        )
+        if not isinstance(payload, dict):
+            path = await self._screenshot("statistics-invalid-response")
+            raise BrowserFlowError(f"统计接口返回格式错误；截图: {path}")
+        return parse_statistics_trends(payload, self.account)
 
     async def _mouse_click_text(self, text: str, description: str, *, exact: bool = False) -> None:
         try:

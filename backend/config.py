@@ -19,6 +19,7 @@ class RuntimePaths(BaseModel):
     lyric_templates_file: Path
     pipeline_state_file: Path
     pipeline_queue_state_file: Path
+    monitoring_statistics_file: Path
 
 
 def _frozen() -> bool:
@@ -56,6 +57,7 @@ def build_runtime_paths(
         lyric_templates_file=data_dir / "lyric_templates.json",
         pipeline_state_file=data_dir / "pipeline_state.json",
         pipeline_queue_state_file=data_dir / "pipeline_queue_state.json",
+        monitoring_statistics_file=data_dir / "monitoring_statistics.json",
     )
 
 

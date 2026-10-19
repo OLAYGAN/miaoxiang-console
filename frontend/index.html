@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>妙响自动化控制台</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="/assets/styles.css?v=52">
+  <link rel="stylesheet" href="/assets/styles.css?v=54">
 </head>
 <body>
 <div class="app-shell">
@@ -38,6 +38,9 @@
       </button>
       <button type="button" class="nav-item" data-view="task" data-stage="pipeline">
         <span>完整流水线</span>
+      </button>
+      <button type="button" class="nav-item" data-view="monitoring">
+        <span>数据监控</span>
       </button>
       <button type="button" class="nav-item" data-view="account">
         <span>账号中心</span>
@@ -508,6 +511,36 @@
       </form>
     </section>
 
+    <section id="view-monitoring" class="view">
+      <section class="panel monitoring-panel">
+        <div class="panel-header">
+          <div>
+            <h2>数据监控</h2>
+            <p class="caption" id="monitoring-caption">批量上传完成后自动采集近 7 天数据</p>
+          </div>
+          <div class="queue-actions">
+            <button type="button" id="refresh-monitoring" class="button">刷新</button>
+          </div>
+        </div>
+        <div class="monitoring-summary">
+          <div><span>监控账号</span><strong id="monitoring-account-count">0</strong></div>
+          <div><span>采集记录</span><strong id="monitoring-collection-count">0</strong></div>
+          <div><span>采集成功</span><strong id="monitoring-success-count">0</strong></div>
+          <div><span>采集异常</span><strong id="monitoring-failed-count">0</strong></div>
+        </div>
+        <div class="monitoring-table" id="monitoring-table">
+          <div class="monitoring-row monitoring-head">
+            <span>采集时间</span><span>数据截止</span><span>日期</span><span>账号</span><span>汽水热度指数</span><span>汽水播放量</span><span>汽水付费用户播放指数</span>
+          </div>
+        </div>
+        <div id="monitoring-empty" class="empty-state">
+          <strong>暂无监控数据</strong>
+          <p>批量上传完成后自动采集。</p>
+        </div>
+        <div id="monitoring-status-list" class="monitoring-status-list" hidden></div>
+      </section>
+    </section>
+
     <section id="view-log" class="view">
       <section class="panel log-panel">
         <div class="panel-header">
@@ -696,6 +729,6 @@
 
 <div id="toast" class="toast" role="status"></div>
 <div id="floating-tooltip" class="floating-tooltip" role="tooltip" aria-hidden="true"></div>
-<script src="/assets/app.js?v=85"></script>
+<script src="/assets/app.js?v=87"></script>
 </body>
 </html>

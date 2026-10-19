@@ -55,6 +55,7 @@ async def test_editing_account_name_keeps_existing_directories() -> None:
             page = await browser.new_page()
             with serve_frontend() as base_url:
                 await page.goto(base_url)
+                await page.wait_for_function("typeof fillAccountForm === 'function'")
                 await page.wait_for_selector("#account-form", state="attached")
                 await page.evaluate(
                     """(account) => {
@@ -162,6 +163,51 @@ async def test_clicking_song_row_toggles_selection() -> None:
                 )
                 assert selected["checked"] is False
                 assert "is-selected" not in selected["className"]
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_monitoring_view_renders_multi_account_daily_rows() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#monitoring-table", state="attached")
+                await page.evaluate(
+                    """() => {
+                    state.view = "monitoring";
+                    state.monitoringStatistics = {
+                        days: 7,
+                        accounts: [
+                            { account_id: "a", account_name: "账号A", status: "completed" },
+                            { account_id: "b", account_name: "账号B", status: "failed", error: "登录失效" },
+                        ],
+                        snapshots: [
+                            { snapshot_id: "s2", account_id: "b", account_name: "账号B", status: "failed", collected_at: "2026-10-18T12:30:00", data_end_date: null, error: "登录失效", record_count: 0 },
+                            { snapshot_id: "s1", account_id: "a", account_name: "账号A", status: "completed", collected_at: "2026-10-18T12:20:00", data_end_date: "2026-10-17", record_count: 2 },
+                        ],
+                        records: [
+                            { snapshot_id: "s1", collected_at: "2026-10-18T12:20:00", data_end_date: "2026-10-17", date: "2026-10-17", account_id: "a", account_name: "账号A", qishui_heat_index: 1234, qishui_play_count: 20, qishui_paid_user_play_index: 3 },
+                            { snapshot_id: "s1", collected_at: "2026-10-18T12:20:00", data_end_date: "2026-10-17", date: "2026-10-16", account_id: "a", account_name: "账号A", qishui_heat_index: 18, qishui_play_count: 1, qishui_paid_user_play_index: 0 },
+                        ],
+                    };
+                    renderView();
+                    }""",
+                )
+
+                assert "is-active" in await page.locator(".nav-item[data-view='monitoring']").get_attribute("class")
+                assert await page.locator("#monitoring-table .monitoring-row:not(.monitoring-head)").count() == 2
+                assert await page.locator("#monitoring-account-count").inner_text() == "2"
+                assert await page.locator("#monitoring-collection-count").inner_text() == "2"
+                assert await page.locator("#monitoring-success-count").inner_text() == "1"
+                assert await page.locator("#monitoring-failed-count").inner_text() == "1"
+                assert "1,234" in await page.locator("#monitoring-table .monitoring-row").nth(1).inner_text()
+                assert await page.locator("#monitoring-status-list").is_visible()
 
             await browser.close()
     finally:
