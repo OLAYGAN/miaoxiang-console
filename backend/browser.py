@@ -54,9 +54,10 @@ def build_chrome_command(
     *,
     profile: Path,
     port: int,
+    hidden: bool = False,
 ) -> list[str]:
     safe_profile = validate_profile_dir(profile)
-    return [
+    command = [
         str(Path(executable)),
         f"--remote-debugging-port={port}",
         f"--user-data-dir={safe_profile}",
@@ -65,6 +66,9 @@ def build_chrome_command(
         "--disable-background-timer-throttling",
         "--disable-renderer-backgrounding",
     ]
+    if hidden:
+        command.extend(("--headless=new", "--window-size=1280,800"))
+    return command
 
 
 async def wait_for_cdp(
@@ -90,13 +94,22 @@ async def wait_for_cdp(
 
 
 class ChromeSession:
-    def __init__(self, account: AccountConfig, settings: ConsoleSettings) -> None:
+    def __init__(
+        self,
+        account: AccountConfig,
+        settings: ConsoleSettings,
+        *,
+        hidden: bool = False,
+    ) -> None:
         self.account = account
         self.settings = settings
+        self.hidden = hidden
         self.browser: Any = None
         self.page: Any = None
         self._playwright: Any = None
         self._process: subprocess.Popen | None = None
+        self._connected_to_existing = False
+        self._opened_page = False
 
     async def _cdp_available(self) -> bool:
         try:
@@ -113,12 +126,14 @@ class ChromeSession:
     async def start(self) -> "ChromeSession":
         profile = Path(self.account.chrome_profile_dir)
         profile.mkdir(parents=True, exist_ok=True)
-        if not await self._cdp_available():
+        self._connected_to_existing = await self._cdp_available()
+        if not self._connected_to_existing:
             executable = resolve_chrome_executable()
             command = build_chrome_command(
                 executable,
                 profile=profile,
                 port=self.account.chrome_debug_port,
+                hidden=self.hidden,
             )
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             self._process = subprocess.Popen(
@@ -140,7 +155,11 @@ class ChromeSession:
                 timeout=self.settings.page_load_timeout_seconds * 1000,
             )
             context = self.browser.contexts[0] if self.browser.contexts else await self.browser.new_context()
-            self.page = context.pages[0] if context.pages else await context.new_page()
+            if self.hidden:
+                self.page = await context.new_page()
+                self._opened_page = True
+            else:
+                self.page = context.pages[0] if context.pages else await context.new_page()
             await self.page.goto(
                 self.account.create_url,
                 wait_until="domcontentloaded",
@@ -159,12 +178,23 @@ class ChromeSession:
             return response.json()
 
     async def cleanup(self) -> None:
-        if self.browser is not None:
+        if self._opened_page and self.page is not None:
             try:
-                await self.browser.close()
+                await self.page.close()
             except Exception:
                 pass
-            self.browser = None
+            self.page = None
+        if self.browser is not None:
+            if self._connected_to_existing:
+                # Disconnect instead of closing a Chrome instance this process
+                # did not launch.
+                self.browser = None
+            else:
+                try:
+                    await self.browser.close()
+                except Exception:
+                    pass
+                self.browser = None
         if self._playwright is not None:
             try:
                 result = self._playwright.stop()

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>妙响自动化控制台</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="/assets/styles.css?v=54">
+  <link rel="stylesheet" href="/assets/styles.css?v=59">
 </head>
 <body>
 <div class="app-shell">
@@ -503,6 +503,13 @@
             <input name="upload_artist_name" required maxlength="64" placeholder="请输入艺人名">
           </label>
         </div>
+        <label class="field" data-tip="在授权作品第二步使用；发布前会同时打开批量开启商用收益分成。">
+          <span>签约模式</span>
+          <select name="upload_contract_mode">
+            <option value="exclusive_agent">独家代理发行</option>
+            <option value="exclusive_authorization">独家授权</option>
+          </select>
+        </label>
         <label class="field" data-tip="词作者和曲作者授权签署使用的真实姓名；可留空，留空则发布时跳过填写。">
           <span>授权真实姓名</span>
           <input name="upload_real_name" maxlength="64" placeholder="可留空；留空则发布时跳过填写">
@@ -516,10 +523,29 @@
         <div class="panel-header">
           <div>
             <h2>数据监控</h2>
-            <p class="caption" id="monitoring-caption">批量上传完成后自动采集近 7 天数据</p>
+            <p class="caption" id="monitoring-caption">手动采集最近 1 天数据；程序运行期间在 00/04/08/12/16/20 点自动采集</p>
           </div>
           <div class="queue-actions">
+            <button type="button" id="collect-monitoring" class="button primary">采集数据</button>
+            <button type="button" id="stop-monitoring" class="button" hidden>停止采集</button>
             <button type="button" id="refresh-monitoring" class="button">刷新</button>
+          </div>
+        </div>
+        <div class="monitoring-controls">
+          <div class="monitoring-controls-header">
+            <div>
+              <h3>采集账号</h3>
+              <p>勾选后点击“采集数据”；勾选会自动保存，刷新页面不丢失</p>
+            </div>
+            <div class="queue-actions">
+              <button type="button" id="monitoring-account-all" class="button">全选</button>
+              <button type="button" id="monitoring-account-clear" class="button">清空</button>
+            </div>
+          </div>
+          <div id="monitoring-account-list" class="monitoring-account-grid"></div>
+          <div class="monitoring-view-bar">
+            <span>查看账号</span>
+            <div id="monitoring-view-list" class="monitoring-view-list"></div>
           </div>
         </div>
         <div class="monitoring-summary">
@@ -530,12 +556,12 @@
         </div>
         <div class="monitoring-table" id="monitoring-table">
           <div class="monitoring-row monitoring-head">
-            <span>采集时间</span><span>数据截止</span><span>日期</span><span>账号</span><span>汽水热度指数</span><span>汽水播放量</span><span>汽水付费用户播放指数</span>
+            <span>采集时间</span><span>日期</span><span>账号</span><span>汽水热度指数</span><span>汽水播放量</span><span>汽水付费用户播放指数</span><span>汽水搜播指数</span><span>可用余额(元)</span>
           </div>
         </div>
         <div id="monitoring-empty" class="empty-state">
           <strong>暂无监控数据</strong>
-          <p>批量上传完成后自动采集。</p>
+          <p>勾选账号后点击“采集数据”。</p>
         </div>
         <div id="monitoring-status-list" class="monitoring-status-list" hidden></div>
       </section>
@@ -729,6 +755,6 @@
 
 <div id="toast" class="toast" role="status"></div>
 <div id="floating-tooltip" class="floating-tooltip" role="tooltip" aria-hidden="true"></div>
-<script src="/assets/app.js?v=87"></script>
+<script src="/assets/app.js?v=98"></script>
 </body>
 </html>

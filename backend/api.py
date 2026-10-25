@@ -1,8 +1,7 @@
 """FastAPI control surface for the local automation console."""
 
 from collections.abc import Callable
-from datetime import date
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import asyncio
 import socket
 import shutil
@@ -41,6 +40,7 @@ from backend.models import (
     LyricData,
     LyricTemplateConfig,
     MultiStageItem,
+    MultiStageSnapshot,
     MonitoringSnapshot,
     MusicModelName,
     normalize_singer_for_model,
@@ -245,6 +245,14 @@ class AITestRequest(BaseModel):
     ai_model: str = Field(min_length=1, max_length=256)
 
 
+class MonitoringCollectionStartRequest(BaseModel):
+    account_ids: list[str] = Field(min_length=1)
+
+
+class MonitoringSettingsUpdate(BaseModel):
+    account_ids: list[str] = Field(default_factory=list)
+
+
 class LyricTemplateWrite(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     lyric_tone: str = ""
@@ -254,8 +262,15 @@ class LyricTemplateWrite(BaseModel):
 
 
 class DefaultBrowserFlow:
-    def __init__(self, account: AccountConfig, settings: ConsoleSettings, screenshot_dir: Path) -> None:
-        self.session = ChromeSession(account, settings)
+    def __init__(
+        self,
+        account: AccountConfig,
+        settings: ConsoleSettings,
+        screenshot_dir: Path,
+        *,
+        hidden: bool = False,
+    ) -> None:
+        self.session = ChromeSession(account, settings, hidden=hidden)
         self.account = account
         self.settings = settings
         self.screenshot_dir = screenshot_dir
@@ -628,13 +643,23 @@ def create_app(
     runtime_paths: RuntimePaths | None = None,
     browser_factory: Callable[[AccountConfig, ConsoleSettings], object] | None = None,
     poll_interval: float = 0.1,
+    monitoring_interval_seconds: float = 4 * 60 * 60,
 ) -> FastAPI:
+    # Browser-backed account stages deliberately use a small fixed width:
+    # two visible Chrome windows remain usable for verification while still
+    # overlapping the platform's long generation and upload waits.
+    STAGE_BROWSER_CONCURRENCY = 2
+
     paths = runtime_paths or get_runtime_paths()
     ensure_runtime_directories(paths)
     account_repository = AccountRepository(paths.accounts_file)
     state_repository = RunStateRepository(paths.run_state_file)
     lyric_template_repository = LyricTemplateRepository(paths.lyric_templates_file)
     monitoring_repository = MonitoringRepository(paths.monitoring_statistics_file)
+    monitoring_settings_store = JsonStore(
+        paths.data_dir / "monitoring_settings.json",
+        default={"account_ids": []},
+    )
     settings_store = JsonStore(paths.settings_file, ConsoleSettings().model_dump(mode="json"))
     settings = ConsoleSettings.model_validate(settings_store.read())
     prompt_version_marker = "AI 音乐创作 Agent 提示词 v2.9（五首批次与跨批去重版）"
@@ -763,6 +788,7 @@ def create_app(
     app.state.run_state = state_repository
     app.state.lyric_templates = lyric_template_repository
     app.state.monitoring = monitoring_repository
+    app.state.monitoring_settings_store = monitoring_settings_store
     app.state.settings_store = settings_store
     app.state.settings = settings
     app.state.events = events
@@ -786,24 +812,126 @@ def create_app(
     app.state.pipeline_queue_engine = pipeline_queue_engine
     multi_stage_engine = MultiStageEngine(events)
     app.state.multi_stage_engine = multi_stage_engine
+    monitoring_collection_engine = MultiStageEngine(events)
+    app.state.monitoring_collection_engine = monitoring_collection_engine
+    stage_engines: dict[str, TaskEngine] = {}
+    app.state.stage_engines = stage_engines
 
-    async def collect_monitoring(account: AccountConfig) -> MonitoringSnapshot:
+    def create_stage_engine(account_id: str) -> TaskEngine:
+        if account_id in stage_engines:
+            raise ConflictError("该账号已有并行任务正在运行")
+        worker = TaskEngine(
+            state_repository=state_repository,
+            event_bus=events,
+            settings=settings,
+            browser_factory=browser_factory or default_factory,
+            poll_interval=poll_interval,
+        )
+        stage_engines[account_id] = worker
+        return worker
+
+    def release_stage_engine(account_id: str, worker: TaskEngine) -> None:
+        if stage_engines.get(account_id) is worker:
+            stage_engines.pop(account_id, None)
+
+    def stage_engine_busy() -> bool:
+        return any(
+            worker.is_running or worker.upload_is_running
+            for worker in stage_engines.values()
+        )
+
+    def account_browser_busy(account: AccountConfig) -> str | None:
+        if (
+            engine.current is not None
+            and engine.current.account_id == account.id
+            and (engine.is_running or engine.upload_is_running)
+        ):
+            return "账号生成或上传任务运行中"
+        worker = stage_engines.get(account.id)
+        if worker is not None and (worker.is_running or worker.upload_is_running):
+            return "账号并行任务运行中"
+        if (
+            pipeline_engine.current is not None
+            and pipeline_engine.current.account_id == account.id
+            and (pipeline_engine.is_running or pipeline_engine.is_waiting_user)
+        ):
+            return "账号完整流水线运行中"
+        return None
+
+    def monitoring_selected_accounts() -> list[AccountConfig]:
+        value = monitoring_settings_store.read()
+        raw_ids = value.get("account_ids", []) if isinstance(value, dict) else []
+        if not isinstance(raw_ids, list):
+            return []
+        accounts: list[AccountConfig] = []
+        for account_id in dict.fromkeys(str(item) for item in raw_ids):
+            try:
+                accounts.append(account_repository.get(account_id))
+            except NotFoundError:
+                continue
+        return accounts
+
+    def save_monitoring_settings(account_ids: list[str]) -> dict:
+        accounts: list[AccountConfig] = []
+        for account_id in dict.fromkeys(account_ids):
+            try:
+                accounts.append(account_repository.get(account_id))
+            except NotFoundError as error:
+                raise NotFoundError(f"监控采集账号不存在: {account_id}") from error
+        account_ids = [account.id for account in accounts]
+        monitoring_settings_store.write({"account_ids": account_ids})
+        return {
+            "account_ids": account_ids,
+            "interval_hours": 4,
+            "next_automatic_at": monitoring_next_automatic_at.isoformat(timespec="seconds"),
+        }
+
+    async def collect_monitoring(
+        account: AccountConfig,
+        *,
+        trigger: str = "multi_upload",
+    ) -> MonitoringSnapshot:
+        uses_last_day = trigger in {"manual", "automatic"}
+        period = "last_1_day" if uses_last_day else "last_7_days"
         try:
-            async with browser_factory(account, settings) as flow:
+            if uses_last_day:
+                busy_reason = account_browser_busy(account)
+                if busy_reason:
+                    raise BrowserFlowError(f"{busy_reason}，已跳过本次采集")
+            if browser_factory is None:
+                flow_context = DefaultBrowserFlow(
+                    account,
+                    settings,
+                    paths.screenshot_dir,
+                    hidden=uses_last_day,
+                )
+            else:
+                flow_context = browser_factory(account, settings)
+            async with flow_context as flow:
                 collector = getattr(flow, "collect_statistics", None)
                 if not callable(collector):
                     snapshot = MonitoringSnapshot(
                         account_id=account.id,
                         account_name=account.account_name,
+                        trigger=trigger,
+                        period=period,
                         status="skipped",
                         error="当前浏览器流程不支持统计数据采集",
                     )
                     monitoring_repository.save(snapshot)
                     return snapshot
-                records = await collector()
+                code = getattr(collector, "__code__", None)
+                accepts_period = code is not None and "period" in code.co_varnames
+                records = (
+                    await collector(period=period)
+                    if accepts_period
+                    else await collector()
+                )
                 snapshot = MonitoringSnapshot(
                     account_id=account.id,
                     account_name=account.account_name,
+                    trigger=trigger,
+                    period=period,
                     status="completed",
                     records=records,
                 )
@@ -815,11 +943,79 @@ def create_app(
             snapshot = MonitoringSnapshot(
                 account_id=account.id,
                 account_name=account.account_name,
+                trigger=trigger,
+                period=period,
                 status="failed",
                 error=str(error),
             )
             monitoring_repository.save(snapshot)
             return snapshot
+
+    def start_monitoring_queue(accounts: list[AccountConfig], trigger: str) -> MultiStageSnapshot:
+        async def run_item(item: MultiStageItem) -> dict:
+            account = account_repository.get(item.account_id)
+            snapshot = await collect_monitoring(account, trigger=trigger)
+            return snapshot.model_dump(mode="json")
+
+        try:
+            return monitoring_collection_engine.start(
+                stage="monitoring",
+                day=date.today().isoformat(),
+                items=[
+                    MultiStageItem(account_id=account.id, account_name=account.account_name)
+                    for account in accounts
+                ],
+                runner=run_item,
+                concurrency=1,
+            )
+        except ValueError as error:
+            raise ConflictError(str(error)) from error
+
+    monitoring_scheduler_task: asyncio.Task | None = None
+    monitoring_next_automatic_at: datetime | None = None
+
+    def next_monitoring_automatic_at(now: datetime) -> datetime:
+        if monitoring_interval_seconds <= 0:
+            return now.replace(microsecond=0)
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        elapsed_seconds = (now - midnight).total_seconds()
+        elapsed_slots = elapsed_seconds // monitoring_interval_seconds
+        if elapsed_seconds % monitoring_interval_seconds == 0:
+            return now.replace(microsecond=0)
+        return midnight + timedelta(seconds=(elapsed_slots + 1) * monitoring_interval_seconds)
+
+    async def run_monitoring_scheduler() -> None:
+        nonlocal monitoring_next_automatic_at
+        try:
+            while True:
+                scheduled_at = next_monitoring_automatic_at(datetime.now())
+                monitoring_next_automatic_at = scheduled_at
+                await asyncio.sleep(max(0, (scheduled_at - datetime.now()).total_seconds()))
+                if monitoring_collection_engine.is_running:
+                    continue
+                accounts = monitoring_selected_accounts()
+                if accounts:
+                    start_monitoring_queue(accounts, trigger="automatic")
+        finally:
+            monitoring_next_automatic_at = None
+
+    async def start_monitoring_scheduler() -> None:
+        nonlocal monitoring_scheduler_task, monitoring_next_automatic_at
+        if monitoring_scheduler_task is None or monitoring_scheduler_task.done():
+            monitoring_next_automatic_at = next_monitoring_automatic_at(datetime.now())
+            monitoring_scheduler_task = asyncio.create_task(run_monitoring_scheduler())
+
+    async def stop_monitoring_scheduler() -> None:
+        nonlocal monitoring_scheduler_task
+        if monitoring_scheduler_task is None:
+            return
+        task = monitoring_scheduler_task
+        monitoring_scheduler_task = None
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     def pipeline_queue_busy() -> bool:
         return pipeline_queue_engine.is_running or pipeline_queue_engine.is_waiting_user
@@ -828,7 +1024,10 @@ def create_app(
         return multi_stage_engine.is_running
 
     async def shutdown_engine() -> None:
+        await stop_monitoring_scheduler()
         await login_browser.close()
+        if monitoring_collection_engine.is_running:
+            await monitoring_collection_engine.stop()
         if multi_stage_engine.is_running:
             await multi_stage_engine.stop()
             return
@@ -840,6 +1039,7 @@ def create_app(
             await pipeline_engine.stop()
 
     app.router.add_event_handler("shutdown", shutdown_engine)
+    app.router.add_event_handler("startup", start_monitoring_scheduler)
 
     @app.exception_handler(AppError)
     async def handle_app_error(request: Request, error: AppError):
@@ -854,10 +1054,18 @@ def create_app(
 
     @app.get("/api/health")
     async def health() -> dict:
+        running_worker = next(
+            (worker for worker in stage_engines.values() if worker.is_running),
+            None,
+        )
         return {
             "status": "ok",
-            "task_running": engine.is_running,
-            "task_status": engine.current.status if engine.current else None,
+            "task_running": engine.is_running or running_worker is not None,
+            "task_status": (
+                running_worker.current.status
+                if running_worker is not None and running_worker.current is not None
+                else engine.current.status if engine.current is not None else None
+            ),
         }
 
     @app.get("/api/available-port")
@@ -895,7 +1103,7 @@ def create_app(
     async def delete_account(account_id: str, delete_chrome: bool = False) -> None:
         account = account_repository.get(account_id)
         if delete_chrome:
-            if engine.is_running or (
+            if multi_stage_busy() or stage_engine_busy() or engine.is_running or (
                 engine.upload_is_running
                 and engine.current_upload
                 and engine.current_upload.get("account_id") == account_id
@@ -918,7 +1126,7 @@ def create_app(
 
     @app.post("/api/accounts/{account_id}/copy")
     async def copy_account(account_id: str, request: AccountCopyRequest) -> dict:
-        if engine.is_running or engine.upload_is_running:
+        if multi_stage_busy() or stage_engine_busy() or engine.is_running or engine.upload_is_running:
             raise ConflictError("任务运行中不能复制 Chrome 目录")
         if login_browser.current_account_id == account_id:
             raise ConflictError("登录浏览器正在使用该账号，请先关闭窗口再复制")
@@ -1158,6 +1366,10 @@ def create_app(
             "remaining_uploads": remaining,
             "artist_name": account.upload_artist_name,
             "real_name": account.upload_real_name,
+            "contract_mode": account.upload_contract_mode,
+            "contract_mode_name": "独家代理发行"
+            if account.upload_contract_mode == "exclusive_agent"
+            else "独家授权",
             "files": files,
             "uploaded_files": uploaded_files,
             "rejected_files": rejected_files,
@@ -1286,6 +1498,13 @@ def create_app(
 
     @app.get("/api/uploads/runs/current")
     async def current_upload(account_id: str | None = None) -> dict | None:
+        for worker in stage_engines.values():
+            current = worker.current_upload
+            if current is None:
+                continue
+            if account_id and current.get("account_id") != account_id:
+                continue
+            return current
         if account_id and engine.current_upload and engine.current_upload.get("account_id") != account_id:
             return None
         return engine.current_upload
@@ -1497,9 +1716,9 @@ def create_app(
         async def run_item(item: MultiStageItem) -> dict:
             account = account_repository.get(item.account_id)
             files = [Path(value) for value in item.request.get("song_files", [])]
-            await login_browser.close()
+            worker = create_stage_engine(item.account_id)
             try:
-                engine.start(
+                worker.start(
                     account,
                     files,
                     day=day_value,
@@ -1507,14 +1726,21 @@ def create_app(
                     model_name=item.request.get("model_name") or "自动",
                     singer_name=item.request.get("singer_name") if item.request.get("singer_name") is not None else "老岩",
                 )
-                await engine.wait()
+                await worker.wait()
             except asyncio.CancelledError:
-                if engine.is_running:
-                    await engine.stop()
-                    await engine.wait()
+                if worker.is_running:
+                    await worker.stop()
+                    await worker.wait()
                 raise
-            return (engine.current or {"status": "failed", "error": "生成任务没有返回结果"}).model_dump(mode="json")
+            finally:
+                release_stage_engine(item.account_id, worker)
+            result = worker.current or {
+                "status": "failed",
+                "error": "生成任务没有返回结果",
+            }
+            return result.model_dump(mode="json")
 
+        await login_browser.close()
         snapshot = multi_stage_engine.start(
             stage="generation",
             day=day_value,
@@ -1532,6 +1758,7 @@ def create_app(
                 for (account, files), item in zip(entries, request.items)
             ],
             runner=run_item,
+            concurrency=STAGE_BROWSER_CONCURRENCY,
         )
         await events.publish({
             "type": "log",
@@ -1610,6 +1837,7 @@ def create_app(
                 raise
             return (engine.current or {"status": "failed", "error": "修复任务没有返回结果"}).model_dump(mode="json")
 
+        await login_browser.close()
         snapshot = multi_stage_engine.start(
             stage="repair",
             day=day_value,
@@ -1675,33 +1903,33 @@ def create_app(
 
         async def run_item(item: MultiStageItem) -> dict:
             account = account_repository.get(item.account_id)
-            await login_browser.close()
+            worker = create_stage_engine(item.account_id)
             try:
-                engine.start_upload(
+                worker.start_upload(
                     account,
                     item.request.get("items", []),
                     day_value,
                     auto_replace_noncompliant=bool(item.request.get("auto_replace_noncompliant")),
                 )
-                await engine.wait_upload()
+                await worker.wait_upload()
             except asyncio.CancelledError:
-                if engine.upload_is_running:
-                    await engine.stop_upload()
-                    await engine.wait_upload()
+                if worker.upload_is_running:
+                    await worker.stop_upload()
+                    await worker.wait_upload()
                 raise
-            upload_result = engine.current_upload or {
+            finally:
+                release_stage_engine(item.account_id, worker)
+            upload_result = worker.current_upload or {
                 "status": "failed",
                 "error": "上传任务没有返回结果",
             }
-            monitoring_snapshot: MonitoringSnapshot | None = None
-            if upload_result.get("status") in {"completed", "partial_failed"}:
-                monitoring_snapshot = await collect_monitoring(account)
             return {
                 "status": upload_result.get("status", "failed"),
                 "upload": upload_result,
-                "monitoring": monitoring_snapshot.model_dump(mode="json") if monitoring_snapshot else None,
+                "monitoring": None,
             }
 
+        await login_browser.close()
         snapshot = multi_stage_engine.start(
             stage="upload",
             day=day_value,
@@ -1718,6 +1946,7 @@ def create_app(
                 for account, items in entries
             ],
             runner=run_item,
+            concurrency=STAGE_BROWSER_CONCURRENCY,
         )
         return snapshot.model_dump(mode="json")
 
@@ -1739,6 +1968,8 @@ def create_app(
                 "account_id": snapshot.account_id,
                 "account_name": snapshot.account_name,
                 "status": snapshot.status,
+                "trigger": snapshot.trigger,
+                "period": snapshot.period,
                 "collected_at": snapshot.collected_at,
                 "data_end_date": snapshot.data_end_date,
                 "error": snapshot.error,
@@ -1762,6 +1993,52 @@ def create_app(
             "accounts": accounts,
             "snapshots": snapshots,
         }
+
+    @app.post("/api/monitoring/collections", status_code=202)
+    async def start_monitoring_collection(request: MonitoringCollectionStartRequest) -> dict:
+        if monitoring_collection_engine.is_running:
+            raise ConflictError("监控采集任务正在运行")
+        account_ids = list(dict.fromkeys(request.account_ids))
+        accounts = []
+        for account_id in account_ids:
+            try:
+                accounts.append(account_repository.get(account_id))
+            except NotFoundError as error:
+                raise NotFoundError(f"监控采集账号不存在: {account_id}") from error
+
+        save_monitoring_settings(account_ids)
+        snapshot = start_monitoring_queue(accounts, trigger="manual")
+        return snapshot.model_dump(mode="json")
+
+    @app.get("/api/monitoring/settings")
+    async def monitoring_settings() -> dict:
+        accounts = monitoring_selected_accounts()
+        return {
+            "account_ids": [account.id for account in accounts],
+            "interval_hours": 4,
+            "next_automatic_at": monitoring_next_automatic_at.isoformat(timespec="seconds")
+            if monitoring_next_automatic_at
+            else None,
+        }
+
+    @app.put("/api/monitoring/settings")
+    async def update_monitoring_settings(request: MonitoringSettingsUpdate) -> dict:
+        return save_monitoring_settings(request.account_ids)
+
+    @app.get("/api/monitoring/collections/current")
+    async def current_monitoring_collection() -> dict | None:
+        return (
+            monitoring_collection_engine.current.model_dump(mode="json")
+            if monitoring_collection_engine.current
+            else None
+        )
+
+    @app.post("/api/monitoring/collections/stop", status_code=202)
+    async def stop_monitoring_collection() -> dict:
+        try:
+            return (await monitoring_collection_engine.stop()).model_dump(mode="json")
+        except RuntimeError as error:
+            raise ConflictError(str(error)) from error
 
     @app.get("/api/multi-stage/runs/current")
     async def current_multi_stage(stage: str | None = None) -> dict | None:
@@ -1907,6 +2184,13 @@ def create_app(
 
     @app.get("/api/runs/current")
     async def current_run(account_id: str | None = None) -> dict | None:
+        for worker in stage_engines.values():
+            current = worker.current
+            if current is None:
+                continue
+            if account_id and current.account_id != account_id:
+                continue
+            return current.model_dump(mode="json")
         if account_id and engine.current and engine.current.account_id != account_id:
             return None
         return engine.current.model_dump(mode="json") if engine.current else None
@@ -1936,7 +2220,7 @@ def create_app(
 
     @app.post("/api/accounts/{account_id}/browser/open", status_code=202)
     async def open_login_browser(account_id: str) -> dict:
-        if engine.is_running or engine.upload_is_running:
+        if engine.is_running or engine.upload_is_running or stage_engine_busy():
             raise AppError("任务运行中不能打开登录浏览器")
         if pipeline_engine.is_running or pipeline_engine.is_waiting_user or pipeline_queue_busy() or multi_stage_busy():
             raise AppError("完整流水线运行中不能打开登录浏览器")
@@ -1963,7 +2247,7 @@ def create_app(
     @app.put("/api/settings")
     async def update_settings(request: ConsoleSettingsUpdate) -> dict:
         nonlocal settings
-        if engine.is_running:
+        if engine.is_running or multi_stage_busy() or stage_engine_busy():
             raise AppError("任务运行中不能修改全局等待配置")
         request_data = request.model_dump(mode="json", exclude_unset=True)
         current_data = settings.model_dump(mode="json")

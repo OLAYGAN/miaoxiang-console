@@ -1,5 +1,6 @@
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
+import asyncio
 import json
 import shutil
 import time
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 from backend.api import create_app
 from backend.api import build_upload_lyrics
 from backend.api import build_upload_items
+from backend.task_engine import TaskEngine
 from backend.config import RuntimePaths
 from backend.lyrics import parse_lyrics
 from backend.models import (
@@ -18,6 +20,7 @@ from backend.models import (
     MultiStageSnapshot,
     MonitoringDailyRecord,
     PipelineSnapshot,
+    TaskSnapshot,
     SongRecord,
 )
 from tests.test_ai_lyrics import make_song
@@ -94,7 +97,11 @@ def write_duration_mp3(path: Path, seconds: float) -> Path:
     return path
 
 
-def make_client(tmp_path: Path, stop_after: int | None = None):
+def make_client(
+    tmp_path: Path,
+    stop_after: int | None = None,
+    monitoring_interval_seconds: float = 4 * 60 * 60,
+):
     holder: dict = {"models": [], "singers": [], "browsers": []}
 
     def factory(account, settings):
@@ -120,7 +127,12 @@ def make_client(tmp_path: Path, stop_after: int | None = None):
         pipeline_queue_state_file=tmp_path / "data" / "pipeline_queue_state.json",
         monitoring_statistics_file=tmp_path / "data" / "monitoring_statistics.json",
     )
-    app = create_app(runtime_paths=paths, browser_factory=factory, poll_interval=0.01)
+    app = create_app(
+        runtime_paths=paths,
+        browser_factory=factory,
+        poll_interval=0.01,
+        monitoring_interval_seconds=monitoring_interval_seconds,
+    )
     holder["engine"] = app.state.engine
     return app, holder
 
@@ -135,6 +147,13 @@ def test_health_and_account_crud(tmp_path: Path) -> None:
         created = client.post("/api/accounts", json=account_payload(tmp_path, port=19222))
         assert created.status_code == 201
         account = created.json()
+        assert account["upload_contract_mode"] == "exclusive_authorization"
+
+        updated_payload = {**account, "upload_contract_mode": "exclusive_agent"}
+        updated = client.put(f"/api/accounts/{account['id']}", json=updated_payload)
+        assert updated.status_code == 200
+        assert updated.json()["upload_contract_mode"] == "exclusive_agent"
+        account = updated.json()
 
         conflict = client.post("/api/accounts", json=account_payload(tmp_path, port=19223))
         assert conflict.status_code == 409
@@ -316,6 +335,8 @@ def test_upload_batch_listing_reads_output_directory(tmp_path: Path) -> None:
         assert body["daily_limit"] == 10
         assert body["daily_used"] == 1
         assert body["remaining_uploads"] == 9
+        assert body["contract_mode"] == "exclusive_authorization"
+        assert body["contract_mode_name"] == "独家授权"
         assert [item["file_name"] for item in body["files"]] == ["第二首.mp3"]
         assert [item["file_name"] for item in body["uploaded_files"]] == ["第一首.mp3"]
         assert all(item["size"] > 0 for item in body["files"])
@@ -1365,7 +1386,7 @@ def test_start_requires_existing_account_and_songs(tmp_path: Path) -> None:
         assert empty.status_code == 422
 
 
-def test_multi_generation_runs_accounts_serially(tmp_path: Path) -> None:
+def test_multi_generation_runs_two_accounts_in_parallel(tmp_path: Path) -> None:
     app, holder = make_client(tmp_path)
     write_song(tmp_path, "01_first")
     with TestClient(app) as client:
@@ -1398,12 +1419,90 @@ def test_multi_generation_runs_accounts_serially(tmp_path: Path) -> None:
                 break
 
         assert queue["stage"] == "generation"
-        assert queue["concurrency"] == 1
+        assert queue["concurrency"] == 2
         assert queue["status"] == "completed"
         assert [item["account_name"] for item in queue["items"]] == ["账号01", "账号02"]
         assert all(item["status"] == "completed" for item in queue["items"])
         assert holder["models"] == ["Sway v5.5", "MiniMax v2.6"]
         assert holder["singers"] == ["", ""]
+
+
+def test_multi_generation_limits_browser_work_to_two_accounts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = make_client(tmp_path)
+    write_song(tmp_path, "01_first")
+    release = asyncio.Event()
+    active: list[str] = []
+
+    class GatedGenerationEngine:
+        def __init__(self, *args, **kwargs) -> None:
+            self.current: TaskSnapshot | None = None
+            self._task: asyncio.Task | None = None
+
+        @property
+        def is_running(self) -> bool:
+            return self._task is not None and not self._task.done()
+
+        def start(self, account, song_files, **kwargs) -> TaskSnapshot:
+            self.current = TaskSnapshot(
+                run_id=f"run-{account.id}",
+                account_id=account.id,
+                account_name=account.account_name,
+                songs=[],
+            )
+            self._task = asyncio.create_task(self._run(account))
+            return self.current
+
+        async def _run(self, account) -> None:
+            active.append(account.id)
+            await release.wait()
+            assert self.current is not None
+            self.current.status = "completed"
+
+        async def wait(self) -> None:
+            if self._task is not None:
+                await self._task
+
+    monkeypatch.setattr("backend.api.TaskEngine", GatedGenerationEngine)
+
+    with TestClient(app) as client:
+        accounts = [
+            client.post("/api/accounts", json=account_payload(tmp_path, f"账号{index:02d}", 19221 + index)).json()
+            for index in range(1, 4)
+        ]
+        response = client.post(
+            "/api/multi-stage/generation/runs",
+            json={
+                "day": "2026-09-17",
+                "items": [
+                    {"account_id": account["id"], "song_files": ["01_first.md"]}
+                    for account in accounts
+                ],
+            },
+        )
+        assert response.status_code == 202
+
+        for _ in range(100):
+            queue = client.get("/api/multi-stage/runs/current").json()
+            statuses = [item["status"] for item in queue["items"]]
+            if statuses.count("running") == 2:
+                break
+
+        assert queue["concurrency"] == 2
+        assert statuses == ["running", "running", "pending"], [
+            item["error"] for item in queue["items"]
+        ]
+        assert len(active) == 2
+
+        release.set()
+        for _ in range(100):
+            queue = client.get("/api/multi-stage/runs/current").json()
+            if queue["status"] in {"completed", "failed", "stopped"}:
+                break
+        assert queue["status"] == "completed"
+        assert len(active) == 3
 
 
 def test_multi_repair_runs_selected_accounts_serially(tmp_path: Path) -> None:
@@ -1489,37 +1588,20 @@ def test_multi_lyrics_runs_accounts_in_parallel_and_saves(tmp_path: Path, monkey
         assert list((Path(account["lyric_dir"]) / "2026-09-17").glob("*.md"))
 
 
-def test_multi_upload_collects_statistics_for_each_account(tmp_path: Path, monkeypatch) -> None:
+def test_multi_upload_does_not_collect_statistics_after_upload(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     app, holder = make_client(tmp_path)
     write_song(tmp_path, "01_song")
 
-    async def collect_statistics(self):
-        assert self.account is not None
-        if self.account.account_name == "账号02":
-            raise RuntimeError("统计接口登录失效")
-        return [
-            MonitoringDailyRecord(
-                date="2026-10-16",
-                account_id=self.account.id,
-                account_name=self.account.account_name,
-                qishui_heat_index=18,
-                qishui_play_count=1,
-                qishui_paid_user_play_index=0,
-            ),
-            MonitoringDailyRecord(
-                date="2026-10-17",
-                account_id=self.account.id,
-                account_name=self.account.account_name,
-                qishui_heat_index=0,
-                qishui_play_count=0,
-                qishui_paid_user_play_index=0,
-            ),
-        ]
+    async def collect_statistics(self, **kwargs):
+        raise AssertionError("上传完成后不应自动采集统计数据")
 
     monkeypatch.setattr(FakeFlow, "collect_statistics", collect_statistics)
 
-    def fake_start_upload(account, items, day, **kwargs):
-        app.state.engine.current_upload = {
+    def fake_start_upload(self, account, items, day, **kwargs):
+        self.current_upload = {
             "status": "completed",
             "step": "done",
             "day": day,
@@ -1527,11 +1609,11 @@ def test_multi_upload_collects_statistics_for_each_account(tmp_path: Path, monke
             "account_name": account.account_name,
         }
 
-    async def fake_wait_upload():
+    async def fake_wait_upload(self):
         return
 
-    monkeypatch.setattr(app.state.engine, "start_upload", fake_start_upload)
-    monkeypatch.setattr(app.state.engine, "wait_upload", fake_wait_upload)
+    monkeypatch.setattr(TaskEngine, "start_upload", fake_start_upload)
+    monkeypatch.setattr(TaskEngine, "wait_upload", fake_wait_upload)
 
     with TestClient(app) as client:
         first = client.post("/api/accounts", json=account_payload(tmp_path, "账号01", 19222)).json()
@@ -1561,24 +1643,219 @@ def test_multi_upload_collects_statistics_for_each_account(tmp_path: Path, monke
         assert queue["status"] == "completed"
         assert all(item["status"] == "completed" for item in queue["items"])
         assert all(item["result"]["upload"]["status"] == "completed" for item in queue["items"])
-        assert queue["items"][0]["result"]["monitoring"]["status"] == "completed"
-        assert queue["items"][1]["result"]["monitoring"]["status"] == "failed"
-        assert "统计接口登录失效" in queue["items"][1]["result"]["monitoring"]["error"]
+        assert all(item["result"]["monitoring"] is None for item in queue["items"])
 
         statistics = client.get("/api/monitoring/statistics?days=7").json()
         assert statistics["days"] == 7
-        assert [account["account_name"] for account in statistics["accounts"]] == ["账号01", "账号02"]
-        assert [account["status"] for account in statistics["accounts"]] == ["completed", "failed"]
-        assert len(statistics["snapshots"]) == 2
-        assert statistics["snapshots"][0]["status"] == "failed"
-        assert statistics["snapshots"][0]["data_end_date"] is None
-        assert statistics["snapshots"][1]["status"] == "completed"
-        assert statistics["snapshots"][1]["data_end_date"] == "2026-10-17"
-        assert len(statistics["records"]) == 2
-        assert statistics["records"][0]["date"] == "2026-10-17"
-        assert statistics["records"][0]["data_end_date"] == "2026-10-17"
-        assert statistics["records"][0]["qishui_heat_index"] == 0
+        assert statistics["accounts"] == []
+        assert statistics["snapshots"] == []
+        assert statistics["records"] == []
+        assert holder["browsers"] == []
+
+
+def test_manual_monitoring_collection_runs_accounts_in_background(tmp_path: Path, monkeypatch) -> None:
+    app, holder = make_client(tmp_path)
+
+    async def collect_statistics(self, *, period="last_7_days"):
+        assert self.account is not None
+        assert period == "last_1_day"
+        if self.account.account_name == "账号02":
+            raise RuntimeError("统计页登录失效")
+        return [
+            MonitoringDailyRecord(
+                date="2026-10-19",
+                account_id=self.account.id,
+                account_name=self.account.account_name,
+                qishui_heat_index=1394,
+                qishui_play_count=3192,
+                qishui_paid_user_play_index=4047,
+                qishui_search_play_index=0,
+            ),
+        ]
+
+    monkeypatch.setattr(FakeFlow, "collect_statistics", collect_statistics)
+
+    with TestClient(app) as client:
+        first = client.post("/api/accounts", json=account_payload(tmp_path, "账号01", 19222)).json()
+        second = client.post("/api/accounts", json=account_payload(tmp_path, "账号02", 19223)).json()
+
+        response = client.post(
+            "/api/monitoring/collections",
+            json={"account_ids": [first["id"], second["id"]]},
+        )
+        assert response.status_code == 202, response.json()
+        queue = response.json()
+        assert queue["stage"] == "monitoring"
+        assert queue["status"] == "running"
+        assert queue["concurrency"] == 1
+
+        for _ in range(100):
+            queue = client.get("/api/monitoring/collections/current").json()
+            if queue["status"] in {"completed", "failed", "stopped"}:
+                break
+        assert queue["status"] == "completed"
+        assert [item["status"] for item in queue["items"]] == ["completed", "failed"]
+        assert queue["items"][0]["result"]["trigger"] == "manual"
+        assert queue["items"][0]["result"]["period"] == "last_1_day"
+        assert queue["items"][0]["result"]["records"][0]["qishui_search_play_index"] == 0
         assert [browser.entered for browser in holder["browsers"]] == [1, 1]
+
+        statistics = client.get("/api/monitoring/statistics").json()
+        assert statistics["snapshots"][0]["trigger"] == "manual"
+        assert statistics["snapshots"][0]["period"] == "last_1_day"
+        assert statistics["records"][0]["date"] == "2026-10-19"
+        assert statistics["records"][0]["qishui_search_play_index"] == 0
+
+
+def test_monitoring_settings_persist_and_automatic_collection_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, holder = make_client(tmp_path, monitoring_interval_seconds=0)
+
+    async def collect_statistics(self, *, period="last_7_days"):
+        assert period == "last_1_day"
+        return [
+            MonitoringDailyRecord(
+                date="2026-10-19",
+                account_id=self.account.id,
+                account_name=self.account.account_name,
+                qishui_heat_index=1,
+                qishui_play_count=2,
+                qishui_paid_user_play_index=3,
+                qishui_search_play_index=4,
+            ),
+        ]
+
+    monkeypatch.setattr(FakeFlow, "collect_statistics", collect_statistics)
+
+    with TestClient(app) as client:
+        account = client.post(
+            "/api/accounts",
+            json=account_payload(tmp_path, "账号01", 19222),
+        ).json()
+        saved = client.put(
+            "/api/monitoring/settings",
+            json={"account_ids": [account["id"]]},
+        )
+        assert saved.status_code == 200, saved.json()
+        assert saved.json()["account_ids"] == [account["id"]]
+
+        restored = client.get("/api/monitoring/settings").json()
+        assert restored["account_ids"] == [account["id"]]
+        assert restored["interval_hours"] == 4
+
+        for _ in range(100):
+            statistics = client.get("/api/monitoring/statistics").json()
+            if any(snapshot["trigger"] == "automatic" for snapshot in statistics["snapshots"]):
+                break
+
+        automatic = next(
+            snapshot for snapshot in statistics["snapshots"]
+            if snapshot["trigger"] == "automatic"
+        )
+        assert automatic["period"] == "last_1_day"
+        assert automatic["status"] == "completed"
+        assert holder["browsers"]
+
+    stored = json.loads((tmp_path / "data" / "monitoring_settings.json").read_text(encoding="utf-8"))
+    assert stored == {"account_ids": [account["id"]]}
+
+
+def test_monitoring_automatic_schedule_aligns_to_four_hour_clock_boundaries(tmp_path: Path) -> None:
+    app, _ = make_client(tmp_path)
+    with TestClient(app) as client:
+        settings = client.get("/api/monitoring/settings").json()
+
+    assert settings["interval_hours"] == 4
+    next_automatic_at = datetime.fromisoformat(settings["next_automatic_at"])
+    assert next_automatic_at.minute == 0
+    assert next_automatic_at.second == 0
+    assert next_automatic_at.microsecond == 0
+    assert next_automatic_at.hour % 4 == 0
+
+
+def test_multi_upload_limits_browser_work_to_two_accounts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _ = make_client(tmp_path)
+    write_song(tmp_path, "01_song")
+    release = asyncio.Event()
+    active: list[str] = []
+
+    class GatedUploadEngine:
+        def __init__(self, *args, **kwargs) -> None:
+            self.current_upload: dict | None = None
+            self._task: asyncio.Task | None = None
+
+        @property
+        def upload_is_running(self) -> bool:
+            return self._task is not None and not self._task.done()
+
+        def start_upload(self, account, items, day, **kwargs) -> dict:
+            self.current_upload = {
+                "status": "running",
+                "step": "starting",
+                "day": day,
+                "account_id": account.id,
+                "account_name": account.account_name,
+            }
+            self._task = asyncio.create_task(self._run(account))
+            return self.current_upload
+
+        async def _run(self, account) -> None:
+            active.append(account.id)
+            await release.wait()
+            assert self.current_upload is not None
+            self.current_upload["status"] = "completed"
+            self.current_upload["step"] = "done"
+
+        async def wait_upload(self) -> None:
+            if self._task is not None:
+                await self._task
+
+    monkeypatch.setattr("backend.api.TaskEngine", GatedUploadEngine)
+
+    with TestClient(app) as client:
+        accounts = [
+            client.post("/api/accounts", json=account_payload(tmp_path, f"账号{index:02d}", 19231 + index)).json()
+            for index in range(1, 4)
+        ]
+        day = "2026-09-17"
+        output = Path(accounts[0]["output_dir"]) / day
+        output.mkdir(parents=True, exist_ok=True)
+        write_duration_mp3(output / "01_song.mp3", 61.0)
+
+        response = client.post(
+            "/api/multi-stage/upload/runs",
+            json={
+                "day": day,
+                "items": [
+                    {"account_id": account["id"], "file_names": ["01_song.mp3"]}
+                    for account in accounts
+                ],
+            },
+        )
+        assert response.status_code == 202, response.json()
+
+        for _ in range(100):
+            queue = client.get("/api/multi-stage/runs/current").json()
+            statuses = [item["status"] for item in queue["items"]]
+            if statuses.count("running") == 2:
+                break
+
+        assert queue["concurrency"] == 2
+        assert statuses == ["running", "running", "pending"]
+        assert len(active) == 2
+
+        release.set()
+        for _ in range(100):
+            queue = client.get("/api/multi-stage/runs/current").json()
+            if queue["status"] in {"completed", "failed", "stopped"}:
+                break
+        assert queue["status"] == "completed"
+        assert len(active) == 3
 
 
 def test_start_uses_today_when_day_is_omitted(tmp_path: Path) -> None:

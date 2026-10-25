@@ -60,6 +60,16 @@ def test_chrome_command_contains_isolation_and_debug_arguments(tmp_path: Path) -
     assert "--disable-background-timer-throttling" in command
 
 
+def test_hidden_chrome_command_uses_new_headless_mode(tmp_path: Path) -> None:
+    executable = tmp_path / "chrome.exe"
+    profile = tmp_path / "profiles" / "账号01"
+
+    command = build_chrome_command(executable, profile=profile, port=9333, hidden=True)
+
+    assert "--headless=new" in command
+    assert "--window-size=1280,800" in command
+
+
 @pytest.mark.asyncio
 async def test_wait_for_cdp_has_bounded_attempts() -> None:
     calls: list[str] = []
@@ -152,6 +162,25 @@ async def test_chrome_session_cleanup_kills_windows_process_tree(
     await session.cleanup()
 
     assert commands == [["taskkill", "/PID", "34567", "/T", "/F"]]
+
+
+@pytest.mark.asyncio
+async def test_hidden_cleanup_closes_only_attached_page(tmp_path: Path) -> None:
+    session = ChromeSession(make_account(tmp_path), ConsoleSettings(), hidden=True)
+    browser = FakeBrowser()
+    page = FakePage()
+    playwright = FakePlaywright()
+    session.browser = browser
+    session.page = page
+    session._playwright = playwright
+    session._connected_to_existing = True
+    session._opened_page = True
+
+    await session.cleanup()
+
+    assert page.closed_count == 1
+    assert browser.closed_count == 0
+    assert playwright.stopped_count == 1
 
 
 @pytest.mark.asyncio
@@ -264,6 +293,14 @@ class FakeProcess:
 
 
 class FakeBrowser:
+    def __init__(self) -> None:
+        self.closed_count = 0
+
+    async def close(self) -> None:
+        self.closed_count += 1
+
+
+class FakePage:
     def __init__(self) -> None:
         self.closed_count = 0
 

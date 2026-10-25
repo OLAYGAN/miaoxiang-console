@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any
 
 from backend.errors import BrowserFlowError
@@ -10,11 +11,14 @@ from backend.models import AccountConfig, MonitoringDailyRecord
 
 
 STATISTICS_URL = "https://music.douyin.com/console/statistics?enter_from=menu_data_center"
+SETTLEMENT_URL = "https://music.douyin.com/console/settlement/index"
+STATISTICS_PERIOD_LAST_1_DAY = 1
 STATISTICS_PERIOD_LAST_7_DAYS = 2
 STATISTICS_METRIC_TYPES = {
     "qishui_heat_index": 1,
     "qishui_play_count": 2,
     "qishui_paid_user_play_index": 3,
+    "qishui_search_play_index": 4,
 }
 
 
@@ -61,7 +65,7 @@ def parse_statistics_trends(
     for values in trends.values():
         dates &= set(values)
     if not dates:
-        raise BrowserFlowError("三个统计指标的日期没有交集")
+        raise BrowserFlowError("统计指标的日期没有交集")
 
     return [
         MonitoringDailyRecord(
@@ -71,6 +75,32 @@ def parse_statistics_trends(
             qishui_heat_index=trends["qishui_heat_index"][iso_date],
             qishui_play_count=trends["qishui_play_count"][iso_date],
             qishui_paid_user_play_index=trends["qishui_paid_user_play_index"][iso_date],
+            qishui_search_play_index=trends["qishui_search_play_index"][iso_date],
         )
         for iso_date in sorted(dates, reverse=True)
     ]
+
+
+def parse_statistics_update_date(page_text: str) -> str | None:
+    match = re.search(r"数据更新至\s*(\d{4})/(\d{1,2})/(\d{1,2})", page_text)
+    if not match:
+        return None
+    try:
+        return datetime(
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+        ).date().isoformat()
+    except ValueError:
+        return None
+
+
+def parse_settlement_available_balance(page_text: str) -> float | None:
+    match = re.search(
+        r"可用余额\s*(?:￥|¥)?\s*([0-9][0-9,.\u00a0 ]*?)\s*元",
+        page_text,
+    )
+    if not match:
+        return None
+    value = _metric_value(match.group(1))
+    return value if value is not None and value >= 0 else None

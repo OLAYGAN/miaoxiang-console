@@ -1,6 +1,7 @@
 """Deterministic page operations for the Miaoxiang studio workflow."""
 
 import asyncio
+import json
 import re
 import inspect
 import os
@@ -9,6 +10,7 @@ from difflib import SequenceMatcher
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
+from typing import Literal
 
 from backend.errors import (
     BrowserFlowError,
@@ -21,10 +23,14 @@ from backend.errors import (
 )
 from backend.lyrics import sanitize_lyrics_for_generation
 from backend.monitoring import (
+    SETTLEMENT_URL,
     STATISTICS_METRIC_TYPES,
+    STATISTICS_PERIOD_LAST_1_DAY,
     STATISTICS_PERIOD_LAST_7_DAYS,
     STATISTICS_URL,
+    parse_settlement_available_balance,
     parse_statistics_trends,
+    parse_statistics_update_date,
 )
 from backend.models import AccountConfig, ConsoleSettings, LyricData, MonitoringDailyRecord
 from backend.models import BatchSongResult, GeneratedCandidate
@@ -33,6 +39,40 @@ from backend.models import BatchSongResult, GeneratedCandidate
 T = TypeVar("T")
 
 MIN_DOWNLOAD_DURATION_SECONDS = 60.0
+_GENERATION_LIMIT_TEXT_RE = re.compile(
+    r"(?:今日|当天).{0,16}(?:上限|用完)|(?:生成|创作).{0,16}(?:上限|用完)|已达上限|达到上限",
+    re.IGNORECASE,
+)
+_UPLOAD_CONTRACT_MODE_LABELS = {
+    "exclusive_agent": "独家代理发行",
+    "exclusive_authorization": "独家授权",
+}
+_AUTHORIZATION_STEP_MARKERS = (
+    "签约模式",
+    "独家代理发行",
+    "独家授权",
+    "非独家授权",
+    "发行信息",
+    "授权信息",
+    "上一步",
+)
+_UPLOAD_PROCESSING_MARKERS = (
+    "上传中",
+    "请等待封面上传完成",
+    "音频检测中",
+    "检测中",
+    "解析中",
+    "转码中",
+    "处理中",
+    "切片中",
+    "正在切片",
+    "歌曲切片中",
+    "生成切片",
+    "高光片段中",
+    "片段生成中",
+    "智能生成高光片段中",
+)
+_EDITOR_PROJECT_RESERVE_COUNT = 20
 
 _MPEG1_BITRATE_TABLE = {
     1: [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
@@ -131,19 +171,37 @@ def read_mp3_duration_seconds(path: Path) -> float:
     return duration
 
 
+def _upload_contract_option_pattern(label: str) -> re.Pattern[str]:
+    """Match a contract card whose platform text may append its term."""
+    return re.compile(
+        rf"^\s*{re.escape(label)}(?:[（(]\s*\d+\s*年\s*[）)])?\s*$"
+    )
+
+
 async def trusted_click(
     page: Any,
     locator: Any,
     description: str,
     hover_ms: int = 500,
 ) -> None:
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            # Chromium can report a menu item as unstable while its container
+            # finishes animating. Playwright's click retries actionability and
+            # can scroll the element itself, so a failed pre-scroll is not fatal.
+            try:
+                await locator.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+            await locator.click(timeout=5000)
+            return
+        except Exception as error:
+            last_error = error
+            if attempt == 0:
+                await page.wait_for_timeout(500)
     try:
-        await locator.scroll_into_view_if_needed(timeout=3000)
-        # Locator clicks remain real mouse events and correctly account for
-        # nested scroll containers; raw page.mouse coordinates do not.
-        await locator.click(timeout=5000)
-    except BrowserFlowError:
-        raise
+        raise last_error or AssertionError("click did not run")
     except Exception as error:
         raise BrowserFlowError(f"点击失败: {description}: {error}") from error
 
@@ -295,6 +353,40 @@ def archive_download(
     if not destination.is_file() or destination.stat().st_size == 0:
         raise BrowserFlowError(f"归档验证失败: {destination}")
     return destination
+
+
+def _chrome_download_roots(account: AccountConfig) -> list[Path]:
+    """Return the directories Chrome may use for direct downloads."""
+    roots = [Path.home() / "Downloads"]
+    profile = Path(account.chrome_profile_dir)
+    for preferences_path in (
+        profile / "Default" / "Preferences",
+        profile / "Preferences",
+    ):
+        try:
+            preferences = json.loads(preferences_path.read_text(encoding="utf-8"))
+            configured = preferences.get("download", {}).get("default_directory")
+            if configured:
+                roots.append(Path(str(configured)).expanduser())
+        except (OSError, ValueError, TypeError):
+            continue
+
+    unique: list[Path] = []
+    for root in roots:
+        if root not in unique:
+            unique.append(root)
+    return unique
+
+
+def _matches_suggested_download(path: Path, suggested: str) -> bool:
+    stem = Path(suggested).stem
+    suffix = Path(suggested).suffix
+    if not stem or not suffix:
+        return False
+    return re.fullmatch(
+        re.escape(stem) + r"(?: \(\d+\))?" + re.escape(suffix),
+        path.name,
+    ) is not None
 
 
 def is_login_challenge(body_text: str) -> bool:
@@ -669,6 +761,7 @@ async def open_download_menu(
     page: Any,
     song_name: str,
     lyrics: str | None = None,
+    export_settle_seconds: float = 0,
 ) -> Any:
     results_tab = page.locator("button").filter(has_text="生成结果").first
     await results_tab.click(timeout=5000)
@@ -679,7 +772,12 @@ async def open_download_menu(
             has_text=song_name
         ).first
     else:
-        card = await find_exported_download_card(page, song_name, lyrics)
+        card = await find_exported_download_card(
+            page,
+            song_name,
+            lyrics,
+            settle_seconds=export_settle_seconds,
+        )
     trigger = card.locator("div[class*='trigger']").last
     await trigger.scroll_into_view_if_needed(timeout=5000)
     await trigger.hover(timeout=5000)
@@ -696,6 +794,31 @@ async def open_download_menu(
 
 
 async def find_exported_download_card(
+    page: Any,
+    song_name: str,
+    lyrics: str,
+    *,
+    settle_seconds: float = 0,
+) -> Any:
+    """Find an exported card, optionally waiting for the asset list to settle."""
+    deadline = datetime.now().timestamp() + max(0, settle_seconds)
+    while True:
+        try:
+            return await _find_exported_download_card_once(page, song_name, lyrics)
+        except BrowserFlowError:
+            if datetime.now().timestamp() >= deadline:
+                raise
+            try:
+                await refresh_asset_tabs(page)
+            except Exception:
+                pass
+            try:
+                await page.wait_for_timeout(3000)
+            except Exception:
+                await asyncio.sleep(3)
+
+
+async def _find_exported_download_card_once(
     page: Any,
     song_name: str,
     lyrics: str,
@@ -952,18 +1075,27 @@ class PageFlow:
             self.day,
         )
 
-    async def collect_statistics(self) -> list[MonitoringDailyRecord]:
+    async def collect_statistics(
+        self,
+        *,
+        period: Literal["last_1_day", "last_7_days"] = "last_7_days",
+    ) -> list[MonitoringDailyRecord]:
         await self.page.goto(
             STATISTICS_URL,
             wait_until="domcontentloaded",
             timeout=self.settings.page_load_timeout_seconds * 1000,
         )
 
-        # The statistics API accepts the period directly; clicking the visible
-        # control keeps the page state consistent when the platform defaults to
-        # another range.
+        period_value = (
+            STATISTICS_PERIOD_LAST_1_DAY
+            if period == "last_1_day"
+            else STATISTICS_PERIOD_LAST_7_DAYS
+        )
+        period_label = "近1天" if period == "last_1_day" else "近7天"
+        # The API accepts the period directly. Also click the visible option so
+        # the page caption stays aligned with the data being fetched.
         try:
-            await self.page.get_by_text("近7天", exact=False).first.click(timeout=3000)
+            await self.page.get_by_text(period_label, exact=True).first.click(timeout=3000)
         except Exception:
             pass
 
@@ -988,12 +1120,43 @@ class PageFlow:
                 }
                 return result;
             }""",
-            [STATISTICS_PERIOD_LAST_7_DAYS, metric_types],
+            [period_value, metric_types],
         )
         if not isinstance(payload, dict):
             path = await self._screenshot("statistics-invalid-response")
             raise BrowserFlowError(f"统计接口返回格式错误；截图: {path}")
-        return parse_statistics_trends(payload, self.account)
+        records = parse_statistics_trends(payload, self.account)
+        page_text = await self.page.locator("body").inner_text()
+        platform_date = parse_statistics_update_date(page_text)
+        if not platform_date:
+            path = await self._screenshot("statistics-date-missing")
+            raise BrowserFlowError(f"统计页未显示数据更新日期；截图: {path}")
+        latest_record_date = max(record.date for record in records)
+        if latest_record_date != platform_date:
+            raise BrowserFlowError(
+                f"统计页日期与接口日期不一致: 页面 {platform_date}, 接口 {latest_record_date}"
+            )
+        available_balance = await self._collect_settlement_available_balance()
+        for record in records:
+            if record.date == platform_date:
+                record.available_balance_yuan = available_balance
+        return records
+
+    async def _collect_settlement_available_balance(self) -> float:
+        await self.page.goto(
+            SETTLEMENT_URL,
+            wait_until="domcontentloaded",
+            timeout=self.settings.page_load_timeout_seconds * 1000,
+        )
+        for _ in range(30):
+            body = await self.page.locator("body").inner_text()
+            value = parse_settlement_available_balance(body)
+            if value is not None:
+                return value
+            await self.page.wait_for_timeout(1000)
+
+        path = await self._screenshot("settlement-available-balance-missing")
+        raise BrowserFlowError(f"结算页未找到可用余额；截图: {path}")
 
     async def _mouse_click_text(self, text: str, description: str, *, exact: bool = False) -> None:
         try:
@@ -1185,27 +1348,61 @@ class PageFlow:
             await self.page.wait_for_timeout(1000)
         return list(dict.fromkeys(removed))
 
-    async def _wait_upload_audio_ready(self) -> None:
+    async def _wait_upload_audio_ready(
+        self,
+        *,
+        expected_songs: int | None = None,
+    ) -> None:
         stable = 0
-        for _ in range(180):
+        last_reason = "未知上传状态"
+        for _ in range(900):
             body = await self.page.inner_text("body")
-            busy_markers = (
-                "音频检测中",
-                "智能生成高光片段中",
-                "上传中",
-                "请等待封面上传完成",
-            )
+            global_busy = [
+                marker for marker in _UPLOAD_PROCESSING_MARKERS if marker in body
+            ]
             has_percentage = bool(re.search(r"\d+(?:\.\d+)?%", body))
-            stable = (
-                stable + 1
-                if not any(marker in body for marker in busy_markers) and not has_percentage
-                else 0
-            )
+            song_busy: list[str] = []
+
+            if expected_songs is not None:
+                states = await self._upload_song_states()
+                if len(states) < expected_songs:
+                    last_reason = (
+                        f"页面只有 {len(states)} 首歌，少于预期的 {expected_songs} 首"
+                    )
+                    stable = 0
+                    await self.page.wait_for_timeout(1000)
+                    continue
+
+                for state in states[:expected_songs]:
+                    text = str(state.get("text") or "")
+                    index = int(state.get("index") or 0)
+                    title = str(state.get("title") or f"第 {index + 1} 首")
+                    busy = [
+                        marker
+                        for marker in _UPLOAD_PROCESSING_MARKERS
+                        if marker in text
+                    ]
+                    if busy:
+                        song_busy.append(f"{title}: {'、'.join(busy)}")
+
+            if global_busy or song_busy or has_percentage:
+                details: list[str] = []
+                if global_busy:
+                    details.append("全局状态: " + "、".join(global_busy))
+                if song_busy:
+                    details.extend(song_busy)
+                if has_percentage:
+                    details.append("上传或处理进度未完成")
+                last_reason = "; ".join(details)
+                stable = 0
+            else:
+                stable += 1
+
             if stable >= 5:
                 return
             await self.page.wait_for_timeout(1000)
         path = await self._screenshot("upload-audio-inspection-timeout")
-        raise BrowserFlowError(f"音频检测超时；截图: {path}")
+        raise BrowserFlowError(f"音频检测/切片超时: {last_reason}；截图: {path}")
 
     async def _visible_upload_diagnostics(self) -> str:
         errors = await self.page.evaluate(
@@ -1241,7 +1438,9 @@ class PageFlow:
         for _ in range(30):
             body = await self.page.inner_text("body")
             title_visible = await title_input.is_visible()
-            if "授权信息" in body and not title_visible:
+            if not title_visible and all(
+                marker in body for marker in _AUTHORIZATION_STEP_MARKERS
+            ):
                 return
             await self.page.wait_for_timeout(1000)
         diagnostics = await self._visible_upload_diagnostics()
@@ -1270,7 +1469,9 @@ class PageFlow:
         body = await self.page.inner_text("body")
         title_input = self.page.locator('input[id="songs[0][title]"]')
         title_visible = await title_input.is_visible()
-        return "授权信息" in body and not title_visible
+        return not title_visible and all(
+            marker in body for marker in _AUTHORIZATION_STEP_MARKERS
+        )
 
     async def _wait_authorization_step_ready(self, *, timeout_seconds: int = 10) -> bool:
         deadline = datetime.now().timestamp() + timeout_seconds
@@ -1280,7 +1481,7 @@ class PageFlow:
             await self.page.wait_for_timeout(500)
         return False
 
-    async def _configure_upload_ai_tools(self, *, ai_created: bool) -> None:
+    async def _select_upload_ai_created(self, *, ai_created: bool) -> None:
         radio_scope = self.page.locator(
             'div[x-field-id="aiTools[isMakeByAITools]"] label.douyin-music-radio'
         )
@@ -1297,22 +1498,6 @@ class PageFlow:
 
         if not ai_created:
             return
-
-        combo = self.page.locator(
-            '[role=combobox][aria-labelledby="aiTools[makeWithAIToolNames]-label"]'
-        )
-        await trusted_click(self.page, combo, "AI工具下拉")
-        await self.page.wait_for_timeout(800)
-        other = self.page.locator("[role=option]").filter(
-            has_text=re.compile(r"其他")
-        ).first
-        await other.click(timeout=5000)
-        await self.page.wait_for_timeout(1000)
-
-        other_tool = self.page.locator(
-            'input[id="aiTools[makeWithOtherAIToolNames]"]'
-        )
-        await other_tool.fill("妙响")
 
     async def _add_next_upload_song(self, current_index: int) -> None:
         expected_count = current_index + 2
@@ -1616,11 +1801,126 @@ class PageFlow:
                     f"第 {index + 1} 首添加自己失败；截图: {path}"
                 )
 
+    async def _select_upload_contract_mode(self) -> None:
+        mode = str(getattr(self.account, "upload_contract_mode", "exclusive_authorization"))
+        label = _UPLOAD_CONTRACT_MODE_LABELS.get(mode, "独家授权")
+        option = self.page.locator(
+            'label:visible, [role="radio"]:visible, [role="button"]:visible, '
+            'button:visible, .douyin-music-radio:visible, .douyin-music-select-item:visible, '
+            'div:visible, span:visible'
+        ).filter(
+            has_text=_upload_contract_option_pattern(label)
+        ).first
+        if not await option.count():
+            diagnostics = await self.page.evaluate(
+                """() => Array.from(document.querySelectorAll(
+                    'label, [role="radio"], [role="button"], button, div, span, '
+                    '[class*="radio"], [class*="select-item"]'
+                )).filter(node => node.offsetParent && /独家|授权|代理/.test(node.innerText || ''))
+                .map(node => ({
+                    tag: node.tagName,
+                    className: String(node.className),
+                    text: (node.innerText || '').trim(),
+                })).slice(0, 60)"""
+            )
+            path = await self._screenshot("upload-contract-mode-missing")
+            raise BrowserFlowError(
+                f"未找到签约模式选项“{label}”；可见选项: {diagnostics}；截图: {path}"
+            )
+        await trusted_click(self.page, option, f"选择签约模式{label}")
+        await self.page.wait_for_timeout(1000)
+
+    async def _mark_commercial_revenue_switch(self) -> bool:
+        return bool(
+            await self.page.evaluate(
+                """() => {
+                    const wanted = '批量开启商用收益分成';
+                    const visibleNodes = Array.from(document.querySelectorAll(
+                        'label, span, div, p'
+                    )).filter(node => node.offsetParent && (node.innerText || '').trim() === wanted);
+                    if (!visibleNodes.length) return false;
+
+                    const depth = node => {
+                        let value = 0;
+                        for (let parent = node; parent; parent = parent.parentElement) value += 1;
+                        return value;
+                    };
+                    visibleNodes.sort((first, second) => depth(second) - depth(first));
+                    const target = visibleNodes[0];
+                    const controls = [
+                        '[role="switch"]',
+                        'input[type="checkbox"]',
+                        '.douyin-music-switch',
+                        '.semi-switch',
+                        'button',
+                    ].flatMap(selector => Array.from(target.querySelectorAll(selector)));
+
+                    let container = target;
+                    while (container && !controls.length) {
+                        controls.push(
+                            ...[
+                                '[role="switch"]',
+                                'input[type="checkbox"]',
+                                '.douyin-music-switch',
+                                '.semi-switch',
+                                'button',
+                            ].flatMap(selector => Array.from(container.querySelectorAll(selector)))
+                        );
+                        container = container.parentElement;
+                    }
+                    const control = controls.find(node => node.offsetParent) || controls[0];
+                    if (!control) return false;
+                    control.setAttribute('data-miaoxiang-revenue-switch', '1');
+                    return true;
+                }"""
+            )
+        )
+
+    async def _commercial_revenue_share_enabled(self) -> bool:
+        return bool(
+            await self.page.evaluate(
+                """() => {
+                    const control = document.querySelector('[data-miaoxiang-revenue-switch="1"]');
+                    if (!control) return false;
+                    if (control instanceof HTMLInputElement) return control.checked;
+                    const stateNode = control.closest(
+                        '[aria-checked], [aria-selected], [class*="checked"], [class*="selected"], [class*="active"]'
+                    );
+                    if (!stateNode) return false;
+                    const checked = stateNode.getAttribute('aria-checked');
+                    const selected = stateNode.getAttribute('aria-selected');
+                    if (checked !== null) return checked === 'true';
+                    if (selected !== null) return selected === 'true';
+                    return /checked|selected|active/i.test(String(stateNode.className));
+                }"""
+            )
+        )
+
+    async def _enable_commercial_revenue_share(self) -> None:
+        if not await self._mark_commercial_revenue_switch():
+            path = await self._screenshot("upload-commercial-revenue-switch-missing")
+            raise BrowserFlowError(f"未找到批量开启商用收益分成开关；截图: {path}")
+        if await self._commercial_revenue_share_enabled():
+            return
+
+        switch = self.page.locator('[data-miaoxiang-revenue-switch="1"]').first
+        await trusted_click(self.page, switch, "打开批量开启商用收益分成")
+        for _ in range(10):
+            await self.page.wait_for_timeout(500)
+            if await self._commercial_revenue_share_enabled():
+                return
+
+        path = await self._screenshot("upload-commercial-revenue-switch-failed")
+        raise BrowserFlowError(f"批量开启商用收益分成打开失败；截图: {path}")
+
     async def _fill_authorization(
         self,
         real_name: str,
         expected_songs: int | None = None,
     ) -> None:
+        await self._select_upload_contract_mode()
+        await self._enable_commercial_revenue_share()
+
         if real_name.strip():
             await self.page.evaluate(
                 """(realName) => {
@@ -1692,6 +1992,46 @@ class PageFlow:
             await self.page.wait_for_timeout(800)
         path = await self._screenshot("upload-link-switch-failed")
         raise BrowserFlowError(f"切换无主页链接次数异常；截图: {path}")
+
+    async def _authorization_progressed(self) -> bool:
+        if await self._find_sign_frame() is not None:
+            return True
+        try:
+            body = await self.page.inner_text("body")
+        except Exception:
+            return False
+        return any(marker in body for marker in ("协议签署", "电子签", "电子牵"))
+
+    async def _click_authorization_next(self) -> None:
+        button = self.page.locator("button:visible").filter(
+            has_text=re.compile(r"^\s*下一步\s*$")
+        ).first
+        last_error: Exception | None = None
+        try:
+            # This navigation can replace the page while Playwright is still
+            # waiting for the post-click state. Do not wait for that state here;
+            # the signing iframe has its own long readiness check below.
+            await button.click(timeout=5000, no_wait_after=True)
+            return
+        except Exception as error:
+            last_error = error
+
+        # A successful click may already be navigating while Playwright raises.
+        for _ in range(10):
+            if await self._authorization_progressed():
+                return
+            await self.page.wait_for_timeout(500)
+
+        try:
+            await button.evaluate("(element) => element.click()")
+            for _ in range(30):
+                if await self._authorization_progressed():
+                    return
+                await self.page.wait_for_timeout(500)
+        except Exception as error:
+            last_error = error
+
+        raise BrowserFlowError(f"点击失败: 授权下一步: {last_error}")
 
     async def _sign_frame_ready(self, frame: Any) -> bool:
         try:
@@ -1830,7 +2170,7 @@ class PageFlow:
             await publish_full.click(timeout=10000)
             await self.page.wait_for_timeout(5000)
 
-            await self._configure_upload_ai_tools(
+            await self._select_upload_ai_created(
                 ai_created=bool(items[0].get("ai_created", True)),
             )
             for index, item in enumerate(items):
@@ -1853,12 +2193,12 @@ class PageFlow:
             await self._fill_upload_control(album_name, active_items[0]["title"])
 
             on_step("wait_uploads", len(active_items))
-            await self._wait_upload_audio_ready()
+            await self._wait_upload_audio_ready(expected_songs=len(active_items))
             await self._use_smart_cover(
                 active_items[0]["cover_prompt"],
                 active_items[0].get("cover_path"),
             )
-            await self._wait_upload_audio_ready()
+            await self._wait_upload_audio_ready(expected_songs=len(active_items))
 
             removed_items = await self._remove_noncompliant_upload_songs()
             if removed_items:
@@ -1871,6 +2211,7 @@ class PageFlow:
             active_items = [item for item in items if item["title"] in remaining_titles]
             if not active_items:
                 return []
+            await self._wait_upload_audio_ready(expected_songs=len(active_items))
 
             if await album_name.input_value() != active_items[0]["title"]:
                 await self._fill_upload_control(
@@ -1893,12 +2234,7 @@ class PageFlow:
                 items[0]["real_name"],
                 expected_songs=len(active_items),
             )
-            authorization_next = self.page.locator("button:visible").filter(
-                has_text=re.compile(r"^\s*下一步\s*$")
-            ).first
-            await trusted_click(
-                self.page, authorization_next, "授权下一步"
-            )
+            await self._click_authorization_next()
             await self.page.wait_for_timeout(2000)
             await self._submit_sign_verification(on_verification_requested)
             on_step("done", len(items))
@@ -2268,7 +2604,9 @@ class PageFlow:
                         const loading = !title || /生成中|loading|skeleton|placeholder/i.test(markerText);
                         return {
                             index,
-                            asset_id: assetIdStore.get(card) || '',
+                            asset_id: card.dataset.libraryMaterialId
+                                || assetIdStore.get(card)
+                                || '',
                             title,
                             source_tag: sourceTag,
                             exported: sourceTag.includes('编辑器导出'),
@@ -2419,7 +2757,12 @@ class PageFlow:
             completed = [state for state in new_states if not state.get("loading")]
             has_loading = any(state.get("loading") for state in new_states)
             last_completed = [
-                {"title": state.get("title", ""), "index": state.get("index", 0), "loading": False}
+                {
+                    "title": state.get("title", ""),
+                    "index": state.get("index", 0),
+                    "asset_id": state.get("asset_id", ""),
+                    "loading": False,
+                }
                 for state in completed
             ]
 
@@ -2521,6 +2864,7 @@ class PageFlow:
                     song_name=best_lyric.song_name,
                     generated_title=title,
                     card_index=card_index,
+                    asset_id=str(generated.get("asset_id") or "") or None,
                 )
             )
         return matches
@@ -2543,16 +2887,22 @@ class PageFlow:
                 song_name=lyric_data.song_name,
                 generated_title=str(state.get("title") or ""),
                 card_index=card_index,
+                asset_id=str(state.get("asset_id") or "") or None,
             )
         return None
 
     async def generate(self) -> None:
         try:
+            await self._ensure_no_generation_limit()
             button = self.page.locator("button").filter(
                 has_text=re.compile("生成歌曲|生成")
             ).first
             await trusted_click(self.page, button, "生成歌曲")
-            await self.page.wait_for_timeout(10000)
+            # Platform quota toasts can disappear before the later HTML check.
+            # Poll while the toast is still visible so the whole run stops at once.
+            for _ in range(20):
+                await self.page.wait_for_timeout(500)
+                await self._ensure_no_generation_limit()
         except GenerationLimitError:
             raise
         except Exception as error:
@@ -2561,6 +2911,7 @@ class PageFlow:
     async def check_generation_limit(self) -> None:
         try:
             for _ in range(10):
+                await self._ensure_no_generation_limit()
                 html = await self.page.content()
                 if "上限" in html or "已达上限" in html or ("次数" in html and "用完" in html):
                     await self._screenshot("generation-limit")
@@ -2590,15 +2941,27 @@ class PageFlow:
             f"等待生成超时：{self.settings.generation_timeout_seconds} 秒；生成前={before_title!r}, 最后={last_title!r}"
         )
 
-    async def enter_editor(self, song_name: str) -> None:
+    async def enter_editor(
+        self,
+        song_name: str,
+        *,
+        asset_id: str | None = None,
+    ) -> None:
         try:
+            await self._ensure_editor_project_capacity()
             source_page = self.page
             context = getattr(source_page, "context", None)
             card = None
             last_error: Exception | None = None
             for attempt in range(3):
                 try:
-                    card = await self._visible_asset_card(song_name)
+                    if asset_id:
+                        card = await self._visible_asset_card(
+                            song_name,
+                            asset_id=asset_id,
+                        )
+                    else:
+                        card = await self._visible_asset_card(song_name)
                     if card is None:
                         raise BrowserFlowError(f"资产列表中未找到可见卡片: {song_name}")
                     await card.scroll_into_view_if_needed(timeout=3000)
@@ -2610,30 +2973,22 @@ class PageFlow:
                     await self.page.wait_for_timeout(1000)
             if card is None:
                 raise last_error or BrowserFlowError(f"资产列表中未找到可见卡片: {song_name}")
-            await self.page.wait_for_timeout(2000)
-            edit = card.locator("button").filter(has_text="编辑").first
-            await trusted_click(self.page, edit, "歌曲编辑按钮")
-            await self.page.wait_for_timeout(3000)
-            editor_item = None
-            if hasattr(self.page, "locator"):
-                dropdown = self.page.locator(
-                    '[class*="aiEditDropdown"]:visible'
-                ).last
-                try:
-                    await dropdown.wait_for(state="visible", timeout=5000)
-                except Exception:
-                    dropdown = None
-                if dropdown is not None:
-                    menu_items = dropdown.locator(
-                        '[class*="aiEditMenuItem"]'
-                    ).filter(has_text=re.compile(r"^\s*编辑器\s*$"))
-                    if await menu_items.count():
-                        editor_item = menu_items.first
-            if editor_item is None:
-                # Keep compatibility with older page shells and focused tests.
-                editor_item = self.page.get_by_text("编辑器", exact=True).last
+            await self.page.wait_for_timeout(1000)
+            edit_button = card.locator("button").filter(
+                has_text=re.compile(r"^\s*编辑\s*$")
+            ).first
+            await trusted_click(self.page, edit_button, "歌曲编辑按钮")
+            await self.page.wait_for_timeout(500)
+            editor_item = self.page.locator(
+                '[class*="aiEditMenuItem"]'
+            ).filter(
+                has_text=re.compile(r"^\s*编辑器(?:\s*[>›»])?\s*$")
+            ).last
             await trusted_click(self.page, editor_item, "编辑器菜单")
-            deadline = datetime.now().timestamp() + 30
+            deadline = datetime.now().timestamp() + max(
+                60,
+                self.settings.page_load_timeout_seconds,
+            )
             editor_page = await self._wait_for_editor_page(
                 context,
                 source_page,
@@ -2655,6 +3010,107 @@ class PageFlow:
             raise
         except Exception as error:
             await self._raise_with_screenshot("进入编辑器", error)
+
+    async def _ensure_editor_project_capacity(self) -> None:
+        """Keep below the editor's hidden project-draft reserve.
+
+        The web shell blocks opening the editor when UsedCount reaches
+        MaxCount - 20 even though can-create still returns CanCreate=true.
+        Empty, uncollected drafts are safe to remove one at a time; the asset
+        songs and uploaded works are stored separately from these projects.
+        """
+        result = await self.page.evaluate(
+            """async () => {
+                const reserve = 20;
+                const readJson = async (response, action) => {
+                    if (!response.ok) {
+                        throw new Error(`${action} HTTP ${response.status}`);
+                    }
+                    const payload = await response.json();
+                    const errorCode = payload?.baseResp?.errorCode;
+                    if (errorCode !== 0) {
+                        throw new Error(
+                            `${action} ${errorCode}: ${payload?.baseResp?.errorMsg || ''}`
+                        );
+                    }
+                    return payload;
+                };
+
+                const canPayload = await readJson(
+                    await fetch('/studio_api/can-create?CanCreateType=1', {
+                        credentials: 'include',
+                    }),
+                    '读取编辑器额度',
+                );
+                const capacity = canPayload?.data || {};
+                const maxCount = Number(capacity.MaxCount || 0);
+                const usedCount = Number(capacity.UsedCount || 0);
+                if (!maxCount || usedCount < maxCount - reserve) {
+                    return {cleanup_needed: false, max_count: maxCount, used_count: usedCount};
+                }
+
+                const listPayload = await readJson(
+                    await fetch(
+                        '/studio_api/project/list?CurrentPage=1&PageSize=500',
+                        {credentials: 'include'},
+                    ),
+                    '读取编辑器草稿',
+                );
+                const projects = listPayload?.data?.Projects || [];
+                const candidates = projects
+                    .filter(project => {
+                        const drafts = project.Drafts || [];
+                        return (
+                            !project.IsCollected
+                            && project.ProjectName === '新项目'
+                            && drafts.length > 0
+                            && drafts.every(draft => !String(draft?.Title || '').trim())
+                        );
+                    })
+                    .sort((first, second) => Number(first.UpdateTime || 0) - Number(second.UpdateTime || 0));
+                const target = candidates[0];
+                if (!target?.ProjectID) {
+                    return {
+                        error: '没有可清理的空编辑器草稿',
+                        max_count: maxCount,
+                        used_count: usedCount,
+                    };
+                }
+
+                await readJson(
+                    await fetch('/studio_api/project/delete', {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ProjectIDs: [target.ProjectID]}),
+                    }),
+                    '清理编辑器草稿',
+                );
+                const afterPayload = await readJson(
+                    await fetch('/studio_api/can-create?CanCreateType=1', {
+                        credentials: 'include',
+                    }),
+                    '复查编辑器额度',
+                );
+                const after = afterPayload?.data || {};
+                const afterUsed = Number(after.UsedCount || 0);
+                return {
+                    cleanup_needed: true,
+                    deleted_project_id: String(target.ProjectID),
+                    max_count: maxCount,
+                    used_count: usedCount,
+                    used_count_after: afterUsed,
+                    enough: afterUsed < maxCount - reserve,
+                };
+            }"""
+        )
+        if not isinstance(result, dict) or result.get("error"):
+            message = str(result.get("error") if isinstance(result, dict) else result)
+            path = await self._screenshot("editor-project-capacity-error")
+            raise BrowserFlowError(f"编辑器草稿额度检查失败: {message}；截图: {path}")
+        if result.get("cleanup_needed") and not result.get("enough"):
+            path = await self._screenshot("editor-project-capacity-still-full")
+            raise BrowserFlowError(f"清理编辑器草稿后额度仍不足: {result}；截图: {path}")
 
     async def _page_is_closed(self, page: Any) -> bool:
         checker = getattr(page, "is_closed", None)
@@ -2766,7 +3222,20 @@ class PageFlow:
             f"等待歌曲 {song_name!r}"
         )
 
-    async def _visible_asset_card(self, song_name: str) -> Any | None:
+    async def _visible_asset_card(
+        self,
+        song_name: str,
+        *,
+        asset_id: str | None = None,
+    ) -> Any | None:
+        if asset_id and re.fullmatch(r"[A-Za-z0-9_.:-]+", asset_id):
+            cards = self.page.locator(
+                f'[data-library-material-id="{asset_id}"]'
+            )
+            for index in range(await cards.count()):
+                card = cards.nth(index)
+                if await card.is_visible():
+                    return card
         card_sets = (
             self.page.locator(
                 '[class*="libraryItemWrapper"], [class*="generatedSongListItem"]'
@@ -2808,6 +3277,44 @@ class PageFlow:
         if "无法根据描述生成" in body:
             return "无法根据描述生成，请修改"
         return None
+
+    async def _visible_generation_limit(self) -> str | None:
+        chunks: list[str] = []
+        selectors = (
+            ".semi-notification-notice-title",
+            ".semi-notification-notice-content",
+            ".douyin-music-modal-content",
+            ".ant-message",
+            ".semi-toast",
+        )
+        for selector in selectors:
+            try:
+                notices = self.page.locator(selector).filter(visible=True)
+                count = await notices.count()
+                chunks.extend(
+                    (await notices.nth(index).inner_text()).strip()
+                    for index in range(count)
+                )
+            except Exception:
+                continue
+        try:
+            chunks.append(await self.page.inner_text("body"))
+        except Exception:
+            pass
+
+        for chunk in chunks:
+            for line in chunk.splitlines():
+                text = line.strip()
+                if text and _GENERATION_LIMIT_TEXT_RE.search(text):
+                    return text[:200]
+        return None
+
+    async def _ensure_no_generation_limit(self) -> None:
+        message = await self._visible_generation_limit()
+        if not message:
+            return
+        path = await self._screenshot("generation-limit")
+        raise GenerationLimitError(f"平台提示生成上限：{message}；截图: {path}")
 
     async def _ensure_no_generation_failure(self) -> None:
         message = await self._visible_generation_failure()
@@ -2851,7 +3358,10 @@ class PageFlow:
                 await self.ensure_create_page_ready()
 
             await self._ensure_no_generation_failure()
-            await self.enter_editor(candidate.generated_title)
+            await self.enter_editor(
+                candidate.generated_title,
+                asset_id=candidate.asset_id,
+            )
             await self.export_song(lyric_data.song_name)
             downloaded = await self.download_song(
                 lyric_data.song_name,
@@ -2908,6 +3418,7 @@ class PageFlow:
                     song_name=song_name,
                     generated_title=str(state.get("title") or ""),
                     card_index=card_index,
+                    asset_id=str(state.get("asset_id") or "") or None,
                 )
                 lyric_data = LyricData(
                     song_name=song_name,
@@ -3014,30 +3525,63 @@ class PageFlow:
         lyrics: str | None = None,
     ) -> Path:
         try:
-            download_item = await open_download_menu(self.page, song_name, lyrics)
-            async with self.page.expect_download(
-                timeout=self.settings.download_timeout_seconds * 1000
-            ) as download_info:
-                # The menu closes as soon as a synthetic mouse click moves
-                # across it in some Chromium versions. A DOM click keeps the
-                # expected browser download tied to the real menu item.
-                await dom_click(download_item, "下载菜单")
-            download = await download_info.value
-            suggested = download.suggested_filename or f"{song_name}.mp3"
-            target = Path(self.account.download_dir, datetime.now().strftime("%Y-%m-%d")) / suggested
-            target.parent.mkdir(parents=True, exist_ok=True)
-            await download.save_as(target)
-            if not target.is_file() or target.stat().st_size == 0:
+            # A persistent CDP browser can keep its own default download folder
+            # while handing Playwright a zero-byte artifact. Recover the real
+            # file before treating the platform download as failed.
+            last_empty_error: BrowserFlowError | None = None
+            for attempt in range(3):
+                attempt_started = datetime.now().timestamp()
+                download_item = await open_download_menu(
+                    self.page,
+                    song_name,
+                    lyrics,
+                    export_settle_seconds=60,
+                )
+                async with self.page.expect_download(
+                    timeout=self.settings.download_timeout_seconds * 1000
+                ) as download_info:
+                    # The menu closes as soon as a synthetic mouse click moves
+                    # across it in some Chromium versions. A DOM click keeps the
+                    # expected browser download tied to the real menu item.
+                    await dom_click(download_item, "下载菜单")
+                download = await download_info.value
+                suggested = download.suggested_filename or f"{song_name}.mp3"
+                target = (
+                    Path(self.account.download_dir, datetime.now().strftime("%Y-%m-%d"))
+                    / suggested
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                save_error: Exception | None = None
+                try:
+                    await download.save_as(target)
+                except Exception as error:
+                    save_error = error
+                if target.is_file() and target.stat().st_size > 0:
+                    return target
+
+                recovered = await self._recover_browser_download(
+                    suggested,
+                    target,
+                    attempt_started,
+                )
+                if recovered is not None:
+                    return recovered
+
                 failure = await download.failure()
                 try:
                     target.unlink()
                 except OSError:
                     pass
-                raise BrowserFlowError(
+                last_empty_error = BrowserFlowError(
                     f"下载文件为空: {target}"
                     + (f"; Chrome: {failure}" if failure else "")
+                    + (f"; Playwright: {save_error}" if save_error else "")
+                    + f"; Chrome 下载目录: {', '.join(str(path) for path in _chrome_download_roots(self.account))}"
+                    + f"; 已尝试 {attempt + 1}/3"
                 )
-            return target
+                if attempt < 2:
+                    await self.page.wait_for_timeout(3000)
+            raise last_empty_error or BrowserFlowError(f"下载文件为空: {song_name}")
         except GenerationLimitError:
             raise
         except SongDownloadError:
@@ -3048,6 +3592,45 @@ class PageFlow:
                 error,
                 error_type=SongDownloadError,
             )
+
+    async def _recover_browser_download(
+        self,
+        suggested: str,
+        target: Path,
+        started_at: float,
+    ) -> Path | None:
+        deadline = datetime.now().timestamp() + 10
+        while datetime.now().timestamp() <= deadline:
+            for root in _chrome_download_roots(self.account):
+                try:
+                    paths = list(root.iterdir())
+                except OSError:
+                    continue
+                candidates = [
+                    path
+                    for path in paths
+                    if path.is_file()
+                    and _matches_suggested_download(path, suggested)
+                    and path.stat().st_size > 0
+                    and path.stat().st_mtime >= started_at - 2
+                ]
+                if not candidates:
+                    continue
+                source = max(candidates, key=lambda path: path.stat().st_mtime)
+                temporary = target.with_name(
+                    f".{target.stem}.{datetime.now().strftime('%Y%m%d%H%M%S%f')}.tmp"
+                )
+                try:
+                    shutil.copy2(source, temporary)
+                    if temporary.is_file() and temporary.stat().st_size > 0:
+                        target.unlink(missing_ok=True)
+                        os.replace(temporary, target)
+                        if target.is_file() and target.stat().st_size > 0:
+                            return target
+                finally:
+                    temporary.unlink(missing_ok=True)
+            await self.page.wait_for_timeout(500)
+        return None
 
     async def _screenshot(self, step: str) -> Path | None:
         try:

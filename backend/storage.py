@@ -209,7 +209,9 @@ class MonitoringRepository:
         *,
         account_id: str | None = None,
     ) -> list[dict]:
-        records: list[dict] = []
+        # Snapshots are an audit trail. The table view exposes one row per
+        # account/date, with the latest successful collection winning.
+        records_by_key: dict[tuple[str, str], dict] = {}
         for snapshot in self.list_snapshots(account_id=account_id):
             if snapshot.status != "completed":
                 continue
@@ -222,7 +224,8 @@ class MonitoringRepository:
                         snapshot_record.date for snapshot_record in snapshot.records
                     ),
                 })
-                records.append(item)
+                records_by_key.setdefault((item["account_id"], item["date"]), item)
+        records = list(records_by_key.values())
         records.sort(
             key=lambda item: (
                 item["collected_at"],

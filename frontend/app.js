@@ -8,6 +8,7 @@ const state = {
   uploadSelectionTouched: false,
   uploadSelectionAccountId: "",
   uploadAiCreated: true,
+  uploadContractSavingIds: new Set(),
   autoReplaceNoncompliant: true,
   pipelineRun: null,
   pipelineSyncedSignature: "",
@@ -22,6 +23,7 @@ const state = {
   latestLyricQueue: null,
   dashboardSongs: {},
   generationRuns: {},
+  uploadRuns: {},
   accountTemplates: {},
   stageUploads: {},
   lyricTemplateAccountLocked: false,
@@ -63,7 +65,22 @@ const state = {
   selectedLyricTemplateId: "",
   monitoringStatistics: null,
   monitoringLoading: false,
+  monitoringSettings: null,
+  monitoringSelectedAccountIds: new Set(),
+  monitoringViewAccountId: "all",
+  monitoringCollection: null,
+  monitoringCollectionLoading: false,
+  monitoringCollectionRequestSeq: 0,
 };
+
+const UPLOAD_CONTRACT_MODE_LABELS = {
+  exclusive_agent: "独家代理发行",
+  exclusive_authorization: "独家授权",
+};
+const UPLOAD_CONTRACT_MODES = [
+  { value: "exclusive_agent", label: "独家代理发行" },
+  { value: "exclusive_authorization", label: "独家授权" },
+];
 
 const THEME_OPTIONS = ["爱情", "友情", "校园", "都市", "治愈", "励志", "古风", "家庭", "旅行", "孤独"];
 const DEFAULT_CREATE_URL = "https://music.douyin.com/studio/create";
@@ -126,6 +143,8 @@ for (const id of [
   "monitoring-caption", "refresh-monitoring", "monitoring-account-count",
   "monitoring-collection-count", "monitoring-success-count", "monitoring-failed-count", "monitoring-table",
   "monitoring-empty", "monitoring-status-list",
+  "collect-monitoring", "stop-monitoring", "monitoring-account-list", "monitoring-account-all",
+  "monitoring-account-clear", "monitoring-view-list",
 ]) {
   elements[id] = document.getElementById(id);
 }
@@ -383,6 +402,15 @@ function renderAccounts() {
   state.selectedTaskAccounts = new Set(
     [...state.selectedTaskAccounts].filter((accountId) => available.has(accountId)),
   );
+  state.monitoringSelectedAccountIds = new Set(
+    [...state.monitoringSelectedAccountIds].filter((accountId) => available.has(accountId)),
+  );
+  if (!state.monitoringSelectedAccountIds.size && state.accountId && available.has(state.accountId)) {
+    state.monitoringSelectedAccountIds.add(state.accountId);
+  }
+  if (state.monitoringViewAccountId !== "all" && !available.has(state.monitoringViewAccountId)) {
+    state.monitoringViewAccountId = "all";
+  }
   renderAccountCards();
   renderAccountEditor();
   renderTaskAccounts();
@@ -423,11 +451,51 @@ function multiStageRunning() {
   return Boolean(state.multiQueue && ["running", "stopping"].includes(state.multiQueue.status));
 }
 
+async function saveUploadContractMode(accountId, mode) {
+  if (!UPLOAD_CONTRACT_MODE_LABELS[mode]) return;
+  const index = state.accounts.findIndex((item) => item.id === accountId);
+  if (index < 0) return;
+  const account = state.accounts[index];
+  if (account.upload_contract_mode === mode) return;
+
+  const previousAccount = account;
+  state.uploadContractSavingIds.add(accountId);
+  state.accounts[index] = { ...account, upload_contract_mode: mode };
+  renderTaskAccounts();
+
+  try {
+    const updated = await api(`/api/accounts/${accountId}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        ...state.accounts[index],
+        upload_contract_mode: mode,
+      }),
+    });
+    state.accounts = state.accounts.map((item) => item.id === updated.id ? updated : item);
+    if (state.editingAccountId === updated.id) fillAccountForm(updated);
+    const uploadState = state.stageUploads[updated.id];
+    if (uploadState) {
+      state.stageUploads[updated.id] = {
+        ...uploadState,
+        contract_mode: updated.upload_contract_mode,
+        contract_mode_name: UPLOAD_CONTRACT_MODE_LABELS[updated.upload_contract_mode],
+      };
+    }
+    toast(`${updated.account_name} 签约模式已保存：${UPLOAD_CONTRACT_MODE_LABELS[mode]}`);
+  } catch (error) {
+    state.accounts[state.accounts.findIndex((item) => item.id === accountId)] = previousAccount;
+    toast(error.message, true);
+  } finally {
+    state.uploadContractSavingIds.delete(accountId);
+    renderTaskAccounts();
+  }
+}
+
 function renderTaskAccounts() {
   const stageMeta = {
     lyrics: { title: "AI 作词", caption: "全部账号 · 并联执行" },
-    generation: { title: "生成下载", caption: "全部账号 · 串联执行" },
-    upload: { title: "上传发布", caption: "全部账号 · 串联执行" },
+    generation: { title: "生成下载", caption: "全部账号 · 最多 2 个并联执行" },
+    upload: { title: "上传发布", caption: "全部账号 · 最多 2 个并联执行" },
     pipeline: { title: "完整流水线", caption: "全部账号 · 按队列串联" },
   }[state.stage] || { title: "任务", caption: "全部账号" };
   elements["workflow-title"].textContent = stageMeta.title;
@@ -455,7 +523,7 @@ function renderTaskAccounts() {
   const columns = {
     lyrics: ["选择", "账号", "状态", "歌词", "模板 / 提示词", "位置", "操作"],
     generation: ["选择", "账号", "状态", "进度", "模型 / 人声", "当前步骤", "操作"],
-    upload: ["选择", "账号", "状态", "额度", "发布配置", "当前步骤", "操作"],
+    upload: ["选择", "账号", "状态", "额度", "签约模式", "当前步骤", "操作"],
     pipeline: ["选择", "账号", "状态", "总进度", "队列配置", "当前阶段", "操作"],
   }[state.stage] || ["选择", "账号", "状态", "进度", "配置", "步骤", "操作"];
   const head = document.createElement("div");
@@ -504,6 +572,7 @@ function renderTaskAccounts() {
     const successCount = songs.filter((song) => successfulSongStatus(song.status)).length;
     const failureCount = songs.filter((song) => isFailureStatus(song.status)).length;
     const upload = state.stageUploads[account.id];
+    const uploadRun = state.uploadRuns[account.id];
     const templates = state.accountTemplates[account.id] || [];
     const template = templates.find((item) => item.id === state.selectedLyricTemplateId && item.account_id === account.id) || templates[0];
     const queueActive = Boolean(state.multiQueue && state.multiQueue.day === todayValue() && (
@@ -578,9 +647,12 @@ function renderTaskAccounts() {
         ? stepLabel(runningSong.current_step)
         : failedSong ? stateLabel(failedSong.status) : successCount === songs.length && songs.length ? "完成" : "等待";
     } else if (state.stage === "upload") {
-      configText = `艺人：${account.upload_artist_name || "-"}`;
-      configSub = `AI 创作${state.uploadAiCreated ? "是" : "否"} · 上限 ${account.upload_batch_size}`;
-      stepText = upload ? `待发布 ${upload.files?.length || 0} 首` : "-";
+      configSub = `艺人：${account.upload_artist_name || "-"} · AI 创作${
+        state.uploadAiCreated ? "是" : "否"
+      } · 上限 ${account.upload_batch_size}`;
+      stepText = uploadRun
+        ? (runningStatuses().has(uploadRun.status) ? stepLabel(uploadRun.step) : stateLabel(uploadRun.status))
+        : upload ? `待发布 ${upload.files?.length || 0} 首` : "-";
     } else if (state.stage === "pipeline") {
       configText = template?.name || "未设置模板";
       configSub = `AI 创作${elements["pipeline-ai-created"].value === "yes" ? "是" : "否"}`;
@@ -589,9 +661,37 @@ function renderTaskAccounts() {
 
     const configCell = document.createElement("span");
     configCell.className = "stage-account-config";
-    configCell.innerHTML = "<strong></strong><small></small>";
-    configCell.querySelector("strong").textContent = configText;
-    configCell.querySelector("small").textContent = configSub;
+    if (state.stage === "upload") {
+      const contractField = document.createElement("label");
+      contractField.className = "upload-contract-field";
+      contractField.dataset.tip = "保存到账号配置；后续上传发布默认使用该模式。";
+
+      const contractTitle = document.createElement("span");
+      contractTitle.textContent = "签约模式";
+
+      const contractSelect = document.createElement("select");
+      contractSelect.disabled = busy || state.uploadContractSavingIds.has(account.id);
+      contractSelect.dataset.contractAccount = account.id;
+      contractSelect.setAttribute("aria-label", `${account.account_name} 签约模式`);
+      for (const mode of UPLOAD_CONTRACT_MODES) {
+        contractSelect.append(new Option(mode.label, mode.value));
+      }
+      contractSelect.value = account.upload_contract_mode || "exclusive_authorization";
+
+      contractField.append(contractTitle, contractSelect);
+      configCell.append(contractField);
+
+      const configMeta = document.createElement("small");
+      configMeta.className = "stage-account-config-meta";
+      configMeta.textContent = configSub;
+      configCell.append(configMeta);
+    } else {
+      configCell.innerHTML = "<strong></strong>";
+      configCell.querySelector("strong").textContent = configText;
+      const configMeta = document.createElement("small");
+      configMeta.textContent = configSub;
+      configCell.append(configMeta);
+    }
     configCell.title = configSub;
 
     const stepCell = document.createElement("span");
@@ -1510,6 +1610,7 @@ function fillAccountForm(account = null, suggestedPort = null) {
     upload_batch_size: 10,
     upload_artist_name: "",
     upload_real_name: "",
+    upload_contract_mode: "exclusive_authorization",
     song_interval_seconds: 5,
   };
   state.accountRoot = account ? inferAccountRoot(account) : "";
@@ -1517,6 +1618,7 @@ function fillAccountForm(account = null, suggestedPort = null) {
   for (const [key, value] of Object.entries(values)) {
     if (form.elements[key]) form.elements[key].value = value;
   }
+  form.elements.upload_contract_mode.value = values.upload_contract_mode || "exclusive_authorization";
   elements["account-root-input"].value = state.accountRoot;
   state.formMode = account ? "edit" : "create";
   renderAccountDirectoryMode();
@@ -1537,6 +1639,7 @@ function accountPayload() {
     upload_batch_size: Number(form.upload_batch_size.value),
     upload_artist_name: form.upload_artist_name.value.trim(),
     upload_real_name: form.upload_real_name.value.trim(),
+    upload_contract_mode: form.upload_contract_mode.value,
     song_interval_seconds: Number(form.song_interval_seconds.value),
     create_url: DEFAULT_CREATE_URL,
     assets_url: "https://music.douyin.com/studio/assets",
@@ -2109,6 +2212,11 @@ function renderLyricSource() {
 
 function uploadRunning() {
   return Boolean(state.uploadRun && ["running", "paused", "stopping"].includes(state.uploadRun.status));
+}
+
+function rememberUploadRun(run) {
+  if (!run?.account_id) return;
+  state.uploadRuns[run.account_id] = run;
 }
 
 function renderUploadRun() {
@@ -2716,13 +2824,19 @@ function formatMonitoringDate(value) {
 function formatMonitoringDateTime(value) {
   const raw = String(value || "");
   const match = raw.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
-  return match ? `${formatMonitoringDate(match[1])} ${match[2]}` : raw || "-";
+  if (!match) return raw || "-";
+  const [, iso_date, clock] = match;
+  const [, month, day] = iso_date.split("-");
+  return month && day ? `${month}/${day} ${clock}` : `${formatMonitoringDate(iso_date)} ${clock}`;
 }
 
 function renderMonitoring() {
   const payload = state.monitoringStatistics;
   const accounts = payload?.accounts || [];
-  const records = payload?.records || [];
+  const allRecords = payload?.records || [];
+  const records = state.monitoringViewAccountId === "all"
+    ? allRecords
+    : allRecords.filter((record) => record.account_id === state.monitoringViewAccountId);
   const snapshots = payload?.snapshots || [];
   const accountIds = new Set(snapshots.map((snapshot) => snapshot.account_id).filter(Boolean));
   const completed = snapshots.filter((snapshot) => snapshot.status === "completed").length;
@@ -2732,11 +2846,65 @@ function renderMonitoring() {
     ? `${formatMonitoringDate([...dates].sort().at(0))} - ${formatMonitoringDate([...dates].sort().at(-1))}`
     : "-";
 
-  elements["monitoring-caption"].textContent = `近 ${payload?.days || 7} 天 · 数据截止 ${range} · ${accountIds.size} 个账号 · ${snapshots.length} 次采集`;
+  const collection = state.monitoringCollection;
+  const collectionRunning = Boolean(collection && ["running", "stopping"].includes(collection.status));
+  const collectionText = collectionRunning
+    ? ` · 采集 ${collection.items.filter((item) => item.status === "completed").length}/${collection.items.length}`
+    : "";
+  const viewName = state.monitoringViewAccountId === "all"
+    ? "全部账号"
+    : state.accounts.find((account) => account.id === state.monitoringViewAccountId)?.account_name || "当前账号";
+  const nextAutomatic = state.monitoringSettings?.next_automatic_at
+    ? ` · 下次自动 ${formatMonitoringDateTime(state.monitoringSettings.next_automatic_at)}`
+    : "";
+  elements["monitoring-caption"].textContent = `00/04/08/12/16/20 点自动采集 · 上传后近 7 天采集 · 数据截止 ${range} · ${viewName}${collectionText}${nextAutomatic}`;
   elements["monitoring-account-count"].textContent = String(accounts.length);
   elements["monitoring-collection-count"].textContent = String(snapshots.length);
   elements["monitoring-success-count"].textContent = String(completed);
   elements["monitoring-failed-count"].textContent = String(abnormal);
+  elements["collect-monitoring"].disabled = collectionRunning
+    || state.monitoringCollectionLoading
+    || !state.monitoringSelectedAccountIds.size;
+  elements["stop-monitoring"].hidden = !collectionRunning;
+
+  const accountList = elements["monitoring-account-list"];
+  accountList.innerHTML = "";
+  state.accounts.forEach((account) => {
+    const selected = state.monitoringSelectedAccountIds.has(account.id);
+    const item = document.createElement("label");
+    item.className = `monitoring-account-item${selected ? " is-selected" : ""}`;
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = selected;
+    checkbox.dataset.monitoringAccount = account.id;
+    checkbox.disabled = collectionRunning;
+    const name = document.createElement("span");
+    name.textContent = account.account_name;
+    const port = document.createElement("small");
+    port.textContent = `端口 ${account.chrome_debug_port}`;
+    item.append(checkbox, name, port);
+    accountList.append(item);
+  });
+  if (!state.accounts.length) {
+    const empty = document.createElement("div");
+    empty.className = "monitoring-account-empty";
+    empty.textContent = "暂无账号";
+    accountList.append(empty);
+  }
+
+  const viewList = elements["monitoring-view-list"];
+  viewList.innerHTML = "";
+  [
+    { id: "all", name: "全部" },
+    ...state.accounts.map((account) => ({ id: account.id, name: account.account_name })),
+  ].forEach((view) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `monitoring-view-button${state.monitoringViewAccountId === view.id ? " is-active" : ""}`;
+    button.textContent = view.name;
+    button.dataset.monitoringView = view.id;
+    viewList.append(button);
+  });
 
   const table = elements["monitoring-table"];
   table.querySelectorAll(".monitoring-row:not(.monitoring-head)").forEach((node) => node.remove());
@@ -2745,12 +2913,13 @@ function renderMonitoring() {
     row.className = "monitoring-row";
     const cells = [
       formatMonitoringDateTime(record.collected_at),
-      formatMonitoringDate(record.data_end_date || record.date),
       formatMonitoringDate(record.date),
       record.account_name || "-",
       formatMonitoringValue(record.qishui_heat_index),
       formatMonitoringValue(record.qishui_play_count),
       formatMonitoringValue(record.qishui_paid_user_play_index),
+      formatMonitoringValue(record.qishui_search_play_index),
+      formatMonitoringValue(record.available_balance_yuan),
     ];
     cells.forEach((value) => {
       const cell = document.createElement("span");
@@ -2764,14 +2933,28 @@ function renderMonitoring() {
   const statusList = elements["monitoring-status-list"];
   statusList.innerHTML = "";
   const abnormalSnapshots = snapshots.filter((snapshot) => snapshot.status !== "completed");
-  statusList.hidden = abnormalSnapshots.length === 0;
-  abnormalSnapshots.forEach((snapshot) => {
+  const statusEntries = [
+    ...abnormalSnapshots.map((snapshot) => ({
+      key: `snapshot-${snapshot.snapshot_id}`,
+      label: `${snapshot.account_name} · ${formatMonitoringDateTime(snapshot.collected_at)} · ${snapshot.status === "failed" ? "采集失败" : "未采集"}`,
+      detail: snapshot.error || "",
+    })),
+    ...(collectionRunning ? collection.items
+      .filter((item) => item.status !== "completed")
+      .map((item) => ({
+        key: `collection-${item.item_id}`,
+        label: `${item.account_name} · ${item.status === "running" ? "采集中" : item.status === "stopping" ? "停止中" : "等待采集"}`,
+        detail: item.error || "",
+      })) : []),
+  ];
+  statusList.hidden = statusEntries.length === 0;
+  statusEntries.forEach((entry) => {
     const item = document.createElement("div");
     item.className = "monitoring-status-item";
     const label = document.createElement("strong");
-    label.textContent = `${snapshot.account_name} · ${formatMonitoringDateTime(snapshot.collected_at)} · ${snapshot.status === "failed" ? "采集失败" : "未采集"}`;
+    label.textContent = entry.label;
     const detail = document.createElement("span");
-    detail.textContent = snapshot.error || "";
+    detail.textContent = entry.detail;
     item.append(label, detail);
     statusList.append(item);
   });
@@ -2788,22 +2971,78 @@ async function loadMonitoringStatistics() {
   renderMonitoring();
 }
 
+async function loadMonitoringSettings() {
+  const settings = await api("/api/monitoring/settings");
+  const accountIds = new Set(state.accounts.map((account) => account.id));
+  state.monitoringSettings = settings;
+  state.monitoringSelectedAccountIds = new Set(
+    (settings.account_ids || []).filter((accountId) => accountIds.has(accountId)),
+  );
+  renderMonitoring();
+}
+
+async function saveMonitoringSettings() {
+  const previous = state.monitoringSettings;
+  const accountIds = [...state.monitoringSelectedAccountIds];
+  try {
+    state.monitoringSettings = await api("/api/monitoring/settings", {
+      method: "PUT",
+      body: JSON.stringify({ account_ids: accountIds }),
+    });
+  } catch (error) {
+    state.monitoringSettings = previous;
+    toast(`保存采集账号失败: ${error.message}`, true);
+  }
+  renderMonitoring();
+}
+
+async function loadMonitoringCollection() {
+  if (state.monitoringCollectionLoading) return;
+  const previous = state.monitoringCollection;
+  const requestSeq = state.monitoringCollectionRequestSeq + 1;
+  state.monitoringCollectionRequestSeq = requestSeq;
+  state.monitoringCollectionLoading = true;
+  let next = null;
+  try {
+    next = await api("/api/monitoring/collections/current");
+  } catch (error) {
+    if (requestSeq === state.monitoringCollectionRequestSeq && !previous) {
+      state.monitoringCollection = null;
+    }
+    return;
+  } finally {
+    state.monitoringCollectionLoading = false;
+  }
+  if (requestSeq !== state.monitoringCollectionRequestSeq) return;
+  state.monitoringCollection = next;
+  const wasRunning = Boolean(previous && ["running", "stopping"].includes(previous.status));
+  const isRunning = Boolean(
+    state.monitoringCollection && ["running", "stopping"].includes(state.monitoringCollection.status),
+  );
+  if (wasRunning && !isRunning) {
+    await loadMonitoringStatistics().catch(() => {});
+    const failed = state.monitoringCollection?.items?.filter((item) => item.status === "failed") || [];
+    toast(failed.length ? `采集完成，${failed.length} 个账号失败` : "监控数据采集完成", failed.length > 0);
+  }
+  renderMonitoring();
+}
+
 function selectedTaskAccounts() {
   const selected = state.selectedTaskAccounts;
   return state.accounts.filter((account) => selected.has(account.id));
 }
 
-async function buildGenerationQueueItems() {
+async function buildGenerationQueueItems(accounts) {
   const items = [];
   const skipped = [];
-  for (const account of selectedTaskAccounts()) {
+  for (const account of accounts) {
     const songs = await api(`/api/accounts/${account.id}/songs?day=${encodeURIComponent(todayValue())}`);
     const valid = songs.filter((song) => song.valid);
     const files = account.id === state.accountId && state.selected.size
       ? valid.filter((song) => state.selected.has(song.file_name)).map((song) => song.file_name)
       : valid.map((song) => song.file_name);
     if (!files.length) {
-      skipped.push(account.account_name);
+      skipped.push({ id: account.id, name: account.account_name });
       continue;
     }
     items.push({ account_id: account.id, song_files: files });
@@ -2943,11 +3182,14 @@ function connectSocket() {
       return;
     }
     if (message.type === "upload_status") {
+      rememberUploadRun(message.data);
       if (runMatchesCurrentAccount(message.data)) {
         state.uploadRun = message.data;
         renderUploadRun();
         renderTaskStatus();
         syncPipelineAfterSingleStage(state.uploadRun);
+      } else {
+        renderTaskAccounts();
       }
     }
     if (message.type === "pipeline_status") {
@@ -3075,8 +3317,14 @@ document.addEventListener("DOMContentLoaded", async () => {
   renderView();
   await Promise.allSettled([loadHealth(), loadSettings()]);
   await loadAccounts();
+  await loadMonitoringSettings().catch(() => {});
   await loadLoginBrowser();
-  await Promise.allSettled([loadMultiStage(), loadStageAccountData(), loadMonitoringStatistics()]);
+  await Promise.allSettled([
+    loadMultiStage(),
+    loadStageAccountData(),
+    loadMonitoringStatistics(),
+    loadMonitoringCollection(),
+  ]);
   const recent = await api("/api/logs/recent").catch(() => []);
   for (const event of recent) if (event.type === "log") appendLog(event.data);
   connectSocket();
@@ -3088,6 +3336,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setInterval(loadUploadRun, 5000);
   setInterval(loadMultiStage, 5000);
   setInterval(loadMonitoringStatistics, 10000);
+  setInterval(loadMonitoringCollection, state.monitoringCollection ? 1000 : 2000);
   setInterval(loadPipelineRun, 5000);
   setInterval(loadPipelineQueue, 5000);
   window.appReady = true;
@@ -3172,7 +3421,18 @@ function bindEvents() {
     elements["account-select"].dispatchEvent(new Event("change", { bubbles: true }));
   });
 
-  elements["stage-account-table"].addEventListener("change", (event) => {
+  elements["stage-account-table"].addEventListener("change", async (event) => {
+    const contractInput = event.target.closest("[data-contract-account]");
+    if (contractInput) {
+      if (!contractInput.disabled) {
+        await saveUploadContractMode(
+          contractInput.dataset.contractAccount,
+          contractInput.value,
+        );
+      }
+      return;
+    }
+
     const checkbox = event.target.closest("[data-task-account]");
     if (!checkbox || checkbox.disabled) return;
     if (checkbox.checked) state.selectedTaskAccounts.add(checkbox.dataset.taskAccount);
@@ -3185,6 +3445,23 @@ function bindEvents() {
   });
 
   elements["stage-account-table"].addEventListener("click", async (event) => {
+    const row = event.target.closest("[data-stage-account]");
+    const control = event.target.closest("button, input, select, textarea, a");
+    if (row && !control && !multiStageRunning() && !isRunning() && !uploadRunning() && !pipelineWorkflowBusy()) {
+      const accountId = row.dataset.stageAccount;
+      if (state.selectedTaskAccounts.has(accountId)) {
+        state.selectedTaskAccounts.delete(accountId);
+      } else {
+        state.selectedTaskAccounts.add(accountId);
+      }
+      if (!pipelineWorkflowBusy()) {
+        state.selectedPipelineQueueAccounts = new Set(state.selectedTaskAccounts);
+      }
+      renderTaskAccounts();
+      renderControls();
+      return;
+    }
+
     const editButton = event.target.closest("[data-edit-stage-account]");
     const focusButton = event.target.closest("[data-focus-account]");
     if (editButton && !editButton.disabled) {
@@ -3676,7 +3953,61 @@ function bindEvents() {
   elements["refresh-monitoring"].addEventListener("click", async () => {
     try {
       await loadMonitoringStatistics();
+      await loadMonitoringCollection();
       toast("监控数据已刷新");
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+
+  elements["monitoring-account-list"].addEventListener("change", (event) => {
+    const checkbox = event.target.closest("[data-monitoring-account]");
+    if (!checkbox || checkbox.disabled) return;
+    if (checkbox.checked) state.monitoringSelectedAccountIds.add(checkbox.dataset.monitoringAccount);
+    else state.monitoringSelectedAccountIds.delete(checkbox.dataset.monitoringAccount);
+    renderMonitoring();
+    void saveMonitoringSettings();
+  });
+
+  elements["monitoring-account-all"].addEventListener("click", () => {
+    state.monitoringSelectedAccountIds = new Set(state.accounts.map((account) => account.id));
+    renderMonitoring();
+    void saveMonitoringSettings();
+  });
+
+  elements["monitoring-account-clear"].addEventListener("click", () => {
+    state.monitoringSelectedAccountIds.clear();
+    renderMonitoring();
+    void saveMonitoringSettings();
+  });
+
+  elements["monitoring-view-list"].addEventListener("click", (event) => {
+    const button = event.target.closest("[data-monitoring-view]");
+    if (!button) return;
+    state.monitoringViewAccountId = button.dataset.monitoringView;
+    renderMonitoring();
+  });
+
+  elements["collect-monitoring"].addEventListener("click", async () => {
+    if (!state.monitoringSelectedAccountIds.size) return toast("请先勾选采集账号", true);
+    try {
+      state.monitoringCollectionRequestSeq += 1;
+      state.monitoringCollection = await api("/api/monitoring/collections", {
+        method: "POST",
+        body: JSON.stringify({ account_ids: [...state.monitoringSelectedAccountIds] }),
+      });
+      renderMonitoring();
+      toast("已在后台开始采集监控数据");
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+
+  elements["stop-monitoring"].addEventListener("click", async () => {
+    try {
+      state.monitoringCollection = await api("/api/monitoring/collections/stop", { method: "POST" });
+      renderMonitoring();
+      toast("已请求停止监控采集");
     } catch (error) {
       toast(error.message, true);
     }
@@ -4111,12 +4442,21 @@ function fillLyricTemplateForm(template = null) {
     if (!state.selectedTaskAccounts.size) return toast("请先勾选账号", true);
     try {
       const selectedAccounts = selectedTaskAccounts();
-      const { items, skipped } = await buildGenerationQueueItems();
+      const selectedIds = new Set(selectedAccounts.map((account) => account.id));
+      const { items, skipped } = await buildGenerationQueueItems(selectedAccounts);
       if (!items.length) return toast("所选账号都没有可生成歌词", true);
+      const currentSelectedIds = new Set(state.selectedTaskAccounts);
+      if (
+        selectedIds.size !== currentSelectedIds.size
+        || [...selectedIds].some((accountId) => !currentSelectedIds.has(accountId))
+      ) {
+        return toast("账号选择状态发生变化，请重新确认后再开始生成", true);
+      }
+      if (items.length + skipped.length !== selectedAccounts.length) {
+        return toast("账号选择状态发生变化，请重新确认后再开始生成", true);
+      }
       const skippedIds = new Set(
-        selectedAccounts
-          .filter((account) => skipped.includes(account.account_name))
-          .map((account) => account.id),
+        skipped.map((account) => account.id),
       );
       const itemRequests = items.map((item) => {
         const account = state.accounts.find((entry) => entry.id === item.account_id);
@@ -4141,10 +4481,12 @@ function fillLyricTemplateForm(template = null) {
       if (missingAccounts.length) {
         toast(`队列缺少账号：${missingAccounts.map((account) => account.account_name).join("、")}`, true);
       } else if (skipped.length) {
-        toast(`已跳过 ${skipped.join("、")}：今天没有可处理歌词`, true);
+        toast(`已跳过 ${skipped.map((account) => account.name).join("、")}：今天没有可处理歌词`, true);
       } else {
         const queueNames = state.multiQueue.items.map((item) => item.account_name).join(" → ");
-        toast(items.length === 1 ? `生成任务已启动：${queueNames}` : `已按顺序启动 ${items.length} 个账号：${queueNames}`);
+        toast(items.length === 1
+          ? `生成任务已启动：${queueNames}`
+          : `已启动 ${items.length} 个账号，最多 2 个同时执行：${queueNames}`);
       }
       renderTaskAccounts();
       renderTaskStatus();

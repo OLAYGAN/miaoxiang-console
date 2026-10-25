@@ -86,10 +86,16 @@ class MultiStageEngine:
             else:
                 self.current.current_index = 0
                 semaphore = asyncio.Semaphore(self.current.concurrency)
+                next_start_index = 0
+                start_lock = asyncio.Lock()
 
                 async def worker(item: MultiStageItem) -> None:
                     async with semaphore:
                         if not self._stop_requested:
+                            nonlocal next_start_index
+                            async with start_lock:
+                                self.current.current_index = next_start_index
+                                next_start_index += 1
                             await self._run_one(runner, item)
 
                 await asyncio.gather(*(worker(item) for item in self.current.items))

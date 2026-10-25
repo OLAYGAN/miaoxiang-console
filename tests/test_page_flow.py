@@ -5,6 +5,7 @@ import asyncio
 import pytest
 from types import SimpleNamespace
 import re
+from unittest import mock
 
 from backend.errors import (
     BrowserFlowError,
@@ -22,6 +23,7 @@ from backend.page_flow import (
         _lyric_probe,
         _lyrics_match,
         _normalize_generated_detail,
+        _upload_contract_option_pattern,
         archive_download,
         clear_and_type,
         dom_click,
@@ -38,6 +40,66 @@ from backend.page_flow import (
         trusted_click,
         type_segmented,
 )
+
+
+@pytest.mark.asyncio
+async def test_collect_statistics_uses_last_day_and_platform_date(tmp_path: Path) -> None:
+    class StatisticsLocator(FakeLocator):
+        def __init__(self, text: str, page: "StatisticsPage") -> None:
+            super().__init__(text)
+            self.page = page
+
+        async def wait_for(self, **kwargs) -> None:
+            return None
+
+        async def inner_text(self) -> str:
+            return self.page.body_text
+
+    class StatisticsPage(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.body_text = "数据中心 数据更新至2026/10/19 近1天"
+            self.evaluate_calls: list[object] = []
+
+        def get_by_text(self, text: str, exact: bool = False) -> StatisticsLocator:
+            return StatisticsLocator(text, self)
+
+        def locator(self, selector: str) -> StatisticsLocator:
+            assert selector == "body"
+            return StatisticsLocator("", self)
+
+        async def goto(self, url: str, **kwargs) -> None:
+            self.url = url
+            if url == page_flow_module.SETTLEMENT_URL:
+                self.body_text = "我的收入 可用余额 15.01 元"
+
+        async def evaluate(self, script: str, *args: object) -> object:
+            self.evaluate_calls.append(args)
+            period, metric_types = args[0]
+            assert period == 1
+            assert metric_types == "1,2,3,4"
+            return {
+                str(metric): {
+                    "baseResp": {"errorCode": 0},
+                    "data": {"points": [{"date": "20261019", "totalValue": value}]},
+                }
+                for metric, value in [(1, "1394"), (2, "3192"), (3, "4047"), (4, "0")]
+            }
+
+    page = StatisticsPage()
+    flow = PageFlow(
+        page=page,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    records = await flow.collect_statistics(period="last_1_day")
+
+    assert len(records) == 1
+    assert records[0].date == "2026-10-19"
+    assert records[0].qishui_search_play_index == 0
+    assert records[0].available_balance_yuan == 15.01
 
 from .test_task_engine import make_account
 
@@ -144,6 +206,42 @@ class FakeUploadAlbumPage(FakePage):
 
     async def inner_text(self, selector: str = "body") -> str:
         return self.body_text
+
+
+@pytest.mark.asyncio
+async def test_upload_ai_declaration_selects_created_without_platform_tool(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class UploadAIPage(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.selectors: list[str] = []
+
+        def locator(self, selector: str) -> FakeLocator:
+            self.selectors.append(selector)
+            return FakeLocator("是")
+
+    page = UploadAIPage()
+    flow = PageFlow(
+        page=page,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    clicks: list[str] = []
+
+    async def fake_click(page, locator, description, **kwargs):
+        clicks.append(description)
+
+    monkeypatch.setattr(page_flow_module, "trusted_click", fake_click)
+
+    await flow._select_upload_ai_created(ai_created=True)
+
+    assert clicks == ["AI创作声明选择是"]
+    assert page.selectors == [
+        'div[x-field-id="aiTools[isMakeByAITools]"] label.douyin-music-radio',
+    ]
 
 
 class FakeAuthorizationLocator:
@@ -284,6 +382,10 @@ class FakeAuthorizationPage(FakePage):
             self.producer_count = 0
 
 
+async def _noop_authorization_setting() -> None:
+    return None
+
+
 def _completed_future() -> object:
     from asyncio import Future
 
@@ -301,6 +403,21 @@ async def test_trusted_click_uses_playwright_element_mouse_click() -> None:
 
     assert locator.calls == ["scroll", "click"]
     assert page.mouse.calls == []
+
+
+@pytest.mark.asyncio
+async def test_trusted_click_tolerates_unstable_pre_scroll() -> None:
+    class UnstableScrollLocator(FakeLocator):
+        async def scroll_into_view_if_needed(self, timeout: int = 0) -> None:
+            self.calls.append("scroll-failed")
+            raise RuntimeError("element is not stable")
+
+    page = FakePage()
+    locator = UnstableScrollLocator()
+
+    await trusted_click(page, locator, "编辑器菜单")
+
+    assert locator.calls == ["scroll-failed", "click"]
 
 
 @pytest.mark.asyncio
@@ -620,6 +737,9 @@ async def test_fill_authorization_uses_generic_no_link_options(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    async def _noop_authorization_setting() -> None:
+        return None
+
     page = FakeAuthorizationPage()
     flow = PageFlow(
         page=page,
@@ -627,6 +747,8 @@ async def test_fill_authorization_uses_generic_no_link_options(
         settings=ConsoleSettings(),
         screenshot_dir=tmp_path,
     )
+    monkeypatch.setattr(flow, "_select_upload_contract_mode", _noop_authorization_setting)
+    monkeypatch.setattr(flow, "_enable_commercial_revenue_share", _noop_authorization_setting)
 
     await flow._fill_authorization("甘斯敏")
 
@@ -647,6 +769,8 @@ async def test_fill_authorization_skips_name_when_real_name_is_blank(
         settings=ConsoleSettings(),
         screenshot_dir=tmp_path,
     )
+    monkeypatch.setattr(flow, "_select_upload_contract_mode", _noop_authorization_setting)
+    monkeypatch.setattr(flow, "_enable_commercial_revenue_share", _noop_authorization_setting)
 
     await flow._fill_authorization("")
 
@@ -673,12 +797,131 @@ async def test_fill_authorization_accepts_platform_info_without_homepage_link(
         raise AssertionError(f"不应再走旧下拉流程: {description}")
 
     monkeypatch.setattr(page_flow_module, "trusted_click", reject_old_dropdown)
+    monkeypatch.setattr(flow, "_select_upload_contract_mode", _noop_authorization_setting)
+    monkeypatch.setattr(flow, "_enable_commercial_revenue_share", _noop_authorization_setting)
 
     await flow._fill_authorization("龙英")
 
     assert page.producer_field.selected is True
     assert page.link_count == 0
     assert page.alternative_count == 0
+
+
+@pytest.mark.asyncio
+async def test_fill_authorization_selects_account_contract_mode_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = FakeAuthorizationPage()
+    flow = PageFlow(
+        page=page,
+        account=make_account(tmp_path).model_copy(
+            update={"upload_contract_mode": "exclusive_agent"}
+        ),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    calls: list[str] = []
+
+    async def select_mode():
+        calls.append("contract")
+
+    async def enable_share():
+        calls.append("share")
+
+    monkeypatch.setattr(flow, "_select_upload_contract_mode", select_mode)
+    monkeypatch.setattr(flow, "_enable_commercial_revenue_share", enable_share)
+
+    await flow._fill_authorization("甘斯敏")
+
+    assert calls == ["contract", "share"]
+    assert page.names == ["甘斯敏"]
+
+
+@pytest.mark.asyncio
+async def test_authorization_step_requires_contract_options(
+    tmp_path: Path,
+) -> None:
+    class AuthorizationStepPage(FakePage):
+        def __init__(self, body_text: str, title_visible: bool) -> None:
+            super().__init__()
+            self.body_text = body_text
+            self.title_locator = FakeLocator("")
+            self.title_locator.visible = title_visible
+
+        def locator(self, selector: str) -> FakeLocator:
+            assert selector == 'input[id="songs[0][title]"]'
+            return self.title_locator
+
+        async def inner_text(self, selector: str = "body") -> str:
+            return self.body_text
+
+    upload_page = AuthorizationStepPage(
+        "上传作品 授权证明 上传授权证明 下一步",
+        title_visible=False,
+    )
+    authorization_page = AuthorizationStepPage(
+        "签约模式 独家代理发行（3年） 独家授权（3年） 非独家授权（3年） "
+        "发行信息 授权信息 上一步 下一步",
+        title_visible=False,
+    )
+    flow = PageFlow(
+        page=upload_page,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    assert not await flow._authorization_step_ready()
+
+    flow.page = authorization_page
+    assert await flow._authorization_step_ready()
+
+    authorization_page.title_locator.visible = True
+    assert not await flow._authorization_step_ready()
+
+
+def test_contract_option_pattern_matches_platform_term_without_nonexclusive() -> None:
+    authorization_pattern = _upload_contract_option_pattern("独家授权")
+    agent_pattern = _upload_contract_option_pattern("独家代理发行")
+
+    assert authorization_pattern.match("独家授权（3年）")
+    assert authorization_pattern.match("独家授权")
+    assert not authorization_pattern.match("非独家授权（3年）")
+    assert agent_pattern.match("独家代理发行（3年）")
+    assert not agent_pattern.match("独家授权（3年）")
+
+
+@pytest.mark.asyncio
+async def test_enable_commercial_revenue_share_clicks_until_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flow = PageFlow(
+        page=FakeAuthorizationPage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    states = [False, True]
+    clicks: list[str] = []
+
+    async def mark():
+        return True
+
+    async def enabled():
+        return states.pop(0)
+
+    async def click(page, locator, description, **kwargs):
+        clicks.append(description)
+
+    monkeypatch.setattr(flow, "_mark_commercial_revenue_switch", mark)
+    monkeypatch.setattr(flow, "_commercial_revenue_share_enabled", enabled)
+    monkeypatch.setattr(page_flow_module, "trusted_click", click)
+
+    await flow._enable_commercial_revenue_share()
+
+    assert clicks == ["打开批量开启商用收益分成"]
 
 
 @pytest.mark.asyncio
@@ -725,6 +968,48 @@ async def test_wait_upload_audio_ready_waits_for_cover_upload(
     await flow._wait_upload_audio_ready()
 
     assert bodies == []
+
+
+@pytest.mark.asyncio
+async def test_wait_upload_audio_ready_waits_for_every_song_slicing(
+    tmp_path: Path,
+) -> None:
+    class UploadSlicePage(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.body = "上传作品"
+
+        async def inner_text(self, selector: str = "body") -> str:
+            return self.body
+
+    page = UploadSlicePage()
+    flow = PageFlow(
+        page=page,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+    states = [
+        [
+            {"index": 0, "title": "第一首", "text": "第一首 上传完成"},
+            {"index": 1, "title": "第二首", "text": "第二首 歌曲切片中 30%"},
+        ],
+        *[
+            [
+                {"index": 0, "title": "第一首", "text": "第一首 上传完成"},
+                {"index": 1, "title": "第二首", "text": "第二首 切片完成"},
+            ]
+            for _ in range(5)
+        ],
+    ]
+
+    async def song_states() -> list[dict]:
+        return states.pop(0)
+
+    with mock.patch.object(flow, "_upload_song_states", song_states):
+        await flow._wait_upload_audio_ready(expected_songs=2)
+
+    assert states == []
 
 
 @pytest.mark.asyncio
@@ -781,17 +1066,18 @@ async def test_upload_album_waits_for_all_files_after_album_info(
     async def configure(*args, **kwargs): calls.append("configure")
     async def fill_song(item, index, *, is_last): calls.append(f"fill-song:{index + 1}")
     async def use_cover(*args, **kwargs): calls.append("cover")
-    async def wait_ready(): calls.append("wait-all")
+    async def wait_ready(**kwargs): calls.append("wait-all")
     async def remove_noncompliant(): calls.append("remove"); return []
     async def song_states(): return [{"title": item["title"]} for item in items]
     async def wait_authorization(): calls.append("authorization-page")
     async def fill_authorization(*args, **kwargs): calls.append("authorization")
+    async def click_authorization_next(): calls.append("click:授权下一步")
     async def submit_verification(*args, **kwargs): calls.append("verification")
 
     async def fake_click(page, locator, description, **kwargs):
         calls.append(f"click:{description}")
 
-    monkeypatch.setattr(flow, "_configure_upload_ai_tools", configure)
+    monkeypatch.setattr(flow, "_select_upload_ai_created", configure)
     monkeypatch.setattr(flow, "_fill_upload_song", fill_song)
     monkeypatch.setattr(flow, "_use_smart_cover", use_cover)
     monkeypatch.setattr(flow, "_wait_upload_audio_ready", wait_ready)
@@ -799,6 +1085,7 @@ async def test_upload_album_waits_for_all_files_after_album_info(
     monkeypatch.setattr(flow, "_upload_song_states", song_states)
     monkeypatch.setattr(flow, "_wait_authorization_step", wait_authorization)
     monkeypatch.setattr(flow, "_fill_authorization", fill_authorization)
+    monkeypatch.setattr(flow, "_click_authorization_next", click_authorization_next)
     monkeypatch.setattr(flow, "_submit_sign_verification", submit_verification)
     monkeypatch.setattr(page_flow_module, "trusted_click", fake_click)
 
@@ -813,8 +1100,79 @@ async def test_upload_album_waits_for_all_files_after_album_info(
     assert calls.index("wait-all") < calls.index("remove")
     assert calls.index("remove") < calls.index("click:专辑下一步")
     cover_index = calls.index("cover")
-    assert calls.count("wait-all") == 3
+    assert calls.count("wait-all") == 4
     assert calls.index("wait-all", cover_index + 1) < calls.index("remove")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition_during_click", [True, False])
+async def test_authorization_next_recovers_when_click_starts_navigation(
+    tmp_path: Path,
+    transition_during_click: bool,
+) -> None:
+    class AuthorizationNextLocator(FakeLocator):
+        def __init__(self, page: "AuthorizationNextPage") -> None:
+            super().__init__("下一步")
+            self.page = page
+
+        async def click(self, **kwargs) -> None:
+            self.calls.append("click")
+            if transition_during_click:
+                self.page.body_text = "协议签署 电子牵"
+                raise RuntimeError("navigation replaced the button")
+            raise RuntimeError("actionability timeout")
+
+        async def evaluate(self, script: str, value: object = None) -> None:
+            self.calls.append("dom-click")
+            self.page.body_text = "协议签署 电子牵"
+
+    class AuthorizationNextPage(FakePage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.body_text = "签约模式 授权信息 下一步"
+
+        def locator(self, selector: str) -> AuthorizationNextLocator:
+            assert "button" in selector
+            return AuthorizationNextLocator(self)
+
+        async def inner_text(self, selector: str = "body") -> str:
+            return self.body_text
+
+    page = AuthorizationNextPage()
+    flow = PageFlow(
+        page=page,
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    await flow._click_authorization_next()
+
+    assert page.body_text == "协议签署 电子牵"
+
+
+@pytest.mark.asyncio
+async def test_authorization_next_fails_when_page_does_not_progress(tmp_path: Path) -> None:
+    class StaticNextLocator(FakeLocator):
+        async def click(self, **kwargs) -> None:
+            raise RuntimeError("button is disabled")
+
+    class StaticAuthorizationPage(FakePage):
+        def locator(self, selector: str) -> StaticNextLocator:
+            return StaticNextLocator("下一步")
+
+        async def inner_text(self, selector: str = "body") -> str:
+            return "签约模式 授权信息 下一步"
+
+    flow = PageFlow(
+        page=StaticAuthorizationPage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    with pytest.raises(BrowserFlowError, match="授权下一步"):
+        await flow._click_authorization_next()
 
 
 @pytest.mark.asyncio
@@ -964,6 +1322,64 @@ async def test_publish_completion_does_not_time_out_before_review_confirmation(
 
 
 @pytest.mark.asyncio
+async def test_editor_capacity_accepts_one_cleanup_below_hidden_reserve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CapacityPage(FakePage):
+        async def evaluate(self, script: str, *args: object) -> object:
+            assert "can-create" in script
+            assert "project/delete" in script
+            return {
+                "cleanup_needed": True,
+                "deleted_project_id": "old-project",
+                "max_count": 500,
+                "used_count": 480,
+                "used_count_after": 479,
+                "enough": True,
+            }
+
+    flow = PageFlow(
+        page=CapacityPage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    await flow._ensure_editor_project_capacity()
+
+
+@pytest.mark.asyncio
+async def test_editor_capacity_rejects_cleanup_without_enough_room(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CapacityPage(FakePage):
+        async def evaluate(self, script: str, *args: object) -> object:
+            return {
+                "cleanup_needed": True,
+                "max_count": 500,
+                "used_count": 480,
+                "used_count_after": 480,
+                "enough": False,
+            }
+
+    flow = PageFlow(
+        page=CapacityPage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    async def screenshot(step: str):
+        return tmp_path / f"{step}.png"
+
+    monkeypatch.setattr(flow, "_screenshot", screenshot)
+    with pytest.raises(BrowserFlowError, match="额度仍不足"):
+        await flow._ensure_editor_project_capacity()
+
+
+@pytest.mark.asyncio
 async def test_enter_editor_refreshes_assets_and_retries_transient_card(
     tmp_path: Path,
     monkeypatch,
@@ -977,6 +1393,9 @@ async def test_enter_editor_refreshes_assets_and_retries_transient_card(
 
         async def hover(self, timeout: int = 0) -> None:
             self.hovered += 1
+
+        async def click(self, timeout: int = 0) -> None:
+            return None
 
         def locator(self, selector: str) -> "FakeLocator":
             return FakeLocator("编辑")
@@ -1015,7 +1434,11 @@ async def test_enter_editor_refreshes_assets_and_retries_transient_card(
     async def wait_for_editor_ready(song_name: str) -> None:
         return None
 
+    async def ensure_capacity() -> None:
+        return None
+
     monkeypatch.setattr(flow, "_visible_asset_card", visible_asset_card)
+    monkeypatch.setattr(flow, "_ensure_editor_project_capacity", ensure_capacity)
     monkeypatch.setattr(page_flow_module, "refresh_asset_tabs", refresh)
     monkeypatch.setattr(page_flow_module, "trusted_click", click)
     monkeypatch.setattr(flow, "_wait_for_editor_ready", wait_for_editor_ready)
@@ -1036,6 +1459,9 @@ async def test_enter_editor_switches_to_new_editor_tab(
             return None
 
         async def hover(self, timeout: int = 0) -> None:
+            return None
+
+        async def click(self, timeout: int = 0) -> None:
             return None
 
         def locator(self, selector: str) -> FakeLocator:
@@ -1075,7 +1501,11 @@ async def test_enter_editor_switches_to_new_editor_tab(
     async def wait_for_editor_ready(song_name: str) -> None:
         assert flow.page is editor
 
+    async def ensure_capacity() -> None:
+        return None
+
     monkeypatch.setattr(flow, "_visible_asset_card", visible_asset_card)
+    monkeypatch.setattr(flow, "_ensure_editor_project_capacity", ensure_capacity)
     monkeypatch.setattr(page_flow_module, "trusted_click", click)
     monkeypatch.setattr(flow, "_wait_for_editor_ready", wait_for_editor_ready)
 
@@ -2619,7 +3049,7 @@ async def test_open_download_menu_uses_generated_card_trigger_and_menu_item() ->
 
 
 @pytest.mark.asyncio
-async def test_download_song_uses_dom_click_and_rejects_empty_file(
+async def test_download_song_retries_and_rejects_persistent_empty_file(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -2657,7 +3087,7 @@ async def test_download_song_uses_dom_click_and_rejects_empty_file(
     item = FakeLocator("下载")
     clicks: list[str] = []
 
-    async def open_menu(page, song_name, lyrics=None):
+    async def open_menu(page, song_name, lyrics=None, **kwargs):
         return item
 
     async def click(locator, description: str) -> None:
@@ -2666,6 +3096,11 @@ async def test_download_song_uses_dom_click_and_rejects_empty_file(
 
     monkeypatch.setattr(page_flow_module, "open_download_menu", open_menu)
     monkeypatch.setattr(page_flow_module, "dom_click", click)
+    monkeypatch.setattr(
+        flow,
+        "_recover_browser_download",
+        lambda suggested, target, started_at: _completed_future(),
+    )
     flow._raise_with_screenshot = (
         lambda step, error, **kwargs: _raise(error)
     )
@@ -2673,8 +3108,69 @@ async def test_download_song_uses_dom_click_and_rejects_empty_file(
     with pytest.raises(BrowserFlowError, match="下载文件为空"):
         await flow.download_song("本地歌名")
 
-    assert clicks == ["下载菜单"]
+    assert clicks == ["下载菜单", "下载菜单", "下载菜单"]
     assert not (tmp_path / "downloads" / "2026-10-01" / "empty.mp3").exists()
+
+
+@pytest.mark.asyncio
+async def test_download_song_recovers_chrome_default_download(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class Download:
+        suggested_filename = "browser.mp3"
+
+        async def save_as(self, target: Path) -> None:
+            Path(target).write_bytes(b"")
+
+        async def failure(self) -> str:
+            return ""
+
+    class DownloadContext:
+        async def __aenter__(self) -> "DownloadContext":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        @property
+        async def value(self) -> Download:
+            return Download()
+
+    class Page(FakePage):
+        def expect_download(self, timeout: int = 0) -> DownloadContext:
+            return DownloadContext()
+
+    flow = PageFlow(
+        page=Page(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+        day="2026-10-01",
+    )
+    source = tmp_path / "chrome-download" / "browser.mp3"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"ID3\x04\x00\x00\x00\x00\x00\x00")
+
+    async def recover(suggested: str, target: Path, started_at: float) -> Path:
+        assert suggested == "browser.mp3"
+        target.write_bytes(source.read_bytes())
+        return target
+
+    async def click(locator, description: str) -> None:
+        await locator.click()
+
+    async def open_menu(page, song_name, lyrics=None, **kwargs):
+        return FakeLocator("下载")
+
+    monkeypatch.setattr(page_flow_module, "open_download_menu", open_menu)
+    monkeypatch.setattr(page_flow_module, "dom_click", click)
+    monkeypatch.setattr(flow, "_recover_browser_download", recover)
+
+    result = await flow.download_song("本地歌名")
+
+    assert result.is_file()
+    assert result.stat().st_size == source.stat().st_size
 
 
 async def _raise(error: Exception) -> None:
@@ -3309,6 +3805,35 @@ async def test_visible_generation_failure_reads_description_rejection_from_page_
     )
 
     assert await flow._visible_generation_failure() == "无法根据描述生成，请修改"
+
+
+@pytest.mark.asyncio
+async def test_generate_stops_when_daily_limit_toast_is_visible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DailyLimitPage(FakePage):
+        def locator(self, selector: str) -> FakeLocator:
+            return FakeLocator("生成歌曲")
+
+        async def inner_text(self, selector: str = "body") -> str:
+            return "平台提示\n今日已达上限，请明日再来"
+
+    flow = PageFlow(
+        page=DailyLimitPage(),
+        account=make_account(tmp_path),
+        settings=ConsoleSettings(),
+        screenshot_dir=tmp_path,
+    )
+
+    async def click(page, locator, name): return None
+    async def screenshot(name): return tmp_path / "generation-limit.png"
+
+    monkeypatch.setattr(page_flow_module, "trusted_click", click)
+    monkeypatch.setattr(flow, "_screenshot", screenshot)
+
+    with pytest.raises(GenerationLimitError, match="今日已达上限"):
+        await flow.generate()
 
 
 @pytest.mark.asyncio

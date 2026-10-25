@@ -30,6 +30,11 @@ MusicModelName = Literal[
     "Sway v5.5",
 ]
 
+UploadContractMode = Literal[
+    "exclusive_agent",
+    "exclusive_authorization",
+]
+
 
 def normalize_singer_for_model(model_name: str, singer_name: str) -> str:
     """Only Sway exposes a virtual-singer selector on the platform."""
@@ -212,6 +217,7 @@ class AccountConfig(BaseModel):
     upload_batch_size: int = Field(default=10, ge=1, le=10)
     upload_artist_name: str = Field(default="白日逐梦", min_length=1, max_length=64)
     upload_real_name: str = Field(default="龙英", max_length=64)
+    upload_contract_mode: UploadContractMode = "exclusive_authorization"
     create_url: str = "https://music.douyin.com/studio/create"
     assets_url: str = "https://music.douyin.com/studio/assets"
 
@@ -329,6 +335,7 @@ class GeneratedCandidate(BaseModel):
     song_name: str
     generated_title: str
     card_index: int
+    asset_id: str | None = None
 
 
 class BatchSongResult(BaseModel):
@@ -478,11 +485,14 @@ class MonitoringDailyRecord(BaseModel):
     qishui_heat_index: float | None = Field(default=None, ge=0)
     qishui_play_count: float | None = Field(default=None, ge=0)
     qishui_paid_user_play_index: float | None = Field(default=None, ge=0)
+    qishui_search_play_index: float | None = Field(default=None, ge=0)
+    available_balance_yuan: float | None = Field(default=None, ge=0)
 
 
 class MonitoringSnapshot(BaseModel):
     snapshot_id: str = Field(default_factory=lambda: uuid4().hex)
-    trigger: Literal["multi_upload"] = "multi_upload"
+    trigger: Literal["multi_upload", "manual", "automatic"] = "multi_upload"
+    period: Literal["last_7_days", "last_1_day"] = "last_7_days"
     account_id: str = Field(min_length=1)
     account_name: str = Field(min_length=1, max_length=64)
     status: Literal["completed", "failed", "skipped"] = "completed"

@@ -69,10 +69,77 @@ async def test_editing_account_name_keeps_existing_directories() -> None:
                 )
                 await page.fill("#account-form [name='account_name']", "黄振艺")
 
+                assert await page.input_value("#account-form [name='upload_contract_mode']") == "exclusive_authorization"
                 assert await page.input_value("#account-form [name='chrome_profile_dir']") == account["chrome_profile_dir"]
                 assert await page.input_value("#account-form [name='lyric_dir']") == account["lyric_dir"]
                 assert await page.input_value("#account-form [name='output_dir']") == account["output_dir"]
                 assert await page.input_value("#account-form [name='download_dir']") == account["download_dir"]
+                payload = await page.evaluate("accountPayload()")
+                assert payload["upload_contract_mode"] == "exclusive_authorization"
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_upload_page_contract_select_save_account_default() -> None:
+    account = {
+        "id": "account",
+        "account_name": "白日逐梦",
+        "chrome_debug_port": 9222,
+        "lyric_dir": r"D:\音乐\歌词\白日逐梦",
+        "output_dir": r"D:\音乐\歌曲\白日逐梦",
+        "model_name": "自动",
+        "singer_name": "",
+        "upload_artist_name": "白日逐梦",
+        "upload_batch_size": 10,
+        "upload_contract_mode": "exclusive_authorization",
+    }
+    captured: dict = {}
+
+    async def handle_account_update(route) -> None:
+        body = route.request.post_data_json
+        captured.update(body)
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({**body, "upload_contract_mode": "exclusive_agent"}, ensure_ascii=False),
+        )
+
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            await page.route("**/api/accounts/account", handle_account_update)
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#stage-account-table", state="attached")
+                await page.evaluate(
+                    """(account) => {
+                    state.accounts = [account];
+                    state.selectedTaskAccounts = new Set([account.id]);
+                    state.view = "task";
+                    state.stage = "upload";
+                    renderView();
+                    }""",
+                    account,
+                )
+
+                headers = page.locator("#stage-account-table .stage-account-head span")
+                assert await headers.nth(4).inner_text() == "签约模式"
+                contract_select = page.locator("[data-contract-account='account']")
+                assert await contract_select.count() == 1
+                assert await contract_select.input_value() == "exclusive_authorization"
+
+                await contract_select.select_option("exclusive_agent")
+                await page.wait_for_function(
+                    "() => state.accounts[0].upload_contract_mode === 'exclusive_agent'"
+                )
+
+                assert captured["upload_contract_mode"] == "exclusive_agent"
+                assert await contract_select.input_value() == "exclusive_agent"
+                assert await page.locator(".upload-contract-field span").inner_text() == "签约模式"
 
             await browser.close()
     finally:
@@ -192,7 +259,7 @@ async def test_monitoring_view_renders_multi_account_daily_rows() -> None:
                             { snapshot_id: "s1", account_id: "a", account_name: "账号A", status: "completed", collected_at: "2026-10-18T12:20:00", data_end_date: "2026-10-17", record_count: 2 },
                         ],
                         records: [
-                            { snapshot_id: "s1", collected_at: "2026-10-18T12:20:00", data_end_date: "2026-10-17", date: "2026-10-17", account_id: "a", account_name: "账号A", qishui_heat_index: 1234, qishui_play_count: 20, qishui_paid_user_play_index: 3 },
+                            { snapshot_id: "s1", collected_at: "2026-10-18T12:20:00", data_end_date: "2026-10-17", date: "2026-10-17", account_id: "a", account_name: "账号A", qishui_heat_index: 1234, qishui_play_count: 20, qishui_paid_user_play_index: 3, available_balance_yuan: 15.01 },
                             { snapshot_id: "s1", collected_at: "2026-10-18T12:20:00", data_end_date: "2026-10-17", date: "2026-10-16", account_id: "a", account_name: "账号A", qishui_heat_index: 18, qishui_play_count: 1, qishui_paid_user_play_index: 0 },
                         ],
                     };
@@ -202,12 +269,110 @@ async def test_monitoring_view_renders_multi_account_daily_rows() -> None:
 
                 assert "is-active" in await page.locator(".nav-item[data-view='monitoring']").get_attribute("class")
                 assert await page.locator("#monitoring-table .monitoring-row:not(.monitoring-head)").count() == 2
+                monitoring_head = await page.locator("#monitoring-table .monitoring-head").inner_text()
+                assert "数据截止" not in monitoring_head
+                assert "可用余额(元)" in monitoring_head
+                assert (await page.locator("#monitoring-table .monitoring-row").nth(1).inner_text()).startswith("10/18 12:20")
                 assert await page.locator("#monitoring-account-count").inner_text() == "2"
                 assert await page.locator("#monitoring-collection-count").inner_text() == "2"
                 assert await page.locator("#monitoring-success-count").inner_text() == "1"
                 assert await page.locator("#monitoring-failed-count").inner_text() == "1"
                 assert "1,234" in await page.locator("#monitoring-table .monitoring-row").nth(1).inner_text()
+                assert "15.01" in await page.locator("#monitoring-table .monitoring-row").nth(1).inner_text()
                 assert await page.locator("#monitoring-status-list").is_visible()
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_monitoring_view_selects_accounts_and_filters_by_account() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            captured: dict = {}
+
+            async def handle_collection(route) -> None:
+                captured["body"] = route.request.post_data
+                await route.fulfill(
+                    status=202,
+                    content_type="application/json",
+                    body=(
+                        '{"queue_id":"m1","stage":"monitoring","day":"2026-10-20",'
+                        '"status":"running","current_index":0,"concurrency":1,'
+                        '"items":[{"item_id":"i1","account_id":"a","account_name":"账号A","status":"running"}]}'
+                    ),
+                )
+
+            await page.route("**/api/monitoring/collections", handle_collection)
+            async def handle_current(route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=(
+                        '{"queue_id":"m1","stage":"monitoring","day":"2026-10-20",'
+                        '"status":"running","current_index":0,"concurrency":1,'
+                        '"items":[{"item_id":"i1","account_id":"a","account_name":"账号A","status":"running"}]}'
+                    ),
+                )
+
+            await page.route(
+                "**/api/monitoring/collections/current",
+                handle_current,
+            )
+            async def handle_settings(route) -> None:
+                if route.request.method == "PUT":
+                    captured["settings_body"] = route.request.post_data
+                    await route.fulfill(status=200, content_type="application/json", body=route.request.post_data)
+                    return
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body='{"account_ids":["b"],"interval_hours":4,"next_automatic_at":null}',
+                )
+
+            await page.route("**/api/monitoring/settings", handle_settings)
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_selector("#monitoring-account-list", state="attached")
+                await page.evaluate(
+                    """() => {
+                    state.accounts = [
+                        { id: "a", account_name: "账号A", chrome_debug_port: 9222 },
+                        { id: "b", account_name: "账号B", chrome_debug_port: 9223 },
+                    ];
+                    state.view = "monitoring";
+                    state.monitoringSelectedAccountIds = new Set(["a", "b"]);
+                    state.monitoringStatistics = {
+                        days: 1,
+                        accounts: [],
+                        snapshots: [],
+                        records: [
+                            { snapshot_id: "s1", collected_at: "2026-10-20T12:00:00", date: "2026-10-19", account_id: "a", account_name: "账号A", qishui_heat_index: 1394, qishui_play_count: 3192, qishui_paid_user_play_index: 4047, qishui_search_play_index: 0 },
+                            { snapshot_id: "s2", collected_at: "2026-10-20T12:01:00", date: "2026-10-19", account_id: "b", account_name: "账号B", qishui_heat_index: 1, qishui_play_count: 2, qishui_paid_user_play_index: 3, qishui_search_play_index: 4 },
+                        ],
+                    };
+                    renderView();
+                    }""",
+                )
+
+                assert await page.locator(".monitoring-account-item").count() == 2
+                assert await page.locator("#monitoring-table .monitoring-row:not(.monitoring-head)").count() == 2
+                await page.locator("[data-monitoring-view='b']").click()
+                assert await page.locator("#monitoring-table .monitoring-row:not(.monitoring-head)").count() == 1
+                assert "账号B" in await page.locator("#monitoring-table .monitoring-row").nth(1).inner_text()
+                await page.locator("#collect-monitoring").click()
+                assert captured["body"] == '{"account_ids":["a","b"]}'
+                await page.wait_for_selector("#stop-monitoring", state="visible")
+                await page.evaluate("() => { state.monitoringCollection = null; renderMonitoring(); }")
+                await page.locator("[data-monitoring-account='a']").click()
+                await page.evaluate("async () => { await saveMonitoringSettings(); }")
+                assert captured["settings_body"] == '{"account_ids":["b"]}'
+                await page.evaluate("async () => { await loadMonitoringSettings(); }")
+                selected = await page.evaluate("() => [...state.monitoringSelectedAccountIds]")
+                assert selected == ["b"]
 
             await browser.close()
     finally:
@@ -928,16 +1093,17 @@ async def test_generation_start_uses_real_checked_account_order() -> None:
                     }""",
                 )
 
-                checkboxes = page.locator("#stage-account-table [data-task-account]")
-                await checkboxes.nth(0).check()
-                await checkboxes.nth(1).check()
-                await checkboxes.nth(2).check()
+                rows = page.locator("#stage-account-table .stage-account-row[data-stage-account]")
+                await rows.nth(0).click()
+                await rows.nth(1).click()
+                await rows.nth(2).click()
                 assert "白日逐梦、蹦儿波、黄振艺" in await page.locator("#task-account-count").inner_text()
                 await page.locator("#start-run").click()
                 await page.wait_for_timeout(500)
 
                 assert [item["account_id"] for item in captured["items"]] == ["first", "second", "third"]
                 assert "白日逐梦 → 蹦儿波 → 黄振艺" in await page.locator("#toast").inner_text()
+                assert "最多 2 个同时执行" in await page.locator("#toast").inner_text()
 
             await browser.close()
     finally:
@@ -1037,6 +1203,83 @@ async def test_generation_view_and_progress_stay_available_while_queue_runs() ->
                 )
                 assert await page.evaluate("() => multiStageRunning()")
                 assert "2 / 3" in await rows.nth(1).inner_text()
+
+            await browser.close()
+    finally:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_generation_warns_when_backend_drops_selected_account() -> None:
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel="chrome", headless=True)
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+
+            async def handle_songs(route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps([
+                        {"file_name": "song.md", "valid": True, "song_name": "歌曲", "status": "pending"},
+                    ], ensure_ascii=False),
+                )
+
+            async def handle_start(route) -> None:
+                await route.fulfill(
+                    status=202,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "queue_id": "generation-queue",
+                        "stage": "generation",
+                        "day": "2026-10-20",
+                        "status": "running",
+                        "current_index": 0,
+                        "concurrency": 2,
+                        "items": [
+                            {"account_id": "first", "account_name": "白日逐梦", "status": "running"},
+                            {"account_id": "second", "account_name": "蹦儿波", "status": "pending"},
+                        ],
+                    }, ensure_ascii=False),
+                )
+
+            async def handle_empty_accounts(route) -> None:
+                await route.fulfill(status=200, content_type="application/json", body="[]")
+
+            async def handle_health(route) -> None:
+                await route.fulfill(status=200, content_type="application/json", body='{"status":"ok"}')
+
+            async def handle_settings(route) -> None:
+                await route.fulfill(status=200, content_type="application/json", body="{}")
+
+            await page.route("**/api/health", handle_health)
+            await page.route("**/api/settings", handle_settings)
+            await page.route("**/api/accounts", handle_empty_accounts)
+            await page.route("**/api/accounts/*/songs**", handle_songs)
+            await page.route("**/api/multi-stage/generation/runs", handle_start)
+            with serve_frontend() as base_url:
+                await page.goto(base_url)
+                await page.wait_for_function("window.appReady === true")
+                await page.evaluate(
+                    """() => {
+                    state.accounts = [
+                        { id: "first", account_name: "白日逐梦", chrome_debug_port: 9222, model_name: "自动", singer_name: "", lyric_dir: "E:\\\\music\\\\first" },
+                        { id: "second", account_name: "蹦儿波", chrome_debug_port: 9223, model_name: "自动", singer_name: "" },
+                        { id: "third", account_name: "黄振艺", chrome_debug_port: 9224, model_name: "自动", singer_name: "" },
+                    ];
+                    state.accountId = "first";
+                    state.selectedTaskAccounts = new Set(["first", "second", "third"]);
+                    state.view = "task";
+                    state.stage = "generation";
+                    document.getElementById("lyric-dir-input").value = "E:\\\\music\\\\first";
+                    renderAccounts();
+                    renderView();
+                    }""",
+                )
+                await page.locator("#start-run").click()
+                await page.wait_for_function(
+                    "() => document.getElementById('toast').textContent.includes('队列缺少账号：黄振艺')",
+                )
 
             await browser.close()
     finally:
